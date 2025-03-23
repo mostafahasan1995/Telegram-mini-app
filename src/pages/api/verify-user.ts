@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import crypto from "crypto";
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN!; 
+const BOT_TOKEN = process.env.NEXT_PUBLIC_TELEGRAM_BOT_TOKEN!; 
 
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") return res.status(405).end(); 

@@ -44,7 +44,7 @@ export default function Home() {
 
   return (
     <div>
-      <h1>Welcome To Telegram Mini App</h1>
+      <h1>Welcome To Telegram Mini App2</h1>
       {loading ? (
         <p>Loading ...</p>
       ) : username ? (
