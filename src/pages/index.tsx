@@ -12,7 +12,7 @@ export default function Home() {
 
       const initData = tg.initData;
       if (!initData) {
-        console.error("❌ No initData found!");
+        tg.showAlert("❌ لا يوجد بيانات Telegram WebApp!");
         setLoading(false);
         return;
       }
@@ -27,21 +27,31 @@ export default function Home() {
           if (data.success) {
             setUsername(data.user.username || "Unknown");
           } else {
-            console.error("❌ Authentication failed!");
+            tg.showAlert("❌ فشل التحقق من المستخدم!");
           }
         })
-        .catch((err) => console.error("❌ Error:", err))
+        .catch(() => {
+          tg.showAlert("❌ حدث خطأ في التحقق من المستخدم!");
+        })
         .finally(() => setLoading(false));
     } else {
-      console.error("❌ Telegram WebApp not found!");
       setLoading(false);
+      setTimeout(() => {
+        window.Telegram?.WebApp?.showAlert("❌ Telegram WebApp غير مدعوم!");
+      }, 500);
     }
   }, []);
 
   return (
     <div>
       <h1>Welcome To Telegram Mini App</h1>
-      {loading ? <p>Loading ...</p> : username ? <p>User Name: {username}</p> : <p>Authentication failed</p>}
+      {loading ? (
+        <p>Loading ...</p>
+      ) : username ? (
+        <p>User Name: {username}</p>
+      ) : (
+        <p>Authentication failed</p>
+      )}
     </div>
   );
 }

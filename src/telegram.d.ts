@@ -4,6 +4,7 @@ declare global {
   interface Window {
     Telegram: {
       WebApp: {
+        showAlert(arg0: string): unknown;
         initData: string;
         expand: () => void;
         initDataUnsafe?: {
