@@ -3,29 +3,45 @@ import { useEffect, useState } from "react";
 
 export default function Home() {
   const [username, setUsername] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     if (typeof window !== "undefined" && window.Telegram?.WebApp) {
       const tg = window.Telegram.WebApp;
-      tg.expand(); 
+      tg.expand();
 
-      const user = tg.initDataUnsafe?.user;
-      if (user?.username) {
-        setUsername(user.username);
-        console.log("تم الاتصال بـ Telegram WebApp ✅");
-        console.log("اسم المستخدم:", user.username);
-      } else {
-        console.warn("⚠️ لم يتم العثور على اسم المستخدم!");
+      const initData = tg.initData;
+      if (!initData) {
+        console.error("❌ No initData found!");
+        setLoading(false);
+        return;
       }
+
+      fetch("/api/verify-user", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ initData }),
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.success) {
+            setUsername(data.user.username || "Unknown");
+          } else {
+            console.error("❌ Authentication failed!");
+          }
+        })
+        .catch((err) => console.error("❌ Error:", err))
+        .finally(() => setLoading(false));
     } else {
-      console.error("❌ لم يتم تحميل Telegram WebApp API");
+      console.error("❌ Telegram WebApp not found!");
+      setLoading(false);
     }
   }, []);
 
   return (
     <div>
       <h1>Welcome To Telegram Mini App</h1>
-      {username ? <p> User Name{username}</p> : <p>Loading ...</p>}
+      {loading ? <p>Loading ...</p> : username ? <p>User Name: {username}</p> : <p>Authentication failed</p>}
     </div>
   );
 }
