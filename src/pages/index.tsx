@@ -17,7 +17,8 @@ export default function Home() {
           </div>
         ) : error ? (
           <div>
-            <p>Authentication Error</p>
+            <p>Authentication Error</p>\
+            <p>{error}</p>
           </div>
         ) : data.user.username ? (
           <div>
