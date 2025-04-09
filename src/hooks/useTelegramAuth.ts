@@ -50,7 +50,6 @@ export default function useTelegramAuth() {
     };
 
     authenticateUser();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   

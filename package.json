@@ -9,8 +9,10 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@nucypher/taco-auth": "^0.2.0",
     "@nucypher/taco": "^0.5.0",
     "axios": "^1.8.4",
+    "ethers": "5.7.2",
     "next": "15.2.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
