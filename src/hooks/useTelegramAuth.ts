@@ -6,7 +6,6 @@ export default function useTelegramAuth() {
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [initData, setInitData] = useState<string>();
 
   useEffect(() => {
     const authenticateUser = async () => {
@@ -18,7 +17,7 @@ export default function useTelegramAuth() {
         const tg = window.Telegram.WebApp;
         tg.expand();
 
-        setInitData(tg.initData);
+        const initData = tg.initData;
         if (!initData) {
           throw new Error("Telegram WebApp data not found");
         }
@@ -30,11 +29,12 @@ export default function useTelegramAuth() {
         });
 
         const data = await response.json();
-        setData(data);
 
         if (!data.success) {
           throw new Error("User verification failed");
         }
+
+        setData(data);
       } catch (err) {
         const errorMessage =
           err instanceof Error ? err.message : "Authentication failed";
