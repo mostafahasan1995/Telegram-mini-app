@@ -2,11 +2,11 @@
 import useTelegramAuth from "@/hooks/useTelegramAuth";
 import useTelegramSearch from "@/hooks/useTelegramSearch";
 import Image from "next/image";
+import { fromHexString } from '@/utils/utils';
 import { conditions, fromBytes, toHexString } from '@nucypher/taco';
 import useTaco from '@/hooks/useTaco';
 import { useState } from "react";
 
-declare const window: any;
 
 const ritualId = 6; // Replace with your own ritual ID
 const domain = 'tapir';
