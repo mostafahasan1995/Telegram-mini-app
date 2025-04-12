@@ -2,12 +2,9 @@
 import useTelegramAuth from "@/hooks/useTelegramAuth";
 import useTelegramSearch from "@/hooks/useTelegramSearch";
 import Image from "next/image";
-import { ethers } from 'ethers';
-import { hexlify } from 'ethers/lib/utils';
-import { fromHexString } from '@/utils/utils';
 import { conditions, fromBytes, toHexString } from '@nucypher/taco';
 import useTaco from '@/hooks/useTaco';
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 declare const window: any;
 
