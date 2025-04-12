@@ -17,58 +17,24 @@ const domain = 'tapir';
 export default function Home() {
   const { data, loading, error } = useTelegramAuth();
   const { setInputSearch, search, profileImage } = useTelegramSearch();
-  const [provider, setProvider] = useState<
-    ethers.providers.Web3Provider | undefined
-  >();
   const [message, setMessage] = useState('this is a secret');
   const [encrypting, setEncrypting] = useState(false);
   const [encryptedText, setEncryptedText] = useState<string | undefined>('');
   const [decrypting, setDecrypting] = useState(false);
-  const [decryptedMessage, setDecryptedMessage] = useState<string | undefined>(
-    '',
-  );
-
-  const loadWeb3Provider = async () => {
-    if (!window.ethereum) {
-      console.error('You need to connect to your wallet first');
-    }
-    const provider = new ethers.providers.Web3Provider(window.ethereum, 'any');
-
-    const { chainId } = await provider.getNetwork();
-    const amoyChainId = 80002;
-    if (chainId !== amoyChainId) {
-      // Switch to Polygon Amoy testnet
-      await window.ethereum.request({
-        method: 'wallet_switchEthereumChain',
-        params: [{ chainId: hexlify(amoyChainId) }],
-      });
-    }
-
-    await provider.send('eth_requestAccounts', []);
-    setProvider(provider);
-  };
-
-  useEffect(() => {
-    loadWeb3Provider();
-  }, []);
+  const [decryptedMessage, setDecryptedMessage] = useState<string | undefined>('');
 
   const { isInit, encryptDataToBytes, decryptDataFromBytes } = useTaco({
     domain,
-    provider,
     ritualId,
   });
 
-  if (!isInit || !provider) {
+  if (!isInit) {
     return <div>Loading...</div>;
   }
 
   const encryptMessage = async () => {
-    if (!provider) {
-      return;
-    }
     setEncrypting(true);
     try {
-      const signer = provider.getSigner();
       const hasPositiveBalance = new conditions.base.rpc.RpcCondition({
         chain: 80002,
         method: 'eth_getBalance',
@@ -83,7 +49,6 @@ export default function Home() {
       const encryptedBytes = await encryptDataToBytes(
         message,
         hasPositiveBalance,
-        signer,
       );
       if (encryptedBytes) {
         setEncryptedText(toHexString(encryptedBytes));
@@ -95,15 +60,12 @@ export default function Home() {
   };
 
   const decryptMessage = async () => {
-    if (!encryptedText || !provider) return;
+    if (!encryptedText) return;
     try {
       setDecrypting(true);
-      const signer = provider.getSigner();
-
       console.log('Decrypting message...');
       const decryptedMessage = await decryptDataFromBytes(
         fromHexString(encryptedText),
-        signer,
       );
       if (decryptedMessage) {
         setDecryptedMessage(fromBytes(decryptedMessage));

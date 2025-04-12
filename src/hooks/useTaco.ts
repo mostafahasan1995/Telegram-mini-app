@@ -13,46 +13,61 @@ import {
 import { ethers } from 'ethers';
 import { useCallback, useEffect, useState } from 'react';
 
+const RPC_PROVIDER_URL = process.env.NEXT_PUBLIC_RPC_PROVIDER_URL || 'https://rpc-amoy.polygon.technology';
+const ENCRYPTOR_PRIVATE_KEY = process.env.NEXT_PUBLIC_ENCRYPTOR_PRIVATE_KEY;
+const CONSUMER_PRIVATE_KEY = process.env.NEXT_PUBLIC_CONSUMER_PRIVATE_KEY;
+
 export default function useTaco({
   ritualId,
   domain,
-  provider,
 }: {
   ritualId: number;
   domain: Domain;
-  provider: ethers.providers.Provider | undefined;
 }) {
   const [isInit, setIsInit] = useState(false);
+  const [provider, setProvider] = useState<ethers.providers.JsonRpcProvider>();
 
   useEffect(() => {
-    initialize().then(() => setIsInit(true));
+    const init = async () => {
+      if (!ENCRYPTOR_PRIVATE_KEY || !CONSUMER_PRIVATE_KEY) {
+        console.error('Private keys are not set in environment variables');
+        return;
+      }
+
+      const rpcProvider = new ethers.providers.JsonRpcProvider(RPC_PROVIDER_URL);
+      setProvider(rpcProvider);
+      await initialize();
+      setIsInit(true);
+    };
+
+    init();
   }, []);
 
   const decryptDataFromBytes = useCallback(
-    async (encryptedBytes: Uint8Array, signer: ethers.Signer) => {
-      if (!isInit || !provider) {
+    async (encryptedBytes: Uint8Array) => {
+      if (!isInit || !provider || !CONSUMER_PRIVATE_KEY) {
         return;
       }
+
+      const consumerSigner = new ethers.Wallet(CONSUMER_PRIVATE_KEY, provider);
       const messageKit = ThresholdMessageKit.fromBytes(encryptedBytes);
-      const authProvider = new EIP4361AuthProvider(provider, signer);
-      const conditionContext =
-        conditions.context.ConditionContext.fromMessageKit(messageKit);
-      conditionContext.addAuthProvider(
-        USER_ADDRESS_PARAM_DEFAULT,
-        authProvider,
-      );
+      const conditionContext = conditions.context.ConditionContext.fromMessageKit(messageKit);
+
+      if (conditionContext.requestedContextParameters.has(USER_ADDRESS_PARAM_DEFAULT)) {
+        const authProvider = new EIP4361AuthProvider(provider, consumerSigner);
+        conditionContext.addAuthProvider(USER_ADDRESS_PARAM_DEFAULT, authProvider);
+      }
+
       return decrypt(provider, domain, messageKit, conditionContext);
     },
     [isInit, provider, domain],
   );
 
   const encryptDataToBytes = useCallback(
-    async (
-      message: string,
-      condition: conditions.condition.Condition,
-      encryptorSigner: any,
-    ) => {
-      if (!isInit || !provider) return;
+    async (message: string, condition: conditions.condition.Condition) => {
+      if (!isInit || !provider || !ENCRYPTOR_PRIVATE_KEY) return;
+
+      const encryptorSigner = new ethers.Wallet(ENCRYPTOR_PRIVATE_KEY, provider);
       const messageKit = await encrypt(
         provider,
         domain,
