@@ -90,6 +90,7 @@ export default function Home() {
           <div>
             <p>Welcome back,</p>
             <p>{data.user.username}</p>
+            <p>{data.user.id}</p>
           </div>
         ) : (
           <p>Authentication failed</p>
