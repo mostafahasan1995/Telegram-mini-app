@@ -7,6 +7,7 @@ declare global {
         showAlert(arg0: string): unknown;
         initData: string;
         expand: () => void;
+        ready: () => void;
         initDataUnsafe?: {
           user?: {
             id?: number;

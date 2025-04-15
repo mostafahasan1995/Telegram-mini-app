@@ -10,11 +10,27 @@ export default function useTelegramAuth() {
   useEffect(() => {
     const authenticateUser = async () => {
       try {
-        if (typeof window === "undefined" || !window.Telegram?.WebApp) {
-          throw new Error("Telegram WebApp is not supported");
+        // Wait for Telegram WebApp to be available
+        if (typeof window === "undefined") {
+          throw new Error("Window is not defined");
         }
 
+        // Wait for Telegram WebApp to initialize
+        await new Promise((resolve) => {
+          const checkTelegram = () => {
+            if (window.Telegram?.WebApp) {
+              resolve(true);
+            } else {
+              setTimeout(checkTelegram, 100);
+            }
+          };
+          checkTelegram();
+        });
+
         const tg = window.Telegram.WebApp;
+        
+        // Initialize the WebApp
+        tg.ready();
         tg.expand();
 
         const initData = tg.initData;
@@ -42,7 +58,7 @@ export default function useTelegramAuth() {
         Swal.fire({
           icon: "error",
           title: "Error",
-          text: "Not Loaded Telegram WebApp API",
+          text: errorMessage,
         });
       } finally {
         setLoading(false);
@@ -51,8 +67,6 @@ export default function useTelegramAuth() {
 
     authenticateUser();
   }, []);
-
-  
 
   return { data, loading, error };
 }
