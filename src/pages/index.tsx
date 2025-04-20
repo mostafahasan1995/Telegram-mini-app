@@ -6,7 +6,7 @@ import { fromHexString } from '@/utils/utils';
 import { conditions, fromBytes, toHexString } from '@nucypher/taco';
 import useTaco from '@/hooks/useTaco';
 import { useState } from "react";
-
+import PasswordManager from "@/components/PasswordManager";
 
 const ritualId = 6; // Replace with your own ritual ID
 const domain = 'tapir';
@@ -91,37 +91,40 @@ export default function Home() {
             <p>Welcome back,</p>
             <p>{data.user.username}</p>
             <p>{data.user.id}</p>
+            {data.backendUser && (
+              <PasswordManager userId={data.backendUser._id} />
+            )}
           </div>
         ) : (
           <p>Authentication failed</p>
         )} 
         <input type="text" onChange={(e) => setInputSearch(e.target.value)} placeholder="enter username"/>
-      <button onClick={search}>search</button>
-      {profileImage && <Image src={profileImage!} alt="" width={100} height={100}/>}
+        <button onClick={search}>search</button>
+        {profileImage && <Image src={profileImage!} alt="" width={100} height={100}/>}
       </div>
       <div>==========================</div>
       <div>
-      <h2>
-        Secret message:{' '}
-        <input
-          value={message}
-          onChange={(e) => setMessage(e.target.value)}
-          onClick={encryptMessage}
-        />{' '}
-        <button onClick={encryptMessage}>Encrypt</button>{' '}
-        {encrypting && 'Encrypting...'}
-      </h2>
-      <h2>
-        Encrypted message:{' '}
-        <input
-          value={encryptedText}
-          onChange={(e) => setEncryptedText(e.target.value)}
-        />{' '}
-        <button onClick={decryptMessage}>Decrypt</button>{' '}
-        {decrypting && 'Decrypting...'}
-      </h2>
-      {decryptedMessage && <h2>Decrypted message: {decryptedMessage}</h2>}
-    </div>
+        <h2>
+          Secret message:{' '}
+          <input
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            onClick={encryptMessage}
+          />{' '}
+          <button onClick={encryptMessage}>Encrypt</button>{' '}
+          {encrypting && 'Encrypting...'}
+        </h2>
+        <h2>
+          Encrypted message:{' '}
+          <input
+            value={encryptedText}
+            onChange={(e) => setEncryptedText(e.target.value)}
+          />{' '}
+          <button onClick={decryptMessage}>Decrypt</button>{' '}
+          {decrypting && 'Decrypting...'}
+        </h2>
+        {decryptedMessage && <h2>Decrypted message: {decryptedMessage}</h2>}
+      </div>
     </>
   );
 }

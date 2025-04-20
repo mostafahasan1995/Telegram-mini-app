@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import Swal from "sweetalert2";
+import { api } from "@/utils/api";
 
 export default function useTelegramAuth() {
   const [data, setData] = useState<any>(null);
@@ -50,7 +51,19 @@ export default function useTelegramAuth() {
           throw new Error("User verification failed");
         }
 
-        setData(data);
+        // Call the backend signup API
+        const userData = {
+          telegramId: data.user.id.toString(),
+          firstName: data.user.first_name,
+          lastName: data.user.last_name,
+          username: data.user.username,
+          photoUrl: data.user.photo_url,
+          authDate: new Date(),
+          hash: initData,
+        };
+
+        const signupResponse = await api.signup(userData);
+        setData({ ...data, backendUser: signupResponse });
       } catch (err) {
         const errorMessage =
           err instanceof Error ? err.message : "Authentication failed";
