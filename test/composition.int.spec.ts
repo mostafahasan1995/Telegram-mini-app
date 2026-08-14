@@ -311,11 +311,18 @@ describe('worker composition', () => {
       expect(moduleRef.get(OutboxDispatchProcessor)).toBeDefined();
       expect(moduleRef.get(WorkerBootstrapService)).toBeDefined();
 
-      // Nest does not merge providers across modules, so the root has to assemble this array.
-      // An empty one means every deposit side-effect lands on the dead-letter queue.
+      // OutboxModule.forWorker() assembles this array next to the processor that consumes it. An
+      // empty one means every deposit side-effect lands on the dead-letter queue.
       const handlers = moduleRef.get<OutboxTopicHandler[]>(OUTBOX_HANDLERS);
       expect(handlers.length).toBeGreaterThan(0);
       expect(handlers.some((handler) => handler.topic.startsWith('deposit'))).toBe(true);
+
+      // The assertion that actually caught a shipped bug: the PROCESSOR's own injected table, not
+      // the token looked up from the root. A root-module binding satisfies the lookup above while
+      // the processor's injector sees nothing and every outbox job dies with OUTBOX_NO_HANDLER.
+      const processor: unknown = moduleRef.get(OutboxDispatchProcessor);
+      const table = (processor as { handlers: readonly OutboxTopicHandler[] }).handlers;
+      expect(table.length).toBe(handlers.length);
     } finally {
       await moduleRef.close();
     }

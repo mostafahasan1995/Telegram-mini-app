@@ -15,17 +15,21 @@
  * every later edit addresses that exact message across process restarts.
  */
 import { Injectable, Logger } from '@nestjs/common';
-import { DepositStatus } from '@prisma/client';
+import { DepositStatus, type Prisma } from '@prisma/client';
 
 import { AppConfigService } from '@core/config/config.service';
+import { IdempotencyService } from '@core/idempotency/idempotency.service';
+import { BALANCE_SNAPSHOT_METADATA_KEY, ichancyAgentFloatCode } from '@core/ledger';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { BotService } from '@core/telegram/services/bot.service';
 
+import { OPS_CARD_IDEMPOTENCY_SCOPE } from '../deposit.constants';
 import { DepositRepository } from '../repositories/deposit.repository';
 import { DepositService } from './deposit.service';
 import {
   renderAdminCard,
   renderAdminKeyboard,
+  renderOpsCard,
   renderPlayerMessage,
   esc,
 } from '../telegram/deposit-card.util';
@@ -40,6 +44,7 @@ export class DepositNotifyService {
     private readonly depositService: DepositService,
     private readonly bot: BotService,
     private readonly config: AppConfigService,
+    private readonly idempotency: IdempotencyService,
   ) {}
 
   /**
@@ -108,6 +113,117 @@ export class DepositNotifyService {
     });
   }
 
+  /**
+   * The dedicated ops card for a CREDITED deposit — a NEW admin-group message (never an edit), in
+   * addition to the review-card redraw, carrying the agent-float before/after.
+   *
+   * FLOAT BEFORE/AFTER — the truthful source: the balance snapshot the ledger stored on the T2
+   * transaction (kind DEPOSIT_CREDIT) for the ICHANCY_AGENT_FLOAT entry. Those are the balances AT
+   * POSTING TIME, taken under the account's row lock, so they are correct even when several credits
+   * raced — recomputing from the account's current balance here would attribute later movements to
+   * this deposit. A missing snapshot renders as — rather than failing the card.
+   *
+   * IDEMPOTENCY: the outbox delivers at-least-once and a fresh sendMessage has no "message is not
+   * modified" safety net, so the send is guarded by an insert-first idempotency record
+   * (scope deposit.ops_card, key = deposit id): a redelivery replays COMPLETED and skips; a failed
+   * send releases the record and rethrows so the redelivery may try again.
+   */
+  async postCreditedOpsCard(depositRequestId: string): Promise<void> {
+    const deposit = await this.prisma.depositRequest.findUnique({
+      where: { id: depositRequestId },
+      select: {
+        id: true,
+        shortId: true,
+        currencyCode: true,
+        claimedAmountMinor: true,
+        creditedAmountMinor: true,
+        creditedAt: true,
+        ledgerCreditTxId: true,
+        player: { select: { telegramUserId: true, ichancyLogin: true, ichancyPlayerId: true } },
+        paymentMethod: { select: { displayName: true } },
+      },
+    });
+    if (deposit === null) {
+      this.logger.warn(`ops card requested for unknown deposit ${depositRequestId}`);
+      return;
+    }
+    // The outbox row commits in the same transaction that writes ledgerCreditTxId, so this can only
+    // be null on a malformed replay. No T2, no money statement to publish.
+    if (deposit.ledgerCreditTxId === null) {
+      this.logger.warn(`ops card requested for ${deposit.shortId} but it has no T2; skipping`);
+      return;
+    }
+
+    const t2 = await this.prisma.ledgerTransaction.findUnique({
+      where: { id: deposit.ledgerCreditTxId },
+      select: { metadata: true, postedAt: true },
+    });
+    const snapshot = agentFloatSnapshot(
+      t2?.metadata ?? null,
+      ichancyAgentFloatCode(deposit.currencyCode),
+    );
+    if (snapshot === null) {
+      // Old rows (or a hand-posted correction) may carry no snapshot. The card still goes out.
+      this.logger.warn(`no agent-float snapshot on T2 of ${deposit.shortId}; card shows — for it`);
+    }
+
+    const text = renderOpsCard({
+      shortId: deposit.shortId,
+      telegramUserId: deposit.player.telegramUserId,
+      ichancyLogin: deposit.player.ichancyLogin,
+      ichancyPlayerId: deposit.player.ichancyPlayerId,
+      amountMinor: deposit.creditedAmountMinor ?? deposit.claimedAmountMinor,
+      floatBeforeMinor: snapshot?.beforeMinor ?? null,
+      floatAfterMinor: snapshot?.afterMinor ?? null,
+      paymentMethodName: deposit.paymentMethod.displayName,
+      creditedAt: deposit.creditedAt ?? t2?.postedAt ?? new Date(),
+    });
+
+    const begun = await this.idempotency.begin({
+      scope: OPS_CARD_IDEMPOTENCY_SCOPE,
+      key: deposit.id,
+      requestHash: this.idempotency.hashRequest({ depositRequestId: deposit.id }),
+    });
+    if (begun.kind === 'replay') {
+      this.logger.debug(`ops card for ${deposit.shortId} was already posted; redelivery ignored`);
+      return;
+    }
+    if (begun.kind === 'mismatch') {
+      // Impossible with a hash derived from the key itself; refuse to guess if it ever happens.
+      this.logger.error(`ops card idempotency mismatch for ${deposit.shortId}; not posting`);
+      return;
+    }
+    if (begun.kind === 'in_flight') {
+      // A concurrent delivery of the same row is posting right now. Throw so the queue retries
+      // AFTER it resolves to COMPLETED (skip) or released (proceed) — returning here would ack the
+      // row while the other worker could still fail.
+      throw new Error(
+        `ops card for ${deposit.shortId} is being posted elsewhere (since ${begun.since.toISOString()})`,
+      );
+    }
+
+    try {
+      const message = await this.bot.notifyAdmins(text, { parseMode: 'HTML', linkPreview: false });
+      if (message === null) {
+        // Permanently unreachable admin chat — same terminal outcome as the review card path.
+        await this.idempotency.release(begun.lease, 'admin chat unreachable');
+        this.logger.error(
+          `admin chat ${this.config.telegram.adminChatId.toString()} is unreachable; ` +
+            `deposit ${deposit.shortId} has no ops card`,
+        );
+        return;
+      }
+      await this.idempotency.complete(begun.lease, {
+        response: { messageId: message.message_id, chatId: message.chat.id },
+        resultRef: deposit.id,
+      });
+    } catch (cause) {
+      // 429/5xx: give the key back so the queue retry may actually send, then let it retry.
+      await this.idempotency.release(begun.lease, 'ops card send failed');
+      throw cause;
+    }
+  }
+
   /** Direct message to the player's private chat. Their Telegram id IS the chat id. */
   async notifyPlayer(
     playerId: string,
@@ -151,4 +267,34 @@ export class DepositNotifyService {
       ? `id ${player.telegramUserId.toString()}`
       : `@${player.telegramUsername} (${player.telegramUserId.toString()})`;
   }
+}
+
+/**
+ * Pull the ICHANCY_AGENT_FLOAT before/after out of the balance snapshots the ledger repository
+ * writes into ledger_transactions.metadata (see BALANCE_SNAPSHOT_METADATA_KEY — the entries table
+ * itself carries no balance columns, by design). Defensive on purpose: this reads immutable JSON
+ * written by another module, and a malformed shape must cost the card two dashes, not the message.
+ */
+function agentFloatSnapshot(
+  metadata: Prisma.JsonValue | null,
+  floatAccountCode: string,
+): { beforeMinor: bigint; afterMinor: bigint } | null {
+  if (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
+  const raw = (metadata as Record<string, Prisma.JsonValue>)[BALANCE_SNAPSHOT_METADATA_KEY];
+  if (!Array.isArray(raw)) return null;
+
+  for (const item of raw) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) continue;
+    const record = item as Record<string, Prisma.JsonValue>;
+    if (record['accountCode'] !== floatAccountCode) continue;
+    const previous = record['previousBalanceMinor'];
+    const current = record['currentBalanceMinor'];
+    if (typeof previous !== 'string' || typeof current !== 'string') return null;
+    try {
+      return { beforeMinor: BigInt(previous), afterMinor: BigInt(current) };
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }

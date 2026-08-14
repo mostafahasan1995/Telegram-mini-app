@@ -442,6 +442,28 @@ export class DepositCreditService {
           amountMinor: amountMinor.toString(),
         });
 
+        // Redraw the review card to its terminal "Credited" state (strips the keyboard), exactly
+        // like the credit-failed and needs-reconciliation paths do.
+        await this.outbox.enqueue(tx, {
+          aggregateType: DEPOSIT_AGGREGATE,
+          aggregateId: deposit.id,
+          topic: DEPOSIT_TOPICS.CARD_UPDATE,
+          payload: { depositRequestId: deposit.id, reason: 'credited' },
+          dedupeKey: `${DEPOSIT_TOPICS.CARD_UPDATE}:${deposit.id}:credited:${deposit.creditKeyEpoch}`,
+        });
+
+        // The dedicated ops card for the admin group (float before/after, dual amounts). Committed
+        // WITH T2 so it rides the same at-least-once outbox machinery as every other side effect —
+        // never a direct send from inside money logic. The dedupe key carries no epoch on purpose:
+        // like T2 itself, one deposit gets one ops card, forever.
+        await this.outbox.enqueue(tx, {
+          aggregateType: DEPOSIT_AGGREGATE,
+          aggregateId: deposit.id,
+          topic: DEPOSIT_TOPICS.OPS_CARD,
+          payload: { depositRequestId: deposit.id, ledgerCreditTxId: posted.transactionId },
+          dedupeKey: `${DEPOSIT_TOPICS.OPS_CARD}:${deposit.id}`,
+        });
+
         this.logger.log(
           `deposit ${deposit.shortId} CREDITED (${verifiedBy}, T2 ${posted.transactionId})`,
         );

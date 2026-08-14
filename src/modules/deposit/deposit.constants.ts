@@ -20,6 +20,13 @@ export const DEPOSIT_TOPICS = {
   PROOF_INGEST: 'deposit.proof_ingest',
   /** Operator-facing alert. Never a player message; goes to the admin chat. */
   ALERT: 'deposit.alert',
+  /**
+   * The credited ops card: a NEW admin-chat message per CREDITED deposit (Mafia-Bot style, with the
+   * agent-float before/after from the T2 posting). Separate from CARD_UPDATE on purpose — the
+   * review card is edited in place and ends as a receipt of the DECISION; this one is the money
+   * record of the CREDIT and is appended, never edited.
+   */
+  OPS_CARD: 'deposit.ops_card',
 } as const;
 
 export type DepositTopic = (typeof DEPOSIT_TOPICS)[keyof typeof DEPOSIT_TOPICS];
@@ -32,6 +39,14 @@ export const DEPOSIT_AGGREGATE = 'DepositRequest';
 
 /** Idempotency scope for POST /v1/deposits. Never reuse it for another endpoint. */
 export const DEPOSIT_CREATE_SCOPE = 'deposit.create';
+
+/**
+ * Idempotency scope guarding the credited ops card (key = deposit id). The outbox delivers
+ * at-least-once and the card is a fresh sendMessage — there is nothing to edit in place, so the
+ * insert-first idempotency_keys record is what makes a redelivered row a no-op instead of a
+ * duplicate card in the admin group. One T2 per deposit forever ⇒ one ops card per deposit forever.
+ */
+export const OPS_CARD_IDEMPOTENCY_SCOPE = 'deposit.ops_card';
 
 /** Telegram callback namespaces. Kept to 3 characters — callback_data has a 64 BYTE budget. */
 export const DEPOSIT_CALLBACK = {
@@ -77,9 +92,16 @@ export const BALANCE_VERIFY_DELAY_MS = 4_000;
 /** Extra delay before the second (post-retry) verification read. */
 export const BALANCE_VERIFY_RETRY_DELAY_MS = 6_000;
 
-/** Deterministic BullMQ job id, so a re-published outbox row cannot enqueue a second credit. */
+/**
+ * Deterministic BullMQ job id, so a re-published outbox row cannot enqueue a second credit.
+ *
+ * '-' separators, never ':': BullMQ rejects custom job ids containing ':' except through a
+ * three-segment compatibility loophole its own code marks for removal. This id only worked because
+ * it happened to have exactly three segments; the sibling two-segment ids in the outbox handler
+ * threw "Custom Id cannot contain :" on every dispatch. See deposit-outbox.handler.ts.
+ */
 export const creditJobId = (depositRequestId: string, creditKeyEpoch: number): string =>
-  `deposit-credit:${depositRequestId}:${creditKeyEpoch}`;
+  `deposit-credit-${depositRequestId}-${creditKeyEpoch}`;
 
 /** Cross-player proof matching window. 180 days is the fraud-review horizon the product asked for. */
 export const PROOF_DUPLICATE_WINDOW_DAYS = 180;

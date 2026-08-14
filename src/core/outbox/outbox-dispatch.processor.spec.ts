@@ -43,7 +43,7 @@ function recorder(topic: string): OutboxTopicHandler & { seen: OutboxMessageView
   };
 }
 
-const build = (handlers: OutboxTopicHandler[] | null): OutboxDispatchProcessor =>
+const build = (handlers: OutboxTopicHandler[]): OutboxDispatchProcessor =>
   new OutboxDispatchProcessor(new ActorContextService(), handlers);
 
 describe('OutboxDispatchProcessor — routing', () => {
@@ -68,8 +68,10 @@ describe('OutboxDispatchProcessor — routing', () => {
     );
   });
 
-  it('fails the same way when no handlers are registered at all', async () => {
-    await expect(build(null).process(job())).rejects.toBeInstanceOf(NoOutboxHandlerError);
+  it('fails the same way when the handler table is empty', async () => {
+    // The table itself can no longer be missing — OutboxModule.forWorker() binds it and the inject
+    // is not optional — but an empty table must still fail the job rather than drop the effect.
+    await expect(build([]).process(job())).rejects.toBeInstanceOf(NoOutboxHandlerError);
   });
 
   it('fans out to every handler that claims the topic', async () => {

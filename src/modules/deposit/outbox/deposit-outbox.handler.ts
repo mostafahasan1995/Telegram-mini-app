@@ -14,6 +14,12 @@
  *
  * IDEMPOTENCY: every job gets a deterministic jobId, so a re-published outbox row (the relay
  * guarantees at-least-once) collapses into the job that already exists rather than a second credit.
+ *
+ * JOB IDS USE '-' AND NEVER ':'. BullMQ rejects a custom jobId containing ':' ("Custom Id cannot
+ * contain :") unless it happens to split into exactly three segments — a compatibility loophole for
+ * old repeatable jobs that their code marks TODO-for-removal. `deposit-credit:<id>:<epoch>` used to
+ * ride that loophole while `deposit-card-update:<outboxId>` threw, which silently killed every card
+ * redraw and player notification at dispatch. Dashes are safe forever.
  */
 import { Injectable, Logger } from '@nestjs/common';
 
@@ -63,7 +69,7 @@ export class DepositOutboxHandler implements OutboxTopicHandler {
         await this.queue.add(
           TASKS.TELEGRAM_ADMIN_CARD_POST,
           { depositRequestId: message.aggregateId },
-          { jobId: `deposit-card-post:${message.aggregateId}` },
+          { jobId: `deposit-card-post-${message.aggregateId}` },
         );
         return;
 
@@ -75,7 +81,7 @@ export class DepositOutboxHandler implements OutboxTopicHandler {
             reason: str(payload, 'reason') ?? 'state-change',
           },
           // The outbox row id makes each redraw unique, while a REDELIVERY of the same row collapses.
-          { jobId: `deposit-card-update:${message.outboxId}` },
+          { jobId: `deposit-card-update-${message.outboxId}` },
         );
         return;
 
@@ -91,7 +97,7 @@ export class DepositOutboxHandler implements OutboxTopicHandler {
         await this.queue.add(
           TASKS.TELEGRAM_NOTIFY_PLAYER,
           { playerId, template, params: params(payload) },
-          { jobId: `deposit-notify:${message.outboxId}` },
+          { jobId: `deposit-notify-${message.outboxId}` },
         );
         return;
       }
@@ -105,10 +111,17 @@ export class DepositOutboxHandler implements OutboxTopicHandler {
         await this.queue.add(
           TASKS.MEDIA_PROOF_PROCESS,
           { depositProofId },
-          { jobId: `proof-ingest:${depositProofId}` },
+          { jobId: `proof-ingest-${depositProofId}` },
         );
         return;
       }
+
+      case DEPOSIT_TOPICS.OPS_CARD:
+        // Sent inline like ALERT: a single admin-group sendMessage with no card of its own to edit.
+        // The dedupe lives inside postCreditedOpsCard (insert-first idempotency record keyed on the
+        // deposit), so a redelivered row is a no-op and a failed send throws so this job retries.
+        await this.notify.postCreditedOpsCard(message.aggregateId);
+        return;
 
       case DEPOSIT_TOPICS.ALERT:
         // Sent inline: see the header. Alerts must not queue behind review cards.

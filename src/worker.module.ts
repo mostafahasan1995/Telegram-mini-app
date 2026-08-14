@@ -34,7 +34,6 @@ import { IdempotencyModule } from '@core/idempotency/idempotency.module';
 import { LedgerModule } from '@core/ledger/ledger.module';
 import { LoggingModule } from '@core/logging/logging.module';
 import { OutboxModule } from '@core/outbox/outbox.module';
-import { OUTBOX_HANDLERS, type OutboxTopicHandler } from '@core/outbox/outbox.types';
 import { PrismaModule } from '@core/prisma/prisma.module';
 import { QueueModule } from '@core/queue/queue.module';
 import { TelegramModule } from '@core/telegram/telegram.module';
@@ -50,6 +49,12 @@ import { ReconciliationModule } from '@modules/reconciliation/reconciliation.mod
 import { FeaturePortsModule } from './feature-ports.module';
 import { WorkerBootstrapService } from './worker-bootstrap.service';
 
+// ONE instance, imported both by the root (for the deposit consumers) and by OutboxModule.forWorker
+// (so the handler classes resolve inside the module that declares OUTBOX_HANDLERS). Calling
+// forWorker() twice would hand Nest two dynamic-module definitions to deduplicate by deep
+// comparison; sharing the object makes them identical by construction.
+const depositWorkerModule = DepositModule.forWorker();
+
 @Module({
   imports: [
     AppConfigModule,
@@ -64,8 +69,15 @@ import { WorkerBootstrapService } from './worker-bootstrap.service';
     QueueModule,
     AuditModule,
     LedgerModule,
-    // forWorker() adds OutboxDispatchProcessor, the single consumer of the `outbox` queue.
-    OutboxModule.forWorker(),
+    // forWorker() adds OutboxDispatchProcessor, the single consumer of the `outbox` queue, AND
+    // binds its OUTBOX_HANDLERS table. The table must live inside OutboxModule: a root-module
+    // provider is invisible to another module's injector, and the processor's @Optional() inject
+    // would silently degrade to an empty table — every outbox job then dies with OUTBOX_NO_HANDLER
+    // while boot looks green. Add a second feature's handler by extending BOTH arrays here.
+    OutboxModule.forWorker({
+      imports: [depositWorkerModule],
+      handlers: [DepositOutboxHandler],
+    }),
     IdempotencyModule,
     IchancyModule,
     FileModule,
@@ -84,7 +96,7 @@ import { WorkerBootstrapService } from './worker-bootstrap.service';
     PaymentMethodModule,
 
     // The consumers: credit-deposit, ingest-proof, notify, the expiry cron, the bot handlers.
-    DepositModule.forWorker(),
+    depositWorkerModule,
     // The consumers: recon queue, invariant checks, agent-float sync, rail ageing.
     ReconciliationModule.forWorker(),
   ],
@@ -92,14 +104,6 @@ import { WorkerBootstrapService } from './worker-bootstrap.service';
     // Drains `telegram-updates` into grammY. Without it every button press in the review group is
     // persisted, enqueued, and never handled — with no error anywhere to show for it.
     TelegramUpdateProcessor,
-
-    // Nest does not merge providers across modules, so the ROOT assembles the handler array. Add a
-    // second handler by adding it to both `inject` and the module that exports it.
-    {
-      provide: OUTBOX_HANDLERS,
-      inject: [DepositOutboxHandler],
-      useFactory: (...handlers: OutboxTopicHandler[]): OutboxTopicHandler[] => handlers,
-    },
 
     WorkerBootstrapService,
   ],

@@ -11,7 +11,7 @@
  * Handlers MUST be idempotent: delivery is at-least-once, a BullMQ retry re-runs every handler for
  * that message, and the relay itself may re-publish a row whose owner died before marking it SENT.
  */
-import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import type { Job } from 'bullmq';
 
@@ -39,12 +39,15 @@ export class OutboxDispatchProcessor extends WorkerHost {
   private readonly logger = new Logger(OutboxDispatchProcessor.name);
   private readonly handlers: readonly OutboxTopicHandler[];
 
+  // NOT @Optional(): OutboxModule.forWorker() always binds the token in this module's injector,
+  // and a composition that somehow loses it must fail AT BOOT — an optional inject once degraded
+  // to an empty table here and every outbox job died with OUTBOX_NO_HANDLER while boot looked green.
   constructor(
     private readonly actorContext: ActorContextService,
-    @Optional() @Inject(OUTBOX_HANDLERS) handlers?: readonly OutboxTopicHandler[] | null,
+    @Inject(OUTBOX_HANDLERS) handlers: readonly OutboxTopicHandler[],
   ) {
     super();
-    this.handlers = handlers ?? [];
+    this.handlers = handlers;
   }
 
   override async process(job: Job<OutboxDispatchTask, unknown, string>): Promise<void> {

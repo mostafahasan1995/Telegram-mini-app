@@ -1,5 +1,5 @@
 /**
- * The on-call operator's three commands, in the same chat where the deposit cards already live.
+ * The on-call operator's commands, in the same chat where the deposit cards already live.
  *
  * ══ WHY A NON-ADMIN GETS SILENCE, NOT A REFUSAL ═══════════════════════════════════════════════
  * Replying "you are not an admin" confirms that the command exists to anyone who guesses it, which
@@ -27,17 +27,19 @@
  * throw would only cost the operator their answer. Each command degrades to a plain message.
  */
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { BreakStatus, DepositStatus } from '@prisma/client';
+import { BreakStatus, DepositStatus, type Prisma } from '@prisma/client';
 import type { Context } from 'grammy';
 
 import type { AuthenticatedAdmin } from '@common/decorators/auth.types';
-import { formatMinorToDecimal } from '@common/helpers/money.util';
+import { compareMinor, formatMinorToDecimal } from '@common/helpers/money.util';
 import { AdminIdentityService } from '@core/auth/services/admin-identity.service';
 import { AppConfigService } from '@core/config/config.service';
 import { ICHANCY_PORT, type IchancyPort, isIchancyOk } from '@core/ichancy';
 import { AccountRegistryService, ichancyAgentFloatCode } from '@core/ledger';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { OnCommand } from '@core/telegram/decorators/handlers.decorator';
+
+import { dualNsp } from '@common/helpers/money-display.util';
 
 /**
  * MIRRORS `REVIEWABLE_STATUSES` in src/modules/deposit/deposit-state.machine.ts — the default
@@ -57,6 +59,16 @@ const WAITING_STATUSES: readonly DepositStatus[] = Object.freeze([
 const UNRESOLVED_BREAK_STATUSES: readonly BreakStatus[] = Object.freeze([
   BreakStatus.OPEN,
   BreakStatus.INVESTIGATING,
+]);
+
+/**
+ * The two states where a player HAS paid but no money reached his casino account. /report surfaces
+ * their count because these are the numbers an operator must not ignore: every one is a person
+ * waiting on money we already accepted.
+ */
+const ATTENTION_STATUSES: readonly DepositStatus[] = Object.freeze([
+  DepositStatus.CREDIT_FAILED,
+  DepositStatus.NEEDS_RECONCILIATION,
 ]);
 
 /** Severity at which a break stops being informational and starts meaning money is missing. */
@@ -86,6 +98,92 @@ function formatAge(since: Date, now: Date): string {
 
   return `${Math.floor(totalHours / 24)}d ${totalHours % 24}h`;
 }
+
+// -----------------------------------------------------------------------------------------------
+// /report period handling
+// -----------------------------------------------------------------------------------------------
+
+type ReportPeriodKey = 'day' | 'week' | 'month';
+
+interface ReportPeriod {
+  /** Arabic name printed in the report header. */
+  readonly label: string;
+  readonly from: Date;
+  /** `now`, captured ONCE — the header and every period-bound query agree to the millisecond. */
+  readonly to: Date;
+}
+
+/**
+ * Liberal aliases: operators type whichever spelling comes to their thumbs (with/without ال and
+ * hamza, English word, single letter). Anything not in this map gets the usage text, never a guess.
+ */
+const REPORT_PERIOD_ALIASES: ReadonlyMap<string, ReportPeriodKey> = new Map<
+  string,
+  ReportPeriodKey
+>([
+  ['اليوم', 'day'],
+  ['يوم', 'day'],
+  ['today', 'day'],
+  ['day', 'day'],
+  ['d', 'day'],
+  ['t', 'day'],
+  ['الأسبوع', 'week'],
+  ['الاسبوع', 'week'],
+  ['أسبوع', 'week'],
+  ['اسبوع', 'week'],
+  ['week', 'week'],
+  ['w', 'week'],
+  ['الشهر', 'month'],
+  ['شهر', 'month'],
+  ['month', 'month'],
+  ['m', 'month'],
+]);
+
+const DAY_MS = 86_400_000;
+
+/**
+ * Boundaries are computed in UTC and LABELED UTC in the header — the report is honest about its
+ * clock. Damascus-local boundaries are a later nicety; wrong-but-unlabeled is the only failure mode.
+ *
+ * day   = since 00:00 UTC today.
+ * week  = the last 7 calendar days (00:00 UTC six days ago → now), rolling — not "since Monday",
+ *         because which day a Syrian week starts on is genuinely contested (Fri/Sat weekend).
+ * month = since the 1st of the current month, 00:00 UTC. The default.
+ */
+function resolveReportPeriod(raw: string, now: Date): ReportPeriod | null {
+  const token = raw.trim().toLowerCase();
+  const key: ReportPeriodKey | undefined =
+    token === '' ? 'month' : REPORT_PERIOD_ALIASES.get(token);
+  if (key === undefined) return null;
+
+  const todayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+
+  switch (key) {
+    case 'day':
+      return { label: 'اليوم', from: new Date(todayUtc), to: now };
+    case 'week':
+      return { label: 'آخر 7 أيام', from: new Date(todayUtc - 6 * DAY_MS), to: now };
+    case 'month':
+      return {
+        label: 'الشهر الحالي',
+        from: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)),
+        to: now,
+      };
+  }
+}
+
+/** "2026-08-14 09:57:17" — the competitor's timestamp shape. Always UTC; the caller labels it so. */
+function formatUtc(date: Date): string {
+  return date.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+const REPORT_USAGE = [
+  '<b>/report</b> — تقرير النشاط',
+  'الاستخدام: <code>/report [اليوم | الأسبوع | الشهر]</code>',
+  '• اليوم — منذ منتصف الليل (UTC)',
+  '• الأسبوع — آخر 7 أيام',
+  '• الشهر — منذ أول الشهر الحالي (الافتراضي)',
+].join('\n');
 
 @Injectable()
 export class AdminTelegramHandlers {
@@ -200,12 +298,7 @@ export class AdminTelegramHandlers {
     const currency = this.config.ichancy.currency;
     const watermark = this.config.limits.agentFloatLowWatermarkMinor;
 
-    const account = await this.accounts.findByCode(this.prisma, ichancyAgentFloatCode(currency));
-    // A float account that has never been posted to is genuinely zero, not missing.
-    const ledgerMinor =
-      account === null
-        ? 0n
-        : await this.accounts.computeBalanceFromEntries(this.prisma, account.id);
+    const ledgerMinor = await this.ledgerFloatMinor();
 
     const wallet = await this.ichancy.getAgentWallet({ correlationId: 'telegram:/float' });
 
@@ -336,6 +429,213 @@ export class AdminTelegramHandlers {
     lines.push('', '<i>Resolve them in the admin panel — a break is closed with a note.</i>');
 
     await this.reply(ctx, lines.join('\n'));
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // /report — the competitor-style activity report, from OUR database
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * WHY sections vanish instead of printing zeros: a "0.00" row for a thing that simply did not
+   * happen reads like an anomaly and trains the operator to skim. A section that exists always
+   * means something. (And there is deliberately NO withdrawals section — withdrawals do not exist
+   * in this system yet, and a fake zero would claim they do.)
+   *
+   * WHY the deposit sections filter on creditedAt/decidedAt rather than createdAt: "الشحن اليوم"
+   * means money that LANDED today. A deposit opened last night and credited this morning belongs
+   * to this morning's number — that is how the competitor's report reads and how the operator
+   * reconciles it against the Ichancy panel.
+   *
+   * WHY this one wraps its body in try/catch where /queue does not: the report is seven reads, and
+   * the registrar's swallow would turn any one hiccup into silence. An explicit failure message
+   * costs three lines and tells the operator to simply try again.
+   */
+  @OnCommand('report')
+  async onReport(ctx: Context): Promise<void> {
+    const admin = await this.requireAdmin(ctx);
+    if (admin === null) return;
+
+    // `ctx.match` is whatever followed "/report"; grammY types it string | RegExpMatchArray.
+    const raw = typeof ctx.match === 'string' ? ctx.match : '';
+    const period = resolveReportPeriod(raw, new Date());
+    if (period === null) {
+      await this.reply(ctx, REPORT_USAGE);
+      return;
+    }
+
+    try {
+      await this.reply(ctx, await this.buildReport(period));
+    } catch (error: unknown) {
+      this.logger.warn(`/report failed: ${describeError(error)}`);
+      await this.reply(ctx, '⚠️ تعذر إنشاء التقرير — حاول مرة أخرى بعد قليل.');
+    }
+  }
+
+  private async buildReport(period: ReportPeriod): Promise<string> {
+    const inPeriod = { gte: period.from, lt: period.to };
+
+    const [newPlayers, totalPlayers, credited, rejected, waiting, attention, floatMinor] =
+      await Promise.all([
+        this.prisma.player.count({ where: { createdAt: inPeriod } }),
+        this.prisma.player.count(),
+        this.creditedByMethod({ status: DepositStatus.CREDITED, creditedAt: inPeriod }),
+        // decidedAt IS the rejection moment — the state machine stamps it on every decision.
+        this.countAndSumDeposits({ status: DepositStatus.REJECTED, decidedAt: inPeriod }),
+        // The queue sections are CURRENT state, not period-bound: a stuck deposit from last week
+        // must not fall out of today's report.
+        this.prisma.depositRequest.count({ where: { status: { in: [...WAITING_STATUSES] } } }),
+        this.prisma.depositRequest.count({ where: { status: { in: [...ATTENTION_STATUSES] } } }),
+        this.ledgerFloatMinor(),
+      ]);
+
+    const lines = [
+      `📊 <b>تقرير النشاط — ${period.label}</b>`,
+      `📅 من: ${formatUtc(period.from)} (UTC)`,
+      `📅 إلى: ${formatUtc(period.to)} (UTC)`,
+      '',
+      '👥 <b>المستخدمين</b>',
+      `🆕 لاعبون جدد خلال الفترة: ${newPlayers}`,
+      `👤 إجمالي اللاعبين: ${totalPlayers}`,
+    ];
+
+    if (credited.length > 0) {
+      lines.push('', '💳 <b>الشحن</b>');
+      let totalCount = 0;
+      let totalMinor = 0n;
+      for (const row of credited) {
+        totalCount += row.count;
+        totalMinor += row.sumMinor;
+        lines.push(`• ${esc(row.displayName)}: ${row.count} عملية — ${dualNsp(row.sumMinor)}`);
+      }
+      lines.push(`💰 إجمالي الشحن: ${totalCount} عملية — <b>${dualNsp(totalMinor)}</b>`);
+    }
+
+    // Shown whenever EITHER number is non-zero — and then both are shown, because "0 failed" next
+    // to "5 waiting" is real information, not a fake zero.
+    if (waiting > 0 || attention > 0) {
+      lines.push(
+        '',
+        '📋 <b>حالة الطابور</b> <i>(الوضع الحالي)</i>',
+        `⏳ بانتظار المراجعة: ${waiting}`,
+        `🚨 فشل شحن / بحاجة تدقيق: ${attention}`,
+      );
+    }
+
+    if (rejected.count > 0) {
+      lines.push(
+        '',
+        '❌ <b>المرفوضة</b>',
+        `عدد المرفوضة: ${rejected.count} — ${dualNsp(rejected.sumMinor)}`,
+      );
+    }
+
+    lines.push(
+      '',
+      '📊 <b>رصيد الكاشيرة</b>',
+      `💰 <code>ICHANCY_AGENT_FLOAT</code>: <b>${dualNsp(floatMinor)}</b>`,
+    );
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Per-method totals with the SAME amount precedence the admin card and /queue use: the verified
+   * figure once an admin set one, the player's claim until then. Prisma's groupBy cannot express
+   * that COALESCE inside _sum, so the period is split into two exact partitions (verified set /
+   * verified null) and the partitions are summed SQL-side — correctness over cleverness, and no
+   * unbounded row fetch. The third query only resolves displayName for the ids that appeared.
+   */
+  private async creditedByMethod(
+    where: Prisma.DepositRequestWhereInput,
+  ): Promise<{ displayName: string; count: number; sumMinor: bigint }[]> {
+    const [verified, claimedOnly] = await Promise.all([
+      this.prisma.depositRequest.groupBy({
+        by: ['paymentMethodId'],
+        where: { ...where, verifiedAmountMinor: { not: null } },
+        _count: { _all: true },
+        _sum: { verifiedAmountMinor: true },
+      }),
+      this.prisma.depositRequest.groupBy({
+        by: ['paymentMethodId'],
+        where: { ...where, verifiedAmountMinor: null },
+        _count: { _all: true },
+        _sum: { claimedAmountMinor: true },
+      }),
+    ]);
+
+    const totals = new Map<string, { count: number; sumMinor: bigint }>();
+    const add = (methodId: string, count: number, sum: bigint | null): void => {
+      const entry = totals.get(methodId) ?? { count: 0, sumMinor: 0n };
+      entry.count += count;
+      entry.sumMinor += sum ?? 0n;
+      totals.set(methodId, entry);
+    };
+    for (const group of verified) {
+      add(group.paymentMethodId, group._count._all, group._sum.verifiedAmountMinor);
+    }
+    for (const group of claimedOnly) {
+      add(group.paymentMethodId, group._count._all, group._sum.claimedAmountMinor);
+    }
+
+    if (totals.size === 0) return [];
+
+    const methods = await this.prisma.paymentMethod.findMany({
+      where: { id: { in: [...totals.keys()] } },
+      select: { id: true, displayName: true },
+    });
+    const names = new Map(methods.map((method) => [method.id, method.displayName]));
+
+    return [...totals.entries()]
+      .map(([methodId, entry]) => ({
+        // A deleted method cannot happen (onDelete: Restrict), but a fallback beats a crash.
+        displayName: names.get(methodId) ?? methodId,
+        count: entry.count,
+        sumMinor: entry.sumMinor,
+      }))
+      .sort((a, b) => {
+        // Biggest rail first — that is the line the operator is looking for. Name breaks ties so
+        // the order is stable between runs.
+        const bySum = compareMinor(b.sumMinor, a.sumMinor);
+        return bySum !== 0 ? bySum : a.displayName.localeCompare(b.displayName);
+      });
+  }
+
+  /** Ungrouped count + sum with the same verified-over-claimed precedence as creditedByMethod. */
+  private async countAndSumDeposits(
+    where: Prisma.DepositRequestWhereInput,
+  ): Promise<{ count: number; sumMinor: bigint }> {
+    const [verified, claimedOnly] = await Promise.all([
+      this.prisma.depositRequest.aggregate({
+        where: { ...where, verifiedAmountMinor: { not: null } },
+        _count: { _all: true },
+        _sum: { verifiedAmountMinor: true },
+      }),
+      this.prisma.depositRequest.aggregate({
+        where: { ...where, verifiedAmountMinor: null },
+        _count: { _all: true },
+        _sum: { claimedAmountMinor: true },
+      }),
+    ]);
+
+    return {
+      count: verified._count._all + claimedOnly._count._all,
+      sumMinor:
+        (verified._sum.verifiedAmountMinor ?? 0n) + (claimedOnly._sum.claimedAmountMinor ?? 0n),
+    };
+  }
+
+  /**
+   * The ledger side of the agent float — THE account-code logic, shared by /float and /report so
+   * the two commands can never disagree about which account "the float" is. From the entries, not
+   * the cached balance, for the reason documented on /float.
+   */
+  private async ledgerFloatMinor(): Promise<bigint> {
+    const currency = this.config.ichancy.currency;
+    const account = await this.accounts.findByCode(this.prisma, ichancyAgentFloatCode(currency));
+    // A float account that has never been posted to is genuinely zero, not missing.
+    return account === null
+      ? 0n
+      : this.accounts.computeBalanceFromEntries(this.prisma, account.id);
   }
 
   // ---------------------------------------------------------------------------------------------

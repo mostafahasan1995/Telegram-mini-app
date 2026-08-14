@@ -9,10 +9,11 @@
  * @OnCommand/@OnCallback/@OnMessage in the worker (the api role never calls bot.handleUpdate), so
  * registering them in the api process would build a dispatch table that can never fire.
  *
- * WHY DepositOutboxHandler is exported: Nest does not merge providers, so the ROOT module assembles
- * the OUTBOX_HANDLERS array:
- *
- *   { provide: OUTBOX_HANDLERS, inject: [DepositOutboxHandler], useFactory: (...h) => h }
+ * WHY DepositOutboxHandler is exported: OutboxModule.forWorker() assembles the OUTBOX_HANDLERS
+ * array from handler classes the worker root passes in (see worker.module.ts) — and injecting a
+ * class across modules requires the owning module to export it. The token itself is bound inside
+ * OutboxModule, next to the processor that consumes it; a root-module binding would be invisible
+ * to that processor's injector.
  *
  * WHAT THIS MODULE DOES NOT PROVIDE, AND MUST NOT:
  *   PLAYER_LINK_PORT     provided by modules/player

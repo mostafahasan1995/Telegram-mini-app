@@ -18,6 +18,7 @@
  */
 import { DepositStatus, type DepositProof, type DepositRequest } from '@prisma/client';
 
+import { dualNsp, formatNspGrouped } from '@common/helpers/money-display.util';
 import { formatMinorToDecimal } from '@common/helpers/money.util';
 import { encodeCallbackData } from '@core/telegram/utils/callback-data.util';
 
@@ -181,6 +182,51 @@ export function renderAdminKeyboard(deposit: DepositRequest): InlineKeyboardMark
 
 function button(text: string, action: string, depositId: string): InlineButton {
   return { text, callback_data: encodeCallbackData(DEPOSIT_CALLBACK_NS, action, depositId) };
+}
+
+export interface OpsCardInput {
+  shortId: string;
+  telegramUserId: bigint;
+  /** Null on a legacy row whose Ichancy account predates the stored credentials. Rendered as —. */
+  ichancyLogin: string | null;
+  ichancyPlayerId: string | null;
+  amountMinor: bigint;
+  /** From the T2 balance snapshot on ICHANCY_AGENT_FLOAT; null when the snapshot is unrecoverable. */
+  floatBeforeMinor: bigint | null;
+  floatAfterMinor: bigint | null;
+  paymentMethodName: string;
+  /** When the credit was confirmed. Rendered in UTC and labelled as such. */
+  creditedAt: Date;
+}
+
+const NO_VALUE = '—';
+
+/**
+ * The credited ops card posted to the admin group — Arabic-first because the operators are; the
+ * field labels follow the market convention the operators already read all day. Deterministic like
+ * renderAdminCard: same inputs, same bytes.
+ */
+export function renderOpsCard(input: OpsCardInput): string {
+  const login = input.ichancyLogin === null ? NO_VALUE : `<code>${esc(input.ichancyLogin)}</code>`;
+  const playerId =
+    input.ichancyPlayerId === null ? NO_VALUE : `<code>${esc(input.ichancyPlayerId)}</code>`;
+  const float = (minor: bigint | null): string =>
+    minor === null ? NO_VALUE : `${esc(formatNspGrouped(minor))} NSP`;
+  // toISOString IS UTC; the label says so because the operators live in another timezone.
+  const time = `${input.creditedAt.toISOString().slice(0, 19).replace('T', ' ')} UTC`;
+
+  return [
+    '📥 <b>عملية شحن على المنصة</b>',
+    `👤 مستخدم التيليغرام: <code>${input.telegramUserId.toString()}</code>`,
+    `🎮 حساب المنصة: ${login}`,
+    `🆔 ID اللاعب: ${playerId}`,
+    `💰 المبلغ المشحون: <b>${esc(dualNsp(input.amountMinor))}</b>`,
+    `📊 رصيد الكاشيرة قبل الشحن: ${float(input.floatBeforeMinor)}`,
+    `📊 رصيد الكاشيرة بعد الشحن: ${float(input.floatAfterMinor)}`,
+    `🧾 المرجع: <code>${esc(input.shortId)}</code>`,
+    `💳 وسيلة الدفع: ${esc(input.paymentMethodName)}`,
+    `📅 الوقت: ${esc(time)}`,
+  ].join('\n');
 }
 
 function orderRisk(flags: readonly RiskFlag[]): RiskFlag[] {

@@ -225,11 +225,14 @@ describe('deposit spine — dependency injection graph', () => {
     let moduleRef: TestingModule;
 
     beforeAll(async () => {
+      // ONE shared instance, exactly as worker.module.ts composes it: the handler classes must
+      // resolve inside OutboxModule (which declares OUTBOX_HANDLERS), not in the root.
+      const depositWorker = DepositModule.forWorker('worker');
       moduleRef = await Test.createTestingModule({
         imports: [
           ...CORE,
-          OutboxModule.forWorker(),
-          DepositModule.forWorker('worker'),
+          OutboxModule.forWorker({ imports: [depositWorker], handlers: [DepositOutboxHandler] }),
+          depositWorker,
           ReconciliationModule.forWorker('worker'),
         ],
       }).compile();
