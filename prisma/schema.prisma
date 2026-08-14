@@ -1,0 +1,956 @@
+// =============================================================================
+// ichancy-cashier — data model
+//
+// Design rules that this schema encodes (read before changing anything):
+//  1. Money is ALWAYS a BigInt column named *Minor, in the currency's minor units. There is no
+//     Decimal, no Float, no Numeric anywhere. Currency.scale is frozen at seed time.
+//  2. The ledger is append-only. ledger_transactions / ledger_entries / audit_logs are protected by
+//     triggers (prisma/sql/002) and grants (prisma/sql/003); Prisma can insert but must never
+//     update or delete them.
+//  3. Double entry: the signed sum of ledger_entries.amount_minor per (transaction, currency) is 0,
+//     enforced by a DEFERRABLE constraint trigger (prisma/sql/001) so multi-row inserts are legal
+//     inside one transaction.
+//  4. The Ichancy API has no idempotency key and no lookup-by-reference. Everything we need to
+//     reconstruct "did the money move?" lives here: ichancy_calls records EVERY attempt, and
+//     deposit_requests keeps the balance readings that justified a BALANCE_DELTA verification.
+//  5. Everything a human claims and everything we verified are SEPARATE columns
+//     (claimedAmountMinor vs verifiedAmountMinor). We never overwrite the claim.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+// Prisma 7 no longer accepts `url` here: the CLI reads the connection string from prisma.config.ts,
+// and PrismaClient gets a @prisma/adapter-pg instance so the pool is ours to configure (DB_POOL_MAX).
+datasource db {
+  provider = "postgresql"
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+enum PlayerStatus {
+  /// Registered with us, not yet mirrored into Ichancy (registerPlayer not confirmed).
+  PENDING_ICHANCY
+  ACTIVE
+  SUSPENDED
+  SELF_EXCLUDED
+  CLOSED
+
+  @@map("player_status")
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  FINANCE_ADMIN
+  REVIEWER
+  SUPPORT
+  VIEWER
+
+  @@map("admin_role")
+}
+
+enum ActorType {
+  PLAYER
+  ADMIN
+  SYSTEM
+
+  @@map("actor_type")
+}
+
+enum PaymentRail {
+  BANK_TRANSFER
+  MOBILE_WALLET
+  CASH_OFFICE
+  CRYPTO
+  /// Internal corrections / float top-ups that did not arrive over a real rail.
+  INTERNAL
+
+  @@map("payment_rail")
+}
+
+enum VerificationMode {
+  /// A human reads the uploaded proof image.
+  MANUAL_PROOF
+  /// Player types the rail's reference and we match it against a statement/whitelist.
+  REFERENCE_MATCH
+  /// Automated statement ingestion (future rails).
+  AUTO_STATEMENT
+  NONE
+
+  @@map("verification_mode")
+}
+
+enum DepositStatus {
+  DRAFT
+  AWAITING_PROOF
+  SUBMITTED
+  UNDER_REVIEW
+  PENDING_SECOND_APPROVAL
+  APPROVED
+  /// Handed to the credit worker; a per-player mutex is held from here until CREDITED/failed.
+  CREDITING
+  CREDITED
+  /// Ichancy explicitly rejected the credit. No ledger movement happened.
+  CREDIT_FAILED
+  /// Ambiguous outcome we could not resolve by balance delta. A human must look at Ichancy.
+  NEEDS_RECONCILIATION
+  REJECTED
+  EXPIRED
+  REVERSED
+
+  @@map("deposit_status")
+}
+
+enum RejectionCode {
+  DUPLICATE_PROOF
+  PROOF_UNREADABLE
+  PROOF_MISSING
+  AMOUNT_MISMATCH
+  REFERENCE_NOT_FOUND
+  WRONG_DESTINATION
+  SENDER_MISMATCH
+  SUSPECTED_FRAUD
+  LIMIT_EXCEEDED
+  PLAYER_INELIGIBLE
+  EXPIRED
+  OTHER
+
+  @@map("rejection_code")
+}
+
+enum ProofSource {
+  PLAYER_UPLOAD
+  ADMIN_UPLOAD
+  TELEGRAM_PHOTO
+  TELEGRAM_DOCUMENT
+  SYSTEM_IMPORT
+
+  @@map("proof_source")
+}
+
+enum LedgerAccountKind {
+  /// Money in transit on a payment rail before we confirm it (one per payment method).
+  RAIL_CLEARING
+  /// Our own confirmed cash.
+  HOUSE_CASH
+  /// What we owe a player who has paid us but is not credited yet (one per player).
+  PLAYER_LIABILITY
+  /// Our finite balance inside the Ichancy agent panel; synced from getAgentAllWallets.
+  ICHANCY_AGENT_FLOAT
+  /// Mirror of what we believe a player holds inside Ichancy (one per player).
+  CASINO_MIRROR
+  /// Receipts we cannot attribute to any deposit yet.
+  SUSPENSE_UNIDENTIFIED
+  /// Absorbs sub-minor-unit differences so every transaction can balance to exactly 0.
+  HOUSE_ROUNDING
+
+  @@map("ledger_account_kind")
+}
+
+enum LedgerTxKind {
+  /// T1: player claims a payment; rail clearing -> player liability.
+  DEPOSIT_CLAIM
+  /// T2: we credited Ichancy; player liability -> casino mirror / agent float.
+  DEPOSIT_CREDIT
+  DEPOSIT_REVERSAL
+  /// We pushed our own money into the Ichancy agent wallet.
+  AGENT_FLOAT_TOPUP
+  /// Correction posted after comparing our float account with getAgentAllWallets.
+  AGENT_FLOAT_SYNC
+  FEE
+  ROUNDING
+  MANUAL_ADJUSTMENT
+  RECONCILIATION_WRITEOFF
+
+  @@map("ledger_tx_kind")
+}
+
+enum IchancyOperation {
+  SIGNIN
+  REFRESH_TOKEN
+  GET_AGENT_ALL_WALLETS
+  DEPOSIT_TO_AGENT
+  WITHDRAW_FROM_AGENT
+  GET_CHILDREN
+  REGISTER_PLAYER
+  GET_PLAYERS_FOR_CURRENT_AGENT
+  DEPOSIT_TO_PLAYER
+  WITHDRAW_FROM_PLAYER
+  GET_PLAYER_BALANCE_BY_ID
+
+  @@map("ichancy_operation")
+}
+
+enum IchancyOutcome {
+  /// status true, no error notification, result not false.
+  OK
+  /// A definite business "no" (HTTP 422, or status:true + an error notification).
+  REJECTED
+  /// HTTP 201/401/403 or an "unauthorized / invalid or expired refresh" notification.
+  TOKEN_EXPIRED
+  /// We do not know whether the money moved. Only balance re-reads can settle this.
+  AMBIGUOUS
+  TIMEOUT
+  TRANSPORT_ERROR
+
+  @@map("ichancy_outcome")
+}
+
+enum OutboxStatus {
+  PENDING
+  IN_FLIGHT
+  SENT
+  FAILED
+  /// Gave up after max attempts; needs a human.
+  DEAD
+
+  @@map("outbox_status")
+}
+
+enum BreakCategory {
+  AGENT_FLOAT_MISMATCH
+  PLAYER_BALANCE_MISMATCH
+  MISSING_CREDIT
+  DUPLICATE_CREDIT
+  UNIDENTIFIED_RECEIPT
+  LEDGER_IMBALANCE
+  ORPHAN_ICHANCY_CALL
+  STUCK_DEPOSIT
+
+  @@map("break_category")
+}
+
+enum BreakStatus {
+  OPEN
+  INVESTIGATING
+  RESOLVED
+  WRITTEN_OFF
+  FALSE_POSITIVE
+
+  @@map("break_status")
+}
+
+/// How we became convinced a credit actually landed. BALANCE_DELTA means the API answer was
+/// ambiguous and we proved it by re-reading getPlayerBalanceById.
+enum CreditVerifiedBy {
+  API_OK
+  BALANCE_DELTA
+  MANUAL
+
+  @@map("credit_verified_by")
+}
+
+// =============================================================================
+// REFERENCE DATA
+// =============================================================================
+
+model Currency {
+  code      String   @id @db.VarChar(3)
+  name      String
+  /// Number of decimal digits in the minor unit. FROZEN at seed: changing it invalidates every
+  /// *Minor column ever written.
+  scale     Int
+  symbol    String?
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  players              Player[]
+  paymentMethods       PaymentMethod[]
+  depositRequests      DepositRequest[]
+  ledgerAccounts       LedgerAccount[]
+  ledgerTransactions   LedgerTransaction[]
+  ledgerEntries        LedgerEntry[]
+  adminApprovalLimits  AdminApprovalLimit[]
+  playerLimits         PlayerLimit[]
+  reconciliationBreaks ReconciliationBreak[]
+
+  @@map("currencies")
+}
+
+model PaymentMethod {
+  id               String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Stable machine code used by the mini-app and by seeds, e.g. SYRIATEL_CASH.
+  code             String           @unique
+  displayName      String           @map("display_name")
+  rail             PaymentRail
+  currencyCode     String           @map("currency_code") @db.VarChar(3)
+  verificationMode VerificationMode @map("verification_mode")
+  isActive         Boolean          @default(true) @map("is_active")
+  sortOrder        Int              @default(0) @map("sort_order")
+
+  minAmountMinor BigInt @map("min_amount_minor")
+  maxAmountMinor BigInt @map("max_amount_minor")
+  /// Fee we keep, charged as fixed + bps of the claimed amount. Posted to HOUSE_CASH via a FEE tx.
+  feeFixedMinor  BigInt @default(0) @map("fee_fixed_minor")
+  feeBps         Int    @default(0) @map("fee_bps")
+
+  /// Player must supply the rail's own reference (bank txn id, wallet receipt no).
+  requiresReference Boolean @default(false) @map("requires_reference")
+  /// Optional regex the reference must match before we accept the submission.
+  referencePattern  String? @map("reference_pattern")
+  /// Free-text shown in the mini-app ("send to the number below, then upload the receipt").
+  instructions      String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  currency        Currency             @relation(fields: [currencyCode], references: [code], onDelete: Restrict)
+  destinations    PaymentDestination[]
+  depositRequests DepositRequest[]
+  ledgerAccounts  LedgerAccount[]
+
+  @@index([isActive, sortOrder])
+  @@index([currencyCode])
+  @@map("payment_methods")
+}
+
+model PaymentDestination {
+  id                String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  paymentMethodId   String  @map("payment_method_id") @db.Uuid
+  label             String
+  /// The account/number/address the player actually pays into.
+  accountIdentifier String  @map("account_identifier")
+  accountHolder     String? @map("account_holder")
+  isActive          Boolean @default(true) @map("is_active")
+  /// Lower = offered first. Lets us rotate destinations without deactivating them.
+  priority          Int     @default(0)
+  /// Soft cap used by the rotation logic to spread volume; not a hard constraint.
+  dailyCapMinor     BigInt? @map("daily_cap_minor")
+  notes             String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  paymentMethod   PaymentMethod    @relation(fields: [paymentMethodId], references: [id], onDelete: Restrict)
+  depositRequests DepositRequest[]
+
+  @@unique([paymentMethodId, accountIdentifier])
+  @@index([paymentMethodId, isActive, priority])
+  @@map("payment_destinations")
+}
+
+// =============================================================================
+// PEOPLE
+// =============================================================================
+
+model Player {
+  id               String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Telegram ids are 64-bit; storing them as BigInt avoids the 2^53 trap.
+  telegramUserId   BigInt       @unique @map("telegram_user_id")
+  telegramUsername String?      @map("telegram_username")
+  firstName        String?      @map("first_name")
+  lastName         String?      @map("last_name")
+  languageCode     String?      @map("language_code")
+  phone            String?
+  status           PlayerStatus @default(PENDING_ICHANCY)
+  currencyCode     String       @default("NSP") @map("currency_code") @db.VarChar(3)
+
+  /// registerPlayer returns the number 1, NOT an id — this is resolved afterwards through
+  /// getPlayersForCurrentAgent(userName=...). Null means the mirror does not exist yet.
+  ichancyPlayerId     String?   @unique @map("ichancy_player_id")
+  /// Credentials we generate at registration time and keep, because the player never sees them.
+  ichancyLogin        String?   @unique @map("ichancy_login")
+  ichancyEmail        String?   @unique @map("ichancy_email")
+  /// Encrypted at rest; never leaves the backend and is never returned by any API.
+  ichancyPasswordEnc  String?   @map("ichancy_password_enc")
+  ichancyRegisteredAt DateTime? @map("ichancy_registered_at") @db.Timestamptz(6)
+
+  lastSeenAt DateTime? @map("last_seen_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  currency             Currency              @relation(fields: [currencyCode], references: [code], onDelete: Restrict)
+  sessions             PlayerSession[]
+  depositRequests      DepositRequest[]
+  ledgerAccounts       LedgerAccount[]
+  limits               PlayerLimit[]
+  selfExclusions       SelfExclusion[]
+  ichancyCalls         IchancyCall[]
+  reconciliationBreaks ReconciliationBreak[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("players")
+}
+
+model PlayerSession {
+  id               String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  playerId         String @map("player_id") @db.Uuid
+  /// Only the hash is stored, so a database dump cannot be replayed as a session.
+  refreshTokenHash String @unique @map("refresh_token_hash")
+
+  issuedAt            DateTime  @default(now()) @map("issued_at") @db.Timestamptz(6)
+  expiresAt           DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt           DateTime? @map("revoked_at") @db.Timestamptz(6)
+  /// Set when this session was rotated; makes refresh-token reuse detectable.
+  replacedBySessionId String?   @unique @map("replaced_by_session_id") @db.Uuid
+
+  ip               String?   @db.Inet
+  userAgent        String?   @map("user_agent")
+  /// auth_date from Telegram initData, kept to audit stale logins.
+  telegramAuthDate DateTime? @map("telegram_auth_date") @db.Timestamptz(6)
+
+  player            Player         @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  replacedBySession PlayerSession? @relation("SessionRotation", fields: [replacedBySessionId], references: [id], onDelete: SetNull)
+  replacesSession   PlayerSession? @relation("SessionRotation")
+
+  @@index([playerId, expiresAt])
+  @@map("player_sessions")
+}
+
+model AdminUser {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  telegramUserId BigInt    @unique @map("telegram_user_id")
+  username       String?   @unique
+  displayName    String    @map("display_name")
+  role           AdminRole
+  isActive       Boolean   @default(true) @map("is_active")
+  /// Optional panel login (argon2/bcrypt hash). Telegram identity alone is enough for the bot.
+  passwordHash   String?   @map("password_hash")
+  totpSecretEnc  String?   @map("totp_secret_enc")
+  lastLoginAt    DateTime? @map("last_login_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  approvalLimits         AdminApprovalLimit[]
+  decidedDeposits        DepositRequest[]      @relation("DepositDecidedBy")
+  secondApprovedDeposits DepositRequest[]      @relation("DepositSecondApprover")
+  assignedBreaks         ReconciliationBreak[] @relation("BreakAssignee")
+  resolvedBreaks         ReconciliationBreak[] @relation("BreakResolver")
+  revokedSelfExclusions  SelfExclusion[]       @relation("SelfExclusionRevoker")
+
+  @@index([role, isActive])
+  @@map("admin_users")
+}
+
+model AdminApprovalLimit {
+  id           String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  adminUserId  String @map("admin_user_id") @db.Uuid
+  currencyCode String @map("currency_code") @db.VarChar(3)
+
+  maxSingleApprovalMinor   BigInt  @map("max_single_approval_minor")
+  maxDailyApprovalMinor    BigInt  @map("max_daily_approval_minor")
+  /// Per-admin override of DUAL_APPROVAL_THRESHOLD_MINOR; null falls back to the env value.
+  secondApprovalAboveMinor BigInt? @map("second_approval_above_minor")
+
+  /// Limits are versioned rather than mutated, so an old decision can always be re-justified.
+  effectiveFrom DateTime  @default(now()) @map("effective_from") @db.Timestamptz(6)
+  effectiveTo   DateTime? @map("effective_to") @db.Timestamptz(6)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  adminUser AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Restrict)
+  currency  Currency  @relation(fields: [currencyCode], references: [code], onDelete: Restrict)
+
+  @@unique([adminUserId, currencyCode, effectiveFrom])
+  @@index([adminUserId, effectiveTo])
+  @@map("admin_approval_limits")
+}
+
+// =============================================================================
+// DEPOSITS
+// =============================================================================
+
+model DepositRequest {
+  id      String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Human-facing reference (Crockford base32, 10 chars). Shown to the player, printed on the admin
+  /// card, and sent as the Ichancy `comment` — the only breadcrumb visible in their panel.
+  shortId String @unique @map("short_id")
+
+  playerId             String  @map("player_id") @db.Uuid
+  paymentMethodId      String  @map("payment_method_id") @db.Uuid
+  paymentDestinationId String? @map("payment_destination_id") @db.Uuid
+  currencyCode         String  @map("currency_code") @db.VarChar(3)
+
+  /// What the player says they sent. NEVER overwritten.
+  claimedAmountMinor  BigInt  @map("claimed_amount_minor")
+  /// What an admin/statement actually confirmed. Null until verified; may differ from the claim.
+  verifiedAmountMinor BigInt? @map("verified_amount_minor")
+  feeMinor            BigInt  @default(0) @map("fee_minor")
+  /// What we actually asked Ichancy to credit (verified - fee). Kept separately so a later fee
+  /// policy change cannot retro-explain an old credit.
+  creditedAmountMinor BigInt? @map("credited_amount_minor")
+
+  status DepositStatus @default(DRAFT)
+
+  /// The rail's own reference typed by the player. Uniqueness is partial (see prisma/sql/004):
+  /// unique per payment method while the deposit is not REJECTED.
+  externalReference String? @map("external_reference")
+  /// Sender account/number as claimed, used to spot mismatched senders.
+  senderAccount     String? @map("sender_account")
+
+  expiresAt        DateTime? @map("expires_at") @db.Timestamptz(6)
+  submittedAt      DateTime? @map("submitted_at") @db.Timestamptz(6)
+  reviewStartedAt  DateTime? @map("review_started_at") @db.Timestamptz(6)
+  decidedAt        DateTime? @map("decided_at") @db.Timestamptz(6)
+  secondApprovedAt DateTime? @map("second_approved_at") @db.Timestamptz(6)
+  creditedAt       DateTime? @map("credited_at") @db.Timestamptz(6)
+
+  decidedByAdminId      String? @map("decided_by_admin_id") @db.Uuid
+  /// Four-eyes: must differ from decidedByAdminId (CHECK constraint, prisma/sql/005).
+  secondApproverAdminId String? @map("second_approver_admin_id") @db.Uuid
+
+  rejectionCode RejectionCode? @map("rejection_code")
+  rejectionNote String?        @map("rejection_note")
+
+  /// Client-supplied idempotency key for the CREATE call, so a retried mini-app POST does not
+  /// open a second deposit.
+  idempotencyKey String? @unique @map("idempotency_key")
+  /// Bumped every time an admin deliberately re-runs the credit. It is part of the BullMQ job id
+  /// and of the per-player Redis mutex key, so a stale worker cannot resurrect an old attempt.
+  creditKeyEpoch Int     @default(0) @map("credit_key_epoch")
+  creditAttempts Int     @default(0) @map("credit_attempts")
+
+  creditVerifiedBy   CreditVerifiedBy? @map("credit_verified_by")
+  /// Ichancy player balance read immediately BEFORE the credit call (b0).
+  balanceBeforeMinor BigInt?           @map("balance_before_minor")
+  /// Balance read after an ambiguous call (b1). (b1 - b0) >= amount proves the credit landed.
+  balanceAfterMinor  BigInt?           @map("balance_after_minor")
+
+  /// T1 (claim) and T2 (credit) pointers. Unique so a ledger transaction can back at most one
+  /// deposit in each role.
+  ledgerClaimTxId  String? @unique @map("ledger_claim_tx_id") @db.Uuid
+  ledgerCreditTxId String? @unique @map("ledger_credit_tx_id") @db.Uuid
+
+  /// Where the review card lives, so the worker can edit the exact message later.
+  adminChatId    BigInt? @map("admin_chat_id")
+  adminMessageId BigInt? @map("admin_message_id")
+  adminThreadId  BigInt? @map("admin_thread_id")
+
+  source    String? @db.VarChar(32)
+  ipAddress String? @map("ip_address") @db.Inet
+  userAgent String? @map("user_agent")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  player              Player              @relation(fields: [playerId], references: [id], onDelete: Restrict)
+  paymentMethod       PaymentMethod       @relation(fields: [paymentMethodId], references: [id], onDelete: Restrict)
+  paymentDestination  PaymentDestination? @relation(fields: [paymentDestinationId], references: [id], onDelete: Restrict)
+  currency            Currency            @relation(fields: [currencyCode], references: [code], onDelete: Restrict)
+  decidedByAdmin      AdminUser?          @relation("DepositDecidedBy", fields: [decidedByAdminId], references: [id], onDelete: Restrict)
+  secondApproverAdmin AdminUser?          @relation("DepositSecondApprover", fields: [secondApproverAdminId], references: [id], onDelete: Restrict)
+  ledgerClaimTx       LedgerTransaction?  @relation("DepositClaimTx", fields: [ledgerClaimTxId], references: [id], onDelete: Restrict)
+  ledgerCreditTx      LedgerTransaction?  @relation("DepositCreditTx", fields: [ledgerCreditTxId], references: [id], onDelete: Restrict)
+
+  proofs               DepositProof[]
+  transitions          DepositTransition[]
+  ichancyCalls         IchancyCall[]
+  ledgerTransactions   LedgerTransaction[]   @relation("LedgerTxDeposit")
+  reconciliationBreaks ReconciliationBreak[]
+
+  @@index([playerId, createdAt])
+  @@index([status, createdAt])
+  @@index([paymentMethodId, status])
+  @@index([shortId])
+  @@map("deposit_requests")
+}
+
+model DepositProof {
+  id               String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  depositRequestId String      @map("deposit_request_id") @db.Uuid
+  source           ProofSource
+
+  /// Object storage coordinates. Files are private; the API hands out short-lived presigned URLs.
+  bucket         String
+  storageKey     String  @map("storage_key")
+  mimeType       String  @map("mime_type")
+  sizeBytes      Int     @map("size_bytes")
+  /// Content hash. Same image re-used across deposits is the cheapest fraud signal we have.
+  sha256         String  @db.Char(64)
+  width          Int?
+  height         Int?
+  /// Telegram's file_id when the proof arrived through the bot rather than the mini-app.
+  telegramFileId String? @map("telegram_file_id")
+
+  uploadedByType ActorType @map("uploaded_by_type")
+  uploadedById   String?   @map("uploaded_by_id") @db.Uuid
+
+  /// Best-effort OCR, used to pre-fill the review card. Never trusted as the verified amount.
+  ocrText        String? @map("ocr_text")
+  ocrAmountMinor BigInt? @map("ocr_amount_minor")
+  ocrReference   String? @map("ocr_reference")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  depositRequest DepositRequest @relation(fields: [depositRequestId], references: [id], onDelete: Restrict)
+
+  @@unique([depositRequestId, sha256])
+  @@index([sha256])
+  @@map("deposit_proofs")
+}
+
+model DepositTransition {
+  id               String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  depositRequestId String         @map("deposit_request_id") @db.Uuid
+  /// Null only for the very first transition into DRAFT.
+  fromStatus       DepositStatus? @map("from_status")
+  toStatus         DepositStatus  @map("to_status")
+
+  actorType ActorType @map("actor_type")
+  actorId   String?   @map("actor_id") @db.Uuid
+  reason    String?
+  /// Anything that explains the move (ichancy error code, matched reference, job id).
+  metadata  Json?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  depositRequest DepositRequest @relation(fields: [depositRequestId], references: [id], onDelete: Restrict)
+
+  @@index([depositRequestId, createdAt])
+  @@index([toStatus, createdAt])
+  @@map("deposit_transitions")
+}
+
+// =============================================================================
+// LEDGER (append-only, double entry)
+// =============================================================================
+
+model LedgerAccount {
+  id   String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Deterministic, human-readable identity, e.g. "PLAYER_LIABILITY:<playerId>" or
+  /// "RAIL_CLEARING:SYRIATEL_CASH". Unique, so account lookup never needs a composite key.
+  code String            @unique
+  kind LedgerAccountKind
+  name String
+
+  currencyCode    String  @map("currency_code") @db.VarChar(3)
+  /// Set for the per-player accounts (PLAYER_LIABILITY, CASINO_MIRROR).
+  playerId        String? @map("player_id") @db.Uuid
+  /// Set for RAIL_CLEARING accounts.
+  paymentMethodId String? @map("payment_method_id") @db.Uuid
+
+  /// Sign convention for reporting: debit-normal accounts (assets) grow with positive entries.
+  isDebitNormal Boolean @map("is_debit_normal")
+  isActive      Boolean @default(true) @map("is_active")
+
+  /// ADVISORY cache for fast float checks on the approval path. The entries table is the truth;
+  /// a reconciliation job rewrites this from SUM(amount_minor).
+  cachedBalanceMinor BigInt    @default(0) @map("cached_balance_minor")
+  cachedAt           DateTime? @map("cached_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  currency             Currency              @relation(fields: [currencyCode], references: [code], onDelete: Restrict)
+  player               Player?               @relation(fields: [playerId], references: [id], onDelete: Restrict)
+  paymentMethod        PaymentMethod?        @relation(fields: [paymentMethodId], references: [id], onDelete: Restrict)
+  entries              LedgerEntry[]
+  reconciliationBreaks ReconciliationBreak[]
+
+  @@index([kind, currencyCode])
+  @@index([playerId, kind])
+  @@map("ledger_accounts")
+}
+
+model LedgerTransaction {
+  id           String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  kind         LedgerTxKind
+  currencyCode String       @map("currency_code") @db.VarChar(3)
+
+  /// When the money actually moved in the real world (may precede postedAt).
+  occurredAt DateTime @map("occurred_at") @db.Timestamptz(6)
+  postedAt   DateTime @default(now()) @map("posted_at") @db.Timestamptz(6)
+
+  description String
+  actorType   ActorType @map("actor_type")
+  actorId     String?   @map("actor_id") @db.Uuid
+
+  depositRequestId String? @map("deposit_request_id") @db.Uuid
+  /// Free-form external anchor (Ichancy comment, bank reference) for forensic search.
+  externalRef      String? @map("external_ref")
+  /// Set on a compensating transaction; the original is never edited.
+  reversesTxId     String? @unique @map("reverses_tx_id") @db.Uuid
+  metadata         Json?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  currency         Currency              @relation(fields: [currencyCode], references: [code], onDelete: Restrict)
+  depositRequest   DepositRequest?       @relation("LedgerTxDeposit", fields: [depositRequestId], references: [id], onDelete: Restrict)
+  reverses         LedgerTransaction?    @relation("LedgerReversal", fields: [reversesTxId], references: [id], onDelete: Restrict)
+  reversedBy       LedgerTransaction?    @relation("LedgerReversal")
+  claimForDeposit  DepositRequest?       @relation("DepositClaimTx")
+  creditForDeposit DepositRequest?       @relation("DepositCreditTx")
+  entries          LedgerEntry[]
+  resolvedBreaks   ReconciliationBreak[] @relation("BreakResolutionTx")
+
+  @@index([kind, postedAt])
+  @@index([depositRequestId])
+  @@index([postedAt])
+  @@map("ledger_transactions")
+}
+
+model LedgerEntry {
+  id                  String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ledgerTransactionId String @map("ledger_transaction_id") @db.Uuid
+  ledgerAccountId     String @map("ledger_account_id") @db.Uuid
+  /// Denormalized from the account so the balance trigger can group without a join.
+  currencyCode        String @map("currency_code") @db.VarChar(3)
+
+  /// SIGNED minor units. Positive = debit, negative = credit. The sum per (transaction, currency)
+  /// must be exactly 0 — enforced by a deferrable constraint trigger, not by application code.
+  amountMinor BigInt  @map("amount_minor")
+  /// Position within the transaction; makes entries reproducible and diffable.
+  sequence    Int
+  memo        String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  transaction LedgerTransaction @relation(fields: [ledgerTransactionId], references: [id], onDelete: Restrict)
+  account     LedgerAccount     @relation(fields: [ledgerAccountId], references: [id], onDelete: Restrict)
+  currency    Currency          @relation(fields: [currencyCode], references: [code], onDelete: Restrict)
+
+  @@unique([ledgerTransactionId, sequence])
+  @@index([ledgerAccountId, createdAt])
+  @@index([ledgerTransactionId])
+  @@map("ledger_entries")
+}
+
+// =============================================================================
+// INFRASTRUCTURE / AUDIT
+// =============================================================================
+
+model OutboxMessage {
+  id            String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  aggregateType String       @map("aggregate_type")
+  aggregateId   String       @map("aggregate_id")
+  /// Routing key, e.g. "deposit.credit.requested" or "telegram.notify.player".
+  topic         String
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+
+  attempts    Int       @default(0)
+  /// Backoff target: the relay only picks rows whose availableAt has passed.
+  availableAt DateTime  @default(now()) @map("available_at") @db.Timestamptz(6)
+  lockedAt    DateTime? @map("locked_at") @db.Timestamptz(6)
+  lockedBy    String?   @map("locked_by")
+  sentAt      DateTime? @map("sent_at") @db.Timestamptz(6)
+  lastError   String?   @map("last_error")
+  /// Optional natural key so the same event cannot be enqueued twice from a retried transaction.
+  dedupeKey   String?   @unique @map("dedupe_key")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([status, availableAt])
+  @@index([aggregateType, aggregateId])
+  @@map("outbox_messages")
+}
+
+model IdempotencyKey {
+  id          String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Namespace, e.g. "deposit.create" — the same client key may exist in different scopes.
+  scope       String
+  key         String
+  /// Hash of the request body; a replay with the SAME key but a different body is a client bug and
+  /// must be rejected rather than silently answered with the old response.
+  requestHash String @map("request_hash")
+
+  /// 'IN_FLIGHT' | 'COMPLETED'. A plain string because this is infrastructure, not a domain enum.
+  state        String  @default("IN_FLIGHT") @db.VarChar(16)
+  /// Cached response replayed on a duplicate call.
+  responseBody Json?   @map("response_body")
+  /// Id of whatever was created (deposit id, ledger tx id).
+  resultRef    String? @map("result_ref")
+
+  lockedAt    DateTime  @default(now()) @map("locked_at") @db.Timestamptz(6)
+  completedAt DateTime? @map("completed_at") @db.Timestamptz(6)
+  expiresAt   DateTime  @map("expires_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([scope, key])
+  @@index([expiresAt])
+  @@map("idempotency_keys")
+}
+
+model TelegramUpdate {
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Telegram's own update_id. UNIQUE is the entire point: webhooks are re-delivered and a replayed
+  /// "approve" callback must never approve twice.
+  updateId BigInt @unique @map("update_id")
+
+  kind       String? @db.VarChar(32)
+  chatId     BigInt? @map("chat_id")
+  fromUserId BigInt? @map("from_user_id")
+  payload    Json
+
+  receivedAt      DateTime  @default(now()) @map("received_at") @db.Timestamptz(6)
+  processedAt     DateTime? @map("processed_at") @db.Timestamptz(6)
+  handler         String?
+  processingError String?   @map("processing_error")
+
+  @@index([receivedAt])
+  @@index([processedAt])
+  @@map("telegram_updates")
+}
+
+model IchancyCall {
+  id        String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  operation IchancyOperation
+  /// 1-based attempt counter within one logical operation (refresh+retry produces attempt 2).
+  attempt   Int              @default(1)
+
+  /// Nullable because a transport failure/timeout never produced a status code.
+  httpStatus   Int?           @map("http_status")
+  outcome      IchancyOutcome
+  /// Request as sent, with credentials/tokens redacted. This is our only forensic record.
+  requestBody  Json           @map("request_body")
+  responseBody Json?          @map("response_body")
+  /// Normalized code (see IchancyRejectionCodes) plus the raw notification content.
+  errorCode    String?        @map("error_code")
+  errorMessage String?        @map("error_message")
+  durationMs   Int            @map("duration_ms")
+
+  depositRequestId String? @map("deposit_request_id") @db.Uuid
+  playerId         String? @map("player_id") @db.Uuid
+  /// Ties every attempt of one logical operation (and its log lines) together.
+  correlationId    String? @map("correlation_id")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  depositRequest       DepositRequest?       @relation(fields: [depositRequestId], references: [id], onDelete: Restrict)
+  player               Player?               @relation(fields: [playerId], references: [id], onDelete: Restrict)
+  reconciliationBreaks ReconciliationBreak[]
+
+  @@index([operation, createdAt])
+  @@index([depositRequestId, createdAt])
+  @@index([outcome, createdAt])
+  @@index([correlationId])
+  @@map("ichancy_calls")
+}
+
+model AuditLog {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  actorType ActorType @map("actor_type")
+  /// Null for SYSTEM. Not a foreign key: the actor may be a player, an admin, or nobody.
+  actorId   String?   @map("actor_id") @db.Uuid
+
+  /// Stable verb, e.g. "deposit.approve", "admin.limit.update".
+  action     String
+  entityType String @map("entity_type")
+  entityId   String @map("entity_id")
+
+  /// Field-level snapshots. Written by the service, never mutated afterwards (immutability trigger).
+  before Json?
+  after  Json?
+
+  ip            String? @db.Inet
+  userAgent     String? @map("user_agent")
+  correlationId String? @map("correlation_id")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([entityType, entityId, createdAt])
+  @@index([actorType, actorId, createdAt])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
+
+model ReconciliationBreak {
+  id       String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  category BreakCategory
+  status   BreakStatus   @default(OPEN)
+  /// 1 = informational, 5 = money is missing right now.
+  severity Int           @default(3)
+
+  currencyCode  String  @map("currency_code") @db.VarChar(3)
+  expectedMinor BigInt? @map("expected_minor")
+  actualMinor   BigInt? @map("actual_minor")
+  deltaMinor    BigInt? @map("delta_minor")
+
+  depositRequestId String? @map("deposit_request_id") @db.Uuid
+  playerId         String? @map("player_id") @db.Uuid
+  ledgerAccountId  String? @map("ledger_account_id") @db.Uuid
+  ichancyCallId    String? @map("ichancy_call_id") @db.Uuid
+
+  detail    Json?
+  /// Stable natural key of the finding so a cron re-run updates instead of duplicating.
+  dedupeKey String? @unique @map("dedupe_key")
+
+  detectedAt        DateTime  @default(now()) @map("detected_at") @db.Timestamptz(6)
+  assignedToAdminId String?   @map("assigned_to_admin_id") @db.Uuid
+  resolvedAt        DateTime? @map("resolved_at") @db.Timestamptz(6)
+  resolvedByAdminId String?   @map("resolved_by_admin_id") @db.Uuid
+  resolutionNote    String?   @map("resolution_note")
+  /// The compensating ledger transaction that closed this break, if any.
+  resolutionTxId    String?   @map("resolution_tx_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  currency        Currency           @relation(fields: [currencyCode], references: [code], onDelete: Restrict)
+  depositRequest  DepositRequest?    @relation(fields: [depositRequestId], references: [id], onDelete: Restrict)
+  player          Player?            @relation(fields: [playerId], references: [id], onDelete: Restrict)
+  ledgerAccount   LedgerAccount?     @relation(fields: [ledgerAccountId], references: [id], onDelete: Restrict)
+  ichancyCall     IchancyCall?       @relation(fields: [ichancyCallId], references: [id], onDelete: Restrict)
+  assignedToAdmin AdminUser?         @relation("BreakAssignee", fields: [assignedToAdminId], references: [id], onDelete: Restrict)
+  resolvedByAdmin AdminUser?         @relation("BreakResolver", fields: [resolvedByAdminId], references: [id], onDelete: Restrict)
+  resolutionTx    LedgerTransaction? @relation("BreakResolutionTx", fields: [resolutionTxId], references: [id], onDelete: Restrict)
+
+  @@index([status, detectedAt])
+  @@index([category, status])
+  @@index([depositRequestId])
+  @@map("reconciliation_breaks")
+}
+
+// =============================================================================
+// RESPONSIBLE GAMING
+// =============================================================================
+
+model PlayerLimit {
+  id           String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  playerId     String @map("player_id") @db.Uuid
+  currencyCode String @map("currency_code") @db.VarChar(3)
+
+  dailyDepositCapMinor   BigInt? @map("daily_deposit_cap_minor")
+  weeklyDepositCapMinor  BigInt? @map("weekly_deposit_cap_minor")
+  monthlyDepositCapMinor BigInt? @map("monthly_deposit_cap_minor")
+  maxSingleDepositMinor  BigInt? @map("max_single_deposit_minor")
+  /// Minimum gap between two deposits; blunt anti-chasing tool.
+  cooldownMinutes        Int?    @map("cooldown_minutes")
+
+  setByType ActorType @map("set_by_type")
+  setById   String?   @map("set_by_id") @db.Uuid
+
+  /// Versioned like admin limits: a tightening applies immediately, a loosening can be scheduled.
+  effectiveFrom DateTime  @default(now()) @map("effective_from") @db.Timestamptz(6)
+  effectiveTo   DateTime? @map("effective_to") @db.Timestamptz(6)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  player   Player   @relation(fields: [playerId], references: [id], onDelete: Restrict)
+  currency Currency @relation(fields: [currencyCode], references: [code], onDelete: Restrict)
+
+  @@unique([playerId, currencyCode, effectiveFrom])
+  @@index([playerId, effectiveTo])
+  @@map("player_limits")
+}
+
+model SelfExclusion {
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  playerId String @map("player_id") @db.Uuid
+
+  startsAt DateTime  @default(now()) @map("starts_at") @db.Timestamptz(6)
+  /// Null = permanent. A permanent exclusion can only be lifted by an admin, never by the player.
+  endsAt   DateTime? @map("ends_at") @db.Timestamptz(6)
+  reason   String?
+
+  requestedByType ActorType @map("requested_by_type")
+  requestedById   String?   @map("requested_by_id") @db.Uuid
+
+  revokedAt        DateTime? @map("revoked_at") @db.Timestamptz(6)
+  revokedByAdminId String?   @map("revoked_by_admin_id") @db.Uuid
+  revocationReason String?   @map("revocation_reason")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  player         Player     @relation(fields: [playerId], references: [id], onDelete: Restrict)
+  revokedByAdmin AdminUser? @relation("SelfExclusionRevoker", fields: [revokedByAdminId], references: [id], onDelete: Restrict)
+
+  @@index([playerId, startsAt])
+  @@index([endsAt])
+  @@map("self_exclusions")
+}

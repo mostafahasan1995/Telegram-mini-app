@@ -1,0 +1,13 @@
+{
+  // WHY a second build config: `npm run dev:api` and `npm run dev:worker` both run
+  // `nest start --watch`, and nest-cli.json sets "deleteOutDir": true. Pointed at the same ./dist,
+  // each watcher deletes the directory the other is compiling into — on Windows that surfaces as
+  // "EPERM: operation not permitted, rmdir 'dist/...'" and BOTH processes die.
+  //
+  // Dev only. `npm run build` still emits every entrypoint (main, main.worker, main.cli) into the
+  // single ./dist that the Dockerfile and the start:* scripts expect.
+  "extends": "./tsconfig.build.json",
+  "compilerOptions": {
+    "outDir": "./dist-worker"
+  }
+}

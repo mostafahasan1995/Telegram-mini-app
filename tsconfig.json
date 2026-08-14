@@ -1,0 +1,49 @@
+{
+  // WHY: strict + noUncheckedIndexedAccess is a hard requirement — money code indexes arrays
+  // (ledger entries, Ichancy `result` arrays that are sometimes [] and sometimes objects) and we
+  // want the compiler to force the undefined check instead of trusting the wire.
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "outDir": "./dist",
+    "baseUrl": "./",
+    "rootDir": "./",
+
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "useUnknownInCatchVariables": true,
+    "exactOptionalPropertyTypes": false,
+    // WHY false: NestJS DI + class-validator DTOs declare properties without initializers and rely
+    // on the framework/decorators to populate them. Everything else stays strict.
+    "strictPropertyInitialization": false,
+
+    "declaration": false,
+    "removeComments": false,
+    "sourceMap": true,
+    "incremental": true,
+    "skipLibCheck": true,
+
+    "types": ["node", "jest"],
+
+    "paths": {
+      "@common/*": ["src/common/*"],
+      "@core/*": ["src/core/*"],
+      "@modules/*": ["src/modules/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "prisma/**/*.ts", "test/**/*.ts", "scripts/**/*.ts", "prisma.config.ts"],
+  "exclude": ["node_modules", "dist", "coverage"]
+}

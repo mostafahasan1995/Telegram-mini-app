@@ -1,0 +1,62 @@
+/**
+ * WHY the deposit module declares its own codes: @common/exceptions owns the edges (auth,
+ * transport, persistence). A code like DEPOSIT_ALREADY_DECIDED is a DOMAIN fact and belongs next to
+ * the service that raises it, so a reader of that service can see the whole contract without
+ * jumping to a shared file that every module edits.
+ *
+ * Same rules as CommonErrorCodes: SCREAMING_SNAKE, never renamed, never reused, no values inside
+ * the code (those go in `details`).
+ */
+export const DepositErrorCodes = {
+  DEPOSIT_NOT_FOUND: 'DEPOSIT_NOT_FOUND',
+  /** The state machine refused: the deposit is no longer in a status this action accepts. */
+  DEPOSIT_INVALID_STATE: 'DEPOSIT_INVALID_STATE',
+  DEPOSIT_ALREADY_DECIDED: 'DEPOSIT_ALREADY_DECIDED',
+  DEPOSIT_EXPIRED: 'DEPOSIT_EXPIRED',
+  DEPOSIT_PROOF_REQUIRED: 'DEPOSIT_PROOF_REQUIRED',
+  DEPOSIT_TOO_MANY_PROOFS: 'DEPOSIT_TOO_MANY_PROOFS',
+  DEPOSIT_TOO_MANY_OPEN: 'DEPOSIT_TOO_MANY_OPEN',
+
+  PAYMENT_METHOD_NOT_FOUND: 'PAYMENT_METHOD_NOT_FOUND',
+  PAYMENT_METHOD_INACTIVE: 'PAYMENT_METHOD_INACTIVE',
+  PAYMENT_DESTINATION_UNAVAILABLE: 'PAYMENT_DESTINATION_UNAVAILABLE',
+  AMOUNT_BELOW_MINIMUM: 'AMOUNT_BELOW_MINIMUM',
+  AMOUNT_ABOVE_MAXIMUM: 'AMOUNT_ABOVE_MAXIMUM',
+  REFERENCE_REQUIRED: 'REFERENCE_REQUIRED',
+  REFERENCE_MALFORMED: 'REFERENCE_MALFORMED',
+  REFERENCE_ALREADY_USED: 'REFERENCE_ALREADY_USED',
+
+  /** Responsible gaming: an active self-exclusion blocks every deposit, no exceptions. */
+  PLAYER_SELF_EXCLUDED: 'PLAYER_SELF_EXCLUDED',
+  PLAYER_SUSPENDED: 'PLAYER_SUSPENDED',
+  DEPOSIT_CAP_EXCEEDED: 'DEPOSIT_CAP_EXCEEDED',
+  DEPOSIT_COOLDOWN_ACTIVE: 'DEPOSIT_COOLDOWN_ACTIVE',
+  SINGLE_DEPOSIT_LIMIT_EXCEEDED: 'SINGLE_DEPOSIT_LIMIT_EXCEEDED',
+
+  /** Review-side authority problems. */
+  ADMIN_LIMIT_EXCEEDED: 'ADMIN_LIMIT_EXCEEDED',
+  ADMIN_DAILY_LIMIT_EXCEEDED: 'ADMIN_DAILY_LIMIT_EXCEEDED',
+  ADMIN_NO_APPROVAL_LIMIT: 'ADMIN_NO_APPROVAL_LIMIT',
+  /** Four eyes: the second approval must come from a DIFFERENT admin. */
+  SECOND_APPROVER_MUST_DIFFER: 'SECOND_APPROVER_MUST_DIFFER',
+  SECOND_APPROVAL_REQUIRED: 'SECOND_APPROVAL_REQUIRED',
+  DEPOSIT_CLAIMED_BY_OTHER: 'DEPOSIT_CLAIMED_BY_OTHER',
+  VERIFIED_AMOUNT_REQUIRED: 'VERIFIED_AMOUNT_REQUIRED',
+  REJECTION_CODE_REQUIRED: 'REJECTION_CODE_REQUIRED',
+
+  /** Float problems — the ledger refuses before we ever call Ichancy. */
+  AGENT_FLOAT_INSUFFICIENT: 'AGENT_FLOAT_INSUFFICIENT',
+
+  /** Proof pipeline. */
+  PROOF_NOT_FOUND: 'PROOF_NOT_FOUND',
+  PROOF_UNREADABLE: 'PROOF_UNREADABLE',
+  PROOF_DUPLICATE_IN_DEPOSIT: 'PROOF_DUPLICATE_IN_DEPOSIT',
+  PROOF_TOO_LARGE: 'PROOF_TOO_LARGE',
+  PROOF_MEDIA_UNSUPPORTED: 'PROOF_MEDIA_UNSUPPORTED',
+
+  /** Ichancy mirror. */
+  PLAYER_LINK_FAILED: 'PLAYER_LINK_FAILED',
+  PLAYER_LINK_AMBIGUOUS: 'PLAYER_LINK_AMBIGUOUS',
+} as const;
+
+export type DepositErrorCode = (typeof DepositErrorCodes)[keyof typeof DepositErrorCodes];

@@ -1,0 +1,107 @@
+# Local infrastructure only. The app itself runs from the host (npm run dev:api / dev:worker)
+# or from the image built by ./Dockerfile — one image, APP_ROLE picks the entrypoint.
+#
+# Host ports default to the standard ones but are overridable, because a dev machine that already
+# runs another Postgres/Redis should not have to edit a tracked file:
+#   POSTGRES_PORT=55432 REDIS_PORT=56379 docker compose up -d
+# (remember to match DATABASE_URL / REDIS_URL in .env when you override them).
+name: ichancy-cashier
+
+services:
+  # OPT-IN. Not started by `docker compose up -d`, because a machine that already runs a Postgres
+  # cannot bind 5432 twice. If you already have one, create a DEDICATED DATABASE on it (never share
+  # a database with another project) and point DATABASE_URL / MIGRATE_DATABASE_URL at that:
+  #   CREATE DATABASE ichancy;
+  #   CREATE ROLE ichancy_app LOGIN PASSWORD '...';   -- the app must NOT be the schema owner
+  #   GRANT CONNECT ON DATABASE ichancy TO ichancy_app;
+  # then: npx prisma migrate deploy && npm run db:bootstrap && npm run seed
+  #
+  # To use this container instead (fresh machine, or you want isolation):
+  #   docker compose --profile local-db up -d
+  # Verified on PostgreSQL 16.13 and 17 — the guarantees in prisma/sql/ hold on both.
+  postgres:
+    image: postgres:17-alpine
+    container_name: ichancy_postgres
+    profiles: ['local-db']
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ichancy
+      POSTGRES_PASSWORD: ichancy
+      POSTGRES_DB: ichancy
+      # WHY: deterministic collation so ORDER BY on shortId/reference is stable across machines.
+      POSTGRES_INITDB_ARGS: '--locale-provider=icu --icu-locale=en-US --encoding=UTF8'
+    command:
+      - postgres
+      - -c
+      - timezone=UTC
+      - -c
+      - max_connections=200
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ichancy -d ichancy']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: ichancy_redis
+    restart: unless-stopped
+    # WHY appendonly: BullMQ jobs and the Ichancy session/lock keys must survive a restart;
+    # losing the refresh token means a re-signin, which invalidates the pair the api role holds.
+    command: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction']
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: ichancy_minio
+    restart: unless-stopped
+    command: ['server', '/data', '--console-address', ':9001']
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - '${MINIO_API_PORT:-9000}:9000' # S3 API
+      - '${MINIO_CONSOLE_PORT:-9001}:9001' # web console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # One-shot: creates the proofs bucket and keeps it private (proofs are served via presigned URLs).
+  minio-init:
+    image: minio/mc:latest
+    container_name: ichancy_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/deposit-proofs &&
+        mc anonymous set none local/deposit-proofs &&
+        echo "minio ready"
+    restart: 'no'
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:

@@ -1,0 +1,27 @@
+node_modules/
+dist/
+dist-worker
+build/
+coverage/
+.env
+.env.*
+!.env.example
+
+# tooling caches
+*.tsbuildinfo
+.eslintcache
+.nest/
+
+# runtime / local data
+logs/
+*.log
+npm-debug.log*
+tmp/
+uploads/
+
+# editors / OS
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
