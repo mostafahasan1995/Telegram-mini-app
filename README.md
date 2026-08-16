@@ -308,6 +308,7 @@ Now open http://localhost:3000/docs to see the API.
 npm run webhook:set
 npm run webhook:set -- --info          # just look, change nothing
 npm run webhook:set -- --drop-pending  # after a long outage
+npm run bot:setup                      # push command menus, bot description and menu button (safe to re-run)
 ```
 
 This is a **manual** step on purpose. It is a global change to your bot. It must not happen
@@ -367,6 +368,9 @@ That is on purpose. A cashier that starts half-configured takes money it cannot 
 | `TELEGRAM_WEBHOOK_SECRET`               | We check this header on every update.                                                |
 | `TELEGRAM_WEBHOOK_PATH_TOKEN`           | Random text in the webhook URL, so nobody can guess it.                              |
 | `TELEGRAM_ADMIN_CHAT_ID`                | The group that gets the review cards. Negative for supergroups.                      |
+| `TELEGRAM_FEED_CHAT_ID`                 | Optional. A second group that also gets the credit card, **masked**. Empty = off.    |
+| `TELEGRAM_FEED_FULL_DETAIL`             | Optional. `true` posts the full card to the feed. Default `false` = masked.          |
+| `REPORT_SCHEDULE_HOURS`                 | Hours between automatic `/report` posts. Default `6`. `0` or empty = off.            |
 | `MINI_APP_ORIGIN`                       | Comma-separated. CORS allow-list. Must be `https` in production.                     |
 | `ICHANCY_BASE_URL`                      | The agent API.                                                                       |
 | `ICHANCY_USERNAME` / `ICHANCY_PASSWORD` | Agent login. **Only the worker uses these.**                                         |

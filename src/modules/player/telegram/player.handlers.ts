@@ -76,6 +76,55 @@ const ABOUT_NAME = 'Ichancy Cashier';
  */
 const PLAYER_DEPOSIT_NS = 'pdep';
 
+/**
+ * The main-menu namespace. Kept apart from 'pdep' above and from the admin deposit card's
+ * namespace (src/modules/deposit/telegram/deposit.handlers.ts) — the registrar routes on the
+ * namespace alone, so a shared prefix would send a player's tap into the wrong handler.
+ */
+const MENU_NS = 'm';
+
+/**
+ * Menu actions — the single source both the keyboard payloads and onMenuTap's router read from,
+ * so a renamed action cannot leave a button that routes nowhere.
+ */
+const MenuAction = {
+  Deposit: 'dep',
+  Balance: 'bal',
+  Deposits: 'deps',
+  Methods: 'methods',
+  Profile: 'profile',
+  Support: 'support',
+  Terms: 'terms',
+  About: 'about',
+} as const;
+
+/**
+ * The /start–/help menu grid, competitor style. Built ONCE at module load so that
+ * encodeCallbackData — the single place that asserts Telegram's 64-BYTE callback_data cap
+ * (Buffer.byteLength, never .length) — runs before the bot ever serves a player: an oversized
+ * payload here is a programming error and must fail the boot, not a random player's tap.
+ */
+const MENU_KEYBOARD: Record<string, unknown> = {
+  inline_keyboard: [
+    [
+      { text: '💵 شحن الرصيد', callback_data: encodeCallbackData(MENU_NS, MenuAction.Deposit) },
+      { text: '💰 رصيدي', callback_data: encodeCallbackData(MENU_NS, MenuAction.Balance) },
+    ],
+    [
+      { text: '📄 إيداعاتي', callback_data: encodeCallbackData(MENU_NS, MenuAction.Deposits) },
+      { text: '🏦 طرق الدفع', callback_data: encodeCallbackData(MENU_NS, MenuAction.Methods) },
+    ],
+    [
+      { text: '👤 حسابي', callback_data: encodeCallbackData(MENU_NS, MenuAction.Profile) },
+      { text: '💬 الدعم', callback_data: encodeCallbackData(MENU_NS, MenuAction.Support) },
+    ],
+    [
+      { text: '📋 الشروط', callback_data: encodeCallbackData(MENU_NS, MenuAction.Terms) },
+      { text: '🟢 حالة الخدمة', callback_data: encodeCallbackData(MENU_NS, MenuAction.About) },
+    ],
+  ],
+};
+
 /** Recorded on `deposit_requests.source`, the way the controller records 'miniapp'. */
 const DEPOSIT_SOURCE = 'telegram:bot';
 
@@ -305,17 +354,18 @@ export class PlayerTelegramHandlers {
       });
 
     const greeting = [
-      `Welcome${from.first_name ? `, ${from.first_name}` : ''}!`,
+      `👋 أهلاً وسهلاً${from.first_name ? ` ${esc(from.first_name)}` : ''}!`,
       '',
-      'This bot is your cashier: open the app to make a deposit, and use /balance to check your',
-      'gaming balance at any time.',
+      `<b>${ABOUT_NAME}</b> — صرّافك هون: اشحن رصيد حسابك وتابع إيداعاتك مباشرة من التلغرام.`,
     ];
 
     if (referral?.outcome === 'BOUND') {
-      greeting.push('', 'You were referred by a friend — thanks for joining through them.');
+      greeting.push('', '🎉 وصلت عن طريق صديق — منورنا!');
     }
 
-    await this.reply(ctx, greeting.join('\n'), this.miniAppKeyboard());
+    greeting.push('', 'اختر من القائمة:');
+
+    await this.reply(ctx, greeting.join('\n'), this.buildMenuKeyboard());
   }
 
   /**
@@ -324,11 +374,109 @@ export class PlayerTelegramHandlers {
    */
   @OnCommand('help')
   async onHelp(ctx: Context): Promise<void> {
-    await this.reply(ctx, HELP_TEXT, this.miniAppKeyboard());
+    await this.reply(ctx, HELP_TEXT, this.buildMenuKeyboard());
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Main menu — the 'm' callback namespace
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * One handler for the whole menu. The spinner is stopped FIRST (answerCallbackQuery), then the
+   * content arrives as a NEW message — the menu is never edited away, so the player can keep
+   * tapping it. Every action routes to the SAME private method its slash command uses.
+   */
+  @OnCallback(MENU_NS)
+  async onMenuTap(ctx: Context): Promise<void> {
+    const query = ctx.callbackQuery;
+    if (query === undefined) return;
+
+    const decoded = decodeCallbackData(query.data);
+    if (decoded === null || decoded.ns !== MENU_NS) {
+      await this.answer(ctx, 'That button is no longer valid.');
+      return;
+    }
+
+    await this.answer(ctx);
+
+    switch (decoded.action) {
+      case MenuAction.Deposit:
+        await this.sendDepositHowTo(ctx);
+        return;
+      case MenuAction.Balance:
+        await this.sendBalance(ctx);
+        return;
+      case MenuAction.Deposits:
+        await this.sendDeposits(ctx);
+        return;
+      case MenuAction.Methods:
+        await this.sendMethods(ctx);
+        return;
+      case MenuAction.Profile:
+        await this.sendProfile(ctx);
+        return;
+      case MenuAction.Support:
+        await this.sendPaySupport(ctx);
+        return;
+      case MenuAction.Terms:
+        await this.sendTerms(ctx);
+        return;
+      case MenuAction.About:
+        await this.sendAbout(ctx);
+        return;
+      default:
+        // A button minted before a deploy that renamed an action. Point back at the live menu.
+        await this.reply(ctx, 'That button is no longer valid — send /help for the current menu.');
+    }
+  }
+
+  /**
+   * m:dep — the menu button cannot carry an amount, so it TEACHES the command instead of starting
+   * a deposit. Nothing is created here: the money write stays behind /deposit <amount>.
+   */
+  private async sendDepositHowTo(ctx: Context): Promise<void> {
+    const player = await this.requirePlayer(ctx);
+    if (player === null) return;
+
+    const methods = await this.activeMethodsFor(player.currencyCode);
+    if (methods.length === 0) {
+      await this.reply(
+        ctx,
+        [
+          `No payment method is open for <b>${esc(player.currencyCode)}</b> at the moment.`,
+          'لا توجد طريقة دفع متاحة حالياً — جرّب بعد قليل.',
+        ].join('\n'),
+      );
+      return;
+    }
+
+    const lines = ['💵 <b>شحن الرصيد</b>', '', 'طرق الدفع المتاحة والحدود:'];
+
+    for (const method of methods) {
+      lines.push(
+        `• <b>${esc(method.displayName)}</b>: <code>${formatMinorToDecimal(method.minAmountMinor)}</code> – ` +
+          `<code>${formatMinorToDecimal(method.maxAmountMinor)}</code> ${esc(method.currencyCode)}`,
+      );
+    }
+
+    lines.push(
+      '',
+      'اكتب المبلغ بعد الأمر، مثال:',
+      '<b>/deposit 50000</b>',
+      '',
+      'ثم أرسل صورة الإيصال هنا.',
+    );
+
+    await this.reply(ctx, lines.join('\n'));
   }
 
   @OnCommand('balance')
   async onBalance(ctx: Context): Promise<void> {
+    await this.sendBalance(ctx);
+  }
+
+  /** The /balance body — shared with the m:bal button. */
+  private async sendBalance(ctx: Context): Promise<void> {
     const from = ctx.from;
     if (from === undefined || from.is_bot) return;
 
@@ -382,6 +530,11 @@ export class PlayerTelegramHandlers {
    */
   @OnCommand('profile')
   async onProfile(ctx: Context): Promise<void> {
+    await this.sendProfile(ctx);
+  }
+
+  /** The /profile body — shared with the m:profile button. */
+  private async sendProfile(ctx: Context): Promise<void> {
     const player = await this.requirePlayer(ctx);
     if (player === null) return;
 
@@ -431,6 +584,11 @@ export class PlayerTelegramHandlers {
 
   @OnCommand('methods')
   async onMethods(ctx: Context): Promise<void> {
+    await this.sendMethods(ctx);
+  }
+
+  /** The /methods body — shared with the m:methods button. */
+  private async sendMethods(ctx: Context): Promise<void> {
     const player = await this.requirePlayer(ctx);
     if (player === null) return;
 
@@ -632,6 +790,11 @@ export class PlayerTelegramHandlers {
 
   @OnCommand('deposits')
   async onDeposits(ctx: Context): Promise<void> {
+    await this.sendDeposits(ctx);
+  }
+
+  /** The /deposits body — shared with the m:deps button. */
+  private async sendDeposits(ctx: Context): Promise<void> {
     const player = await this.requirePlayer(ctx);
     if (player === null) return;
 
@@ -683,6 +846,11 @@ export class PlayerTelegramHandlers {
 
   @OnCommand('terms')
   async onTerms(ctx: Context): Promise<void> {
+    await this.sendTerms(ctx);
+  }
+
+  /** The /terms body — shared with the m:terms button. */
+  private async sendTerms(ctx: Context): Promise<void> {
     await this.reply(ctx, TERMS_TEXT);
   }
 
@@ -700,6 +868,11 @@ export class PlayerTelegramHandlers {
    */
   @OnCommand('about')
   async onAbout(ctx: Context): Promise<void> {
+    await this.sendAbout(ctx);
+  }
+
+  /** The /about body — shared with the m:about (حالة الخدمة) button. */
+  private async sendAbout(ctx: Context): Promise<void> {
     const [db, redis] = await Promise.all([this.checkDb(), this.checkRedis()]);
     const healthy = db.up && redis.up;
 
@@ -753,6 +926,11 @@ export class PlayerTelegramHandlers {
    */
   @OnCommand('paysupport')
   async onPaySupport(ctx: Context): Promise<void> {
+    await this.sendPaySupport(ctx);
+  }
+
+  /** The /paysupport body — shared with the m:support button. */
+  private async sendPaySupport(ctx: Context): Promise<void> {
     await this.reply(ctx, PAYSUPPORT_TEXT);
   }
 
@@ -1095,6 +1273,11 @@ export class PlayerTelegramHandlers {
    * developer running on http://localhost would see every /start silently fail. Below https, the
    * keyboard is simply omitted.
    */
+  /** The one menu keyboard, shared by /start, /help and anywhere the menu should reappear. */
+  private buildMenuKeyboard(): Record<string, unknown> {
+    return MENU_KEYBOARD;
+  }
+
   private miniAppKeyboard(): Record<string, unknown> | undefined {
     const url = this.config.app.baseUrl;
     if (!url.startsWith('https://')) return undefined;
@@ -1113,9 +1296,13 @@ export class PlayerTelegramHandlers {
     }
   }
 
-  private async answer(ctx: Context, text: string, alert = false): Promise<void> {
+  /** No text just stops the client's spinner — what a menu tap wants before its real answer. */
+  private async answer(ctx: Context, text?: string, alert = false): Promise<void> {
     try {
-      await ctx.answerCallbackQuery({ text, show_alert: alert });
+      await ctx.answerCallbackQuery({
+        ...(text !== undefined ? { text } : {}),
+        show_alert: alert,
+      });
     } catch (error: unknown) {
       // An unanswered query only spins the client's loader; it is never worth an exception.
       this.logger.warn(`answerCallbackQuery failed: ${describeError(error)}`);

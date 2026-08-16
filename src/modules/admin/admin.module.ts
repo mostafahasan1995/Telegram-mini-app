@@ -12,6 +12,21 @@
  * through ICHANCY_PORT. The module is not @Global, so the token has to be brought in here; the
  * ledger side of the same command arrives through @Global LedgerModule.
  *
+ * ActivityReportService is exported because /report's body is no longer owned by a Telegram
+ * handler: anything that wants to render the SAME activity report on a schedule injects this
+ * instead of growing a second copy that drifts on the next label change. ReportScheduleCron is that
+ * scheduled sender.
+ *
+ * WHY TelegramModule is imported: ReportScheduleCron posts through BotService, and TelegramModule is
+ * not @Global (CacheModule and LedgerModule are, which is why LockService, RedisService and the
+ * ledger arrive unasked). Both real compositions — app.module.ts and worker.module.ts — already
+ * import it, so this adds nothing to either process; it only makes this module's own dependency
+ * honest instead of relying on a parent to have imported it.
+ *
+ * WHY ReportScheduleCron is an UNCONDITIONAL provider like the reconciliation crons: `@Interval`
+ * only becomes behaviour where ScheduleModule is imported, and that is worker.module.ts alone. The
+ * `config.app.isWorker` guard inside tick() is the belt to that braces.
+ *
  * WHY AdminTelegramHandlers is an UNCONDITIONAL provider, exactly as PlayerModule registers
  * PlayerTelegramHandlers: TelegramHandlerRegistrar discovers handlers via DiscoveryService and
  * skips registration entirely in the api role, so listing it here costs an api process one object
@@ -22,24 +37,29 @@ import { Module } from '@nestjs/common';
 
 import { AuthModule } from '@core/auth/auth.module';
 import { IchancyModule } from '@core/ichancy/ichancy.module';
+import { TelegramModule } from '@core/telegram/telegram.module';
 
 import { AdminApprovalLimitController } from './controllers/admin-approval-limit.controller';
 import { AdminUserController } from './controllers/admin-user.controller';
 import { AdminApprovalLimitRepository } from './repositories/admin-approval-limit.repository';
 import { AdminUserRepository } from './repositories/admin-user.repository';
+import { ActivityReportService } from './services/activity-report.service';
 import { AdminApprovalLimitService } from './services/admin-approval-limit.service';
 import { AdminUserService } from './services/admin-user.service';
+import { ReportScheduleCron } from './services/report-schedule.cron';
 import { AdminTelegramHandlers } from './telegram/admin.handlers';
 import { APPROVAL_LIMIT_PORT } from './approval-limit.port';
 
 @Module({
-  imports: [AuthModule, IchancyModule],
+  imports: [AuthModule, IchancyModule, TelegramModule],
   controllers: [AdminUserController, AdminApprovalLimitController],
   providers: [
     AdminUserRepository,
     AdminApprovalLimitRepository,
     AdminUserService,
     AdminApprovalLimitService,
+    ActivityReportService,
+    ReportScheduleCron,
     AdminTelegramHandlers,
     { provide: APPROVAL_LIMIT_PORT, useExisting: AdminApprovalLimitService },
   ],
@@ -49,6 +69,7 @@ import { APPROVAL_LIMIT_PORT } from './approval-limit.port';
     AdminUserService,
     AdminUserRepository,
     AdminApprovalLimitRepository,
+    ActivityReportService,
   ],
 })
 export class AdminModule {}

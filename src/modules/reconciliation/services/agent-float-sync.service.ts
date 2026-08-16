@@ -26,8 +26,10 @@ import { BreakCategory, LedgerTxKind } from '@prisma/client';
 import type { AuthenticatedAdmin } from '@common/decorators/auth.types';
 import { BusinessRuleError } from '@common/exceptions/app.exception';
 import { formatMinorToDecimal } from '@common/helpers/money.util';
+import { dualNsp } from '@common/helpers/money-display.util';
 import { adminActor } from '@common/types/actor.type';
 import { LockService } from '@core/cache/lock.service';
+import { RedisService } from '@core/cache/redis.service';
 import { AppConfigService } from '@core/config/config.service';
 import { ICHANCY_PORT, type IchancyPort } from '@core/ichancy';
 import {
@@ -65,9 +67,15 @@ export interface FloatSyncResult {
 /** Money is missing or unexplained. Not the top severity — the books are still internally consistent. */
 const SEVERITY_FLOAT_DRIFT = 4;
 
+/** One low-float warning per this window (6 h); /float shows the live figure on demand anytime. */
+const LOW_FLOAT_WARN_WINDOW_SECONDS = 6 * 60 * 60;
+
 @Injectable()
 export class AgentFloatSyncService {
   private readonly logger = new Logger(AgentFloatSyncService.name);
+
+  /** So the fake-mode skip announces itself once, not every 5 minutes. */
+  private fakeSkipLogged = false;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -77,12 +85,26 @@ export class AgentFloatSyncService {
     private readonly locks: LockService,
     private readonly bot: BotService,
     private readonly config: AppConfigService,
+    private readonly redis: RedisService,
     @Inject(ICHANCY_PORT) private readonly ichancy: IchancyPort,
   ) {}
 
   @Interval('agent-float-sync', AGENT_FLOAT_SYNC_INTERVAL_MS)
   async tick(): Promise<void> {
     if (!this.config.app.isWorker) return;
+
+    // The fake adapter's wallet is a hardcoded default, so comparing it against the ledger
+    // manufactures a "drift" that is pure noise — an ERROR log and an admin-group warning every
+    // five minutes, none of it actionable. An alarm that is never real teaches operators to skim
+    // past alarms, so in fake mode the whole sync is inert. The admin /float command still works
+    // and says the wallet read comes from the fake.
+    if (this.config.ichancy.fake) {
+      if (!this.fakeSkipLogged) {
+        this.logger.log('agent float sync skipped: Ichancy is FAKE (no real wallet to compare)');
+        this.fakeSkipLogged = true;
+      }
+      return;
+    }
 
     const handle = await this.locks.acquire(
       LockService.key('cron', 'agent-float-sync'),
@@ -257,12 +279,39 @@ export class AgentFloatSyncService {
     return this.accounts.computeBalanceFromEntries(this.prisma, account.id);
   }
 
+  /**
+   * The low-float warning, competitor-style Arabic, throttled to once per window via SET NX.
+   *
+   * WHY throttled here and not at the caller: the sync runs every 5 minutes and the float stays low
+   * until a human tops it up — un-throttled, that is 72 identical warnings a day, and the 73rd is
+   * the one nobody reads. One warning per window keeps the signal; /float always shows the live
+   * number on demand.
+   */
   private async warnLowFloat(currencyCode: string, availableMinor: bigint): Promise<void> {
+    const first = await this.redis.set(
+      `recon:float-low-warned:${currencyCode}`,
+      new Date().toISOString(),
+      'EX',
+      LOW_FLOAT_WARN_WINDOW_SECONDS,
+      'NX',
+    );
+    if (first === null) return; // warned recently; stay quiet until the window expires
+
+    const watermarkMinor = this.config.limits.agentFloatLowWatermarkMinor;
+    const shortfallMinor = watermarkMinor - availableMinor;
+    // notifyAdmins ONLY — never notifyFeed: this is our working capital and the fact that we are
+    // nearly out of it. The feed group may contain customers, for whom it is a run signal.
     await this.bot.notifyAdmins(
-      `⚠️ <b>Agent float is low</b>\n` +
-        `Available: <b>${formatMinorToDecimal(availableMinor)} ${currencyCode}</b>\n` +
-        `Watermark: ${formatMinorToDecimal(this.config.limits.agentFloatLowWatermarkMinor)} ${currencyCode}\n` +
-        `<i>Credits will start failing with INSUFFICIENT_AGENT_FLOAT once it runs out.</i>`,
+      [
+        '⚠️ <b>تنبيه: رصيد الكاشيرة منخفض</b>',
+        '━━━━━━━━━━━━━━━━━━━━',
+        `📊 الرصيد المتاح: <b>${dualNsp(availableMinor)}</b>`,
+        `📉 حد الأمان: ${dualNsp(watermarkMinor)}`,
+        `🔻 النقص: <b>${dualNsp(shortfallMinor)}</b>`,
+        '━━━━━━━━━━━━━━━━━━━━',
+        '⛔ عند نفاد الرصيد ستُرفض عمليات الشحن تلقائياً',
+        '💡 اشحن رصيد الوكيل في أقرب وقت — ثم /float للتأكد',
+      ].join('\n'),
       { parseMode: 'HTML', linkPreview: false },
     );
   }

@@ -144,6 +144,8 @@ export class InvariantCheckCron {
     if (worst.length > 0) {
       lines.push('', '<b>At least one is a real imbalance, not a cache drift.</b>');
     }
+    // notifyAdmins ONLY — never notifyFeed: "our books do not add up" is an internal engineering
+    // signal, and in a group that may contain customers it reads as "your money is missing".
     await this.bot.notifyAdmins(lines.join('\n'), { parseMode: 'HTML', linkPreview: false });
   }
 }

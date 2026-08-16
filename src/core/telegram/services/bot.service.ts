@@ -209,6 +209,22 @@ export class BotService {
     return this.sendMessage(this.config.telegram.adminChatId, text, options);
   }
 
+  /**
+   * Posts to the OPTIONAL feed chat — the customer-visible group that mirrors credited deposits.
+   *
+   * Returns null WITHOUT touching the Bot API when no feed chat is configured, so call sites stay
+   * unconditional and the unconfigured case is indistinguishable from the "chat is unreachable"
+   * case they already handle. Never throws for being unconfigured: the feed is a nice-to-have and
+   * must not be able to fail a money job.
+   *
+   * NOTHING operational goes here — see notifyAdmins for alerts. This chat may contain customers.
+   */
+  async notifyFeed(text: string, options: SendOptions = {}): Promise<Message.TextMessage | null> {
+    const feedChatId = this.config.telegram.feedChatId;
+    if (feedChatId === null) return null;
+    return this.sendMessage(feedChatId, text, options);
+  }
+
   /** Registers our webhook URL. Used by the `webhook:set` CLI command. */
   async setWebhook(
     url: string,

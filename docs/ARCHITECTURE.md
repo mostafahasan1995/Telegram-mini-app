@@ -108,6 +108,12 @@ There is no `wallet.balance` column that gets edited. A "wallet" is a `LedgerAcc
 | ledger invariants | 15 min | Σ per tx = 0, global Σ = 0, balances = Σ entries |
 | rail ageing | (see service) | "approved but never proved" report |
 | idempotency reaper | 10 min | delete expired idempotency keys |
+| scheduled report | 10 min tick | posts the `/report` body every `REPORT_SCHEDULE_HOURS` (0 = off) |
+
+The scheduled report is the odd one: the tick is fixed because `@Interval` needs a constant, and a
+Redis marker (`SET NX EX`) decides which tick actually posts. That is what makes a restart neither
+re-post nor reset the schedule, and what stops two workers posting the same report. It goes to the
+feed group if one is configured, otherwise to the admin group — never nowhere.
 
 ## The three Ichancy problems and our answers
 

@@ -16,10 +16,12 @@ import { validateEnv, type Env } from './env.schema';
  * @nestjs/config reads .env with `dotenv.parse()`, which deliberately does NOT mutate process.env.
  * It copies the values across afterwards — but only the ones that are still string | number |
  * boolean. Every var our schema TRANSFORMS into another type is therefore absent from process.env:
- * MINI_APP_ORIGIN (-> string[]), TELEGRAM_ADMIN_CHAT_ID, DUAL_APPROVAL_THRESHOLD_MINOR and
- * AGENT_FLOAT_LOW_WATERMARK_MINOR (-> bigint). Validating process.env a second time reported those
- * four as "expected string, received undefined" and refused to boot, even though .env defined all
- * of them correctly.
+ * MINI_APP_ORIGIN (-> string[]), TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_FEED_CHAT_ID,
+ * DUAL_APPROVAL_THRESHOLD_MINOR and AGENT_FLOAT_LOW_WATERMARK_MINOR (-> bigint), ICHANCY_FAKE and
+ * TELEGRAM_FEED_FULL_DETAIL (-> boolean). Validating process.env a second time reported the
+ * required ones as "expected string, received undefined" and refused to boot, even though .env
+ * defined all of them correctly — and silently read the optional ones as unset, which is worse,
+ * because a feature configured in .env would simply not happen and nothing would say why.
  *
  * The fallback still covers containers, where the vars are real environment variables and
  * `ignoreEnvFile` is true, so the hook never runs with file contents.

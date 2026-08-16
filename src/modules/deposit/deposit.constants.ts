@@ -48,6 +48,17 @@ export const DEPOSIT_CREATE_SCOPE = 'deposit.create';
  */
 export const OPS_CARD_IDEMPOTENCY_SCOPE = 'deposit.ops_card';
 
+/**
+ * The SAME guard for the optional feed group, under its OWN scope (key = deposit id).
+ *
+ * WHY a second scope instead of reusing the one above: one scope means one record, and one record
+ * means the two sends share a fate. A feed send that failed would leave the record released and a
+ * redelivery would post the admin card twice; a feed send that succeeded would mark the key
+ * COMPLETED and a redelivery would skip the admin card that never went out. Separate scopes make
+ * each target's history its own — either can fail, replay or be retried without touching the other.
+ */
+export const OPS_CARD_FEED_IDEMPOTENCY_SCOPE = 'deposit.ops_card.feed';
+
 /** Telegram callback namespaces. Kept to 3 characters — callback_data has a 64 BYTE budget. */
 export const DEPOSIT_CALLBACK = {
   CLAIM: 'd:c',

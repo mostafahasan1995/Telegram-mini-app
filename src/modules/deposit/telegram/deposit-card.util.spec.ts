@@ -5,9 +5,13 @@ import { CALLBACK_DATA_MAX_BYTES } from '@core/telegram/utils/callback-data.util
 import { RiskFlags } from '../enums/risk-flag.enum';
 import {
   esc,
+  mask,
   renderAdminCard,
   renderAdminKeyboard,
+  renderOpsCard,
+  renderOpsCardPublic,
   renderPlayerMessage,
+  type OpsCardInput,
 } from './deposit-card.util';
 
 const DEPOSIT_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
@@ -138,6 +142,119 @@ describe('renderAdminKeyboard', () => {
         );
       }
     }
+  });
+});
+
+describe('mask', () => {
+  it('keeps only the last three characters, behind a fixed-length prefix', () => {
+    expect(mask('player_hamza')).toBe('•••mza');
+    expect(mask('90210123')).toBe('•••123');
+  });
+
+  it('accepts a bigint without going through Number', () => {
+    // 6243119785 > 2^32; a Number round-trip would still be exact here, but the point is that the
+    // function never reaches for one — the same call with a >2^53 id must keep its real last digits.
+    expect(mask(6_243_119_785n)).toBe('•••785');
+    expect(mask(90_071_992_547_409_931n)).toBe('•••931');
+  });
+
+  it('reveals NOTHING when "the last three" would be the whole value', () => {
+    expect(mask('abc')).toBe('•••');
+    expect(mask('ab')).toBe('•••');
+    expect(mask('a')).toBe('•••');
+    expect(mask(42n)).toBe('•••');
+  });
+
+  it('renders a missing value as the same em-dash the full card uses', () => {
+    expect(mask(null)).toBe('—');
+    expect(mask(undefined)).toBe('—');
+    expect(mask('')).toBe('—');
+    expect(mask('   ')).toBe('—');
+  });
+
+  it('never leaks the length of what it hid', () => {
+    // One bullet per hidden character would turn the mask into a length oracle.
+    expect(mask('abcd')).toHaveLength(mask('abcdefghijklmnopqrstuvwxyz').length);
+  });
+
+  it('never reveals more than three characters, whatever it is given', () => {
+    for (const value of ['abcd', 'x'.repeat(200), '  padded_login  ', '000000000000']) {
+      expect(mask(value).replace('•••', '').length).toBeLessThanOrEqual(3);
+    }
+  });
+});
+
+describe('renderOpsCardPublic', () => {
+  const opsCard: OpsCardInput = {
+    shortId: 'K7Q2ZP9V3M',
+    telegramUserId: 6_243_119_785n,
+    ichancyLogin: 'player_hamza',
+    ichancyPlayerId: '90210123',
+    amountMinor: 150_000n,
+    floatBeforeMinor: 8_800_000n,
+    floatAfterMinor: 8_650_000n,
+    paymentMethodName: 'Syriatel Cash',
+    creditedAt: new Date('2026-08-12T09:31:07.000Z'),
+  };
+
+  it('is deterministic — the same inputs produce byte-identical text', () => {
+    expect(renderOpsCardPublic(opsCard)).toBe(renderOpsCardPublic(opsCard));
+  });
+
+  /** The whole reason this variant exists: the feed group may contain customers. */
+  it('never contains the cashier float, in any form', () => {
+    const text = renderOpsCardPublic(opsCard);
+    expect(text).not.toContain('رصيد الكاشيرة');
+    expect(text).not.toContain('88,000.00'); // floatBeforeMinor
+    expect(text).not.toContain('86,500.00'); // floatAfterMinor
+    expect(text).not.toContain('8800000');
+    expect(text).not.toContain('8650000');
+  });
+
+  it('masks every identifier and leaks none of them whole', () => {
+    const text = renderOpsCardPublic(opsCard);
+    expect(text).toContain('•••785');
+    expect(text).toContain('•••mza');
+    expect(text).toContain('•••123');
+    expect(text).not.toContain('6243119785');
+    expect(text).not.toContain('player_hamza');
+    expect(text).not.toContain('90210123');
+  });
+
+  it('keeps the amount in both market currencies, the method, the reference and the time', () => {
+    const text = renderOpsCardPublic(opsCard);
+    expect(text).toContain('1,500.00 جديدة | 150,000 قديمة');
+    expect(text).toContain('Syriatel Cash');
+    expect(text).toContain('K7Q2ZP9V3M');
+    expect(text).toContain('2026-08-12 09:31:07 UTC');
+  });
+
+  it('reads as the same product as the admin card, and ends on a friendly line', () => {
+    const text = renderOpsCardPublic(opsCard);
+    expect(text.startsWith('📥 <b>عملية شحن على المنصة</b>')).toBe(true);
+    expect(text.endsWith('✅ تم شحن الرصيد بنجاح')).toBe(true);
+  });
+
+  it('renders a missing login or player id as — rather than an empty mask', () => {
+    const text = renderOpsCardPublic({ ...opsCard, ichancyLogin: null, ichancyPlayerId: null });
+    expect(text).toContain('🎮 حساب المنصة: <code>—</code>');
+    expect(text).toContain('🆔 ID اللاعب: <code>—</code>');
+  });
+
+  it('escapes what survives masking — a login is player-supplied text', () => {
+    const text = renderOpsCardPublic({ ...opsCard, ichancyLogin: 'evil<b>' });
+    expect(text).not.toContain('•••<b>');
+    expect(text).toContain('•••&lt;b&gt;');
+  });
+
+  /** Guard: the admin card is the money record and must not have been softened by any of this. */
+  it('is the only masked variant — renderOpsCard still shows everything', () => {
+    const admin = renderOpsCard(opsCard);
+    expect(admin).toContain('رصيد الكاشيرة قبل الشحن: 88,000.00 NSP');
+    expect(admin).toContain('رصيد الكاشيرة بعد الشحن: 86,500.00 NSP');
+    expect(admin).toContain('6243119785');
+    expect(admin).toContain('player_hamza');
+    expect(admin).not.toContain('•••');
   });
 });
 

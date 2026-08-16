@@ -23,15 +23,17 @@ import { BALANCE_SNAPSHOT_METADATA_KEY, ichancyAgentFloatCode } from '@core/ledg
 import { PrismaService } from '@core/prisma/prisma.service';
 import { BotService } from '@core/telegram/services/bot.service';
 
-import { OPS_CARD_IDEMPOTENCY_SCOPE } from '../deposit.constants';
+import { OPS_CARD_FEED_IDEMPOTENCY_SCOPE, OPS_CARD_IDEMPOTENCY_SCOPE } from '../deposit.constants';
 import { DepositRepository } from '../repositories/deposit.repository';
 import { DepositService } from './deposit.service';
 import {
   renderAdminCard,
   renderAdminKeyboard,
   renderOpsCard,
+  renderOpsCardPublic,
   renderPlayerMessage,
   esc,
+  type OpsCardInput,
 } from '../telegram/deposit-card.util';
 
 @Injectable()
@@ -127,6 +129,11 @@ export class DepositNotifyService {
    * modified" safety net, so the send is guarded by an insert-first idempotency record
    * (scope deposit.ops_card, key = deposit id): a redelivery replays COMPLETED and skips; a failed
    * send releases the record and rethrows so the redelivery may try again.
+   *
+   * TWO TARGETS, TWO GUARDS: when a feed group is configured the same credit is mirrored there via
+   * postFeedOpsCard, under its OWN idempotency scope and with a MASKED card by default (the feed
+   * may contain customers). The admin card is the one that matters — the feed can never fail this
+   * method, and this method's failures can never cost the feed its attempt.
    */
   async postCreditedOpsCard(depositRequestId: string): Promise<void> {
     const deposit = await this.prisma.depositRequest.findUnique({
@@ -167,7 +174,7 @@ export class DepositNotifyService {
       this.logger.warn(`no agent-float snapshot on T2 of ${deposit.shortId}; card shows — for it`);
     }
 
-    const text = renderOpsCard({
+    const card: OpsCardInput = {
       shortId: deposit.shortId,
       telegramUserId: deposit.player.telegramUserId,
       ichancyLogin: deposit.player.ichancyLogin,
@@ -177,8 +184,29 @@ export class DepositNotifyService {
       floatAfterMinor: snapshot?.afterMinor ?? null,
       paymentMethodName: deposit.paymentMethod.displayName,
       creditedAt: deposit.creditedAt ?? t2?.postedAt ?? new Date(),
-    });
+    };
+    const adminText = renderOpsCard(card);
 
+    try {
+      await this.postAdminOpsCard(deposit, adminText);
+    } finally {
+      // In `finally`, not after the await: the admin path throws on contention and rethrows a
+      // failed send, and the feed must not inherit either. The two targets carry separate
+      // idempotency scopes, so neither can suppress or duplicate the other. postFeedOpsCard never
+      // throws, so an admin error propagating through here is never replaced by a feed error.
+      await this.postFeedOpsCard(deposit, card, adminText);
+    }
+  }
+
+  /**
+   * The admin-group half of the ops card. Unchanged behaviour: guarded by the
+   * `deposit.ops_card` idempotency record, throws on contention so the queue retries, rethrows a
+   * failed send after giving the key back. This is the card that matters operationally.
+   */
+  private async postAdminOpsCard(
+    deposit: { id: string; shortId: string },
+    text: string,
+  ): Promise<void> {
     const begun = await this.idempotency.begin({
       scope: OPS_CARD_IDEMPOTENCY_SCOPE,
       key: deposit.id,
@@ -221,6 +249,83 @@ export class DepositNotifyService {
       // 429/5xx: give the key back so the queue retry may actually send, then let it retry.
       await this.idempotency.release(begun.lease, 'ops card send failed');
       throw cause;
+    }
+  }
+
+  /**
+   * The same credit, mirrored into the OPTIONAL feed group.
+   *
+   * MASKED BY DEFAULT: the feed group may contain CUSTOMERS. renderOpsCardPublic drops the cashier
+   * float entirely and reduces the player's identifiers to their last characters. The full card is
+   * only reused when TELEGRAM_FEED_FULL_DETAIL says the group is staff-only — an explicit act.
+   *
+   * NEVER THROWS. A credited deposit is already money that moved; failing the outbox job because a
+   * secondary group did not get its copy would re-run a notification path for no gain and leave the
+   * job red for something nobody needs to act on. The cost is that a card lost to a transient error
+   * (or to a concurrent worker holding the key) stays lost — which is the right trade for a mirror.
+   */
+  private async postFeedOpsCard(
+    deposit: { id: string; shortId: string },
+    card: OpsCardInput,
+    adminText: string,
+  ): Promise<void> {
+    // No feed configured: nothing to do, and nothing to say about it once per deposit either.
+    const feedChatId = this.config.telegram.feedChatId;
+    if (feedChatId === null) return;
+
+    // Feed pointed at the SAME chat as the admin group: postAdminOpsCard already delivered this
+    // exact deposit there, so a second send is a duplicate card, not a feed. This is not a
+    // hypothetical misconfiguration — an operator running a single group naturally sets both ids to
+    // it, and the two would then differ only in that the feed copy is the masked one, which reads
+    // as a bug. One group is a perfectly good setup; it just does not need the feed half.
+    if (feedChatId === this.config.telegram.adminChatId) {
+      this.logger.debug(
+        `feed card for ${deposit.shortId} skipped: feed chat is the admin chat (already posted)`,
+      );
+      return;
+    }
+
+    try {
+      const begun = await this.idempotency.begin({
+        scope: OPS_CARD_FEED_IDEMPOTENCY_SCOPE,
+        key: deposit.id,
+        requestHash: this.idempotency.hashRequest({ depositRequestId: deposit.id }),
+      });
+      if (begun.kind !== 'proceed') {
+        // replay: it is already in the feed. in_flight: another delivery is posting it right now.
+        // mismatch: impossible with a hash derived from the key. None is worth a warning.
+        this.logger.debug(`feed card for ${deposit.shortId} skipped (${begun.kind})`);
+        return;
+      }
+
+      // Rendered here rather than by the caller so the masked card is never built — and so never
+      // sits in a variable next to the full one — when there is no feed to send it to.
+      const text = this.config.telegram.feedFullDetail ? adminText : renderOpsCardPublic(card);
+
+      try {
+        const message = await this.bot.notifyFeed(text, { parseMode: 'HTML', linkPreview: false });
+        if (message === null) {
+          await this.idempotency.release(begun.lease, 'feed chat unreachable');
+          this.logger.warn(
+            `feed chat ${feedChatId.toString()} is unreachable; ` +
+              `deposit ${deposit.shortId} has no feed card`,
+          );
+          return;
+        }
+        await this.idempotency.complete(begun.lease, {
+          response: { messageId: message.message_id, chatId: message.chat.id },
+          resultRef: deposit.id,
+        });
+      } catch (cause) {
+        // Give the key back so a later redelivery may still post it, then fall into the WARN below.
+        await this.idempotency.release(begun.lease, 'feed card send failed');
+        throw cause;
+      }
+    } catch (cause) {
+      this.logger.warn(
+        `feed card for deposit ${deposit.shortId} failed: ` +
+          `${cause instanceof Error ? cause.message : String(cause)}`,
+      );
     }
   }
 

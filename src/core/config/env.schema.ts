@@ -21,6 +21,52 @@ const telegramId = (label: string) =>
     .regex(/^-?\d+$/, `${label} must be an integer Telegram id`)
     .transform((value) => BigInt(value));
 
+/**
+ * Same validation as telegramId(), but "absent" and "present but blank" both mean *no such chat*.
+ *
+ * WHY blank counts as absent: an operator turning an optional group off does it by emptying the
+ * line in .env, not by deleting it. Refusing to boot over `TELEGRAM_FEED_CHAT_ID=` would punish the
+ * exact gesture that disables the feature.
+ */
+const optionalTelegramId = (label: string) =>
+  z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    telegramId(label).optional(),
+  );
+
+/**
+ * The boolean spellings an operator may reasonably type in .env. Blank counts as unset, for the
+ * same reason as above. Mirrors the ICHANCY_FAKE pattern below, which is deliberately left inline:
+ * it is the switch that stops real money moving and is not worth refactoring for four shared lines.
+ */
+const optionalFlag = () =>
+  z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z
+      .enum(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off'])
+      .optional()
+      .transform((v) => (v === undefined ? undefined : ['true', '1', 'yes', 'on'].includes(v))),
+  );
+
+/**
+ * A whole number of hours where 0 is a REAL value meaning "off", and blank means the same thing —
+ * emptying the line is how an operator disables a feature in this file (see optionalTelegramId).
+ *
+ * The asymmetry that follows is deliberate and is the whole point of this helper: an ABSENT variable
+ * falls through to the caller's `.default()` ("nobody has said anything, use the documented
+ * cadence"), while an EMPTY one is somebody saying "none". A single `.optional()` could not tell
+ * those two apart, and picking either meaning for both would make one of the two gestures a lie.
+ */
+const optionalHours = (label: string, maxHours: number) =>
+  z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? 0 : value),
+    z.coerce
+      .number()
+      .int(`${label} must be a whole number of hours`)
+      .min(0, `${label} must be 0 (off) or a positive number of hours`)
+      .max(maxHours, `${label} must not exceed ${maxHours} hours`),
+  );
+
 const httpUrl = (label: string) =>
   z
     .string()
@@ -73,6 +119,44 @@ export const envSchema = z
       .min(8, 'TELEGRAM_WEBHOOK_PATH_TOKEN must be at least 8 characters')
       .regex(/^[A-Za-z0-9_-]+$/, 'TELEGRAM_WEBHOOK_PATH_TOKEN must be URL-safe'),
     TELEGRAM_ADMIN_CHAT_ID: telegramId('TELEGRAM_ADMIN_CHAT_ID'),
+
+    /**
+     * OPTIONAL second group that also receives the credited-deposit card — the "feed".
+     *
+     * SAFETY: this group may contain CUSTOMERS, so what goes there is the MASKED card
+     * (renderOpsCardPublic): no cashier float, identifiers reduced to their last characters. Unset
+     * (or blank) = the feature is off and nothing is ever posted anywhere but the admin group.
+     *
+     * Like TELEGRAM_ADMIN_CHAT_ID this TRANSFORMS to bigint, so it is absent from process.env after
+     * @nestjs/config copies the validated result back — read it through AppConfigService only. See
+     * config.module.ts for the full story.
+     */
+    TELEGRAM_FEED_CHAT_ID: optionalTelegramId('TELEGRAM_FEED_CHAT_ID'),
+
+    /**
+     * Opt-in to posting the FULL admin card (cashier float, Telegram id, Ichancy login and player
+     * id) to the feed group. Defaults to FALSE — masked — because the default has to be the safe
+     * one: a mistyped feed chat id then leaks nothing, and turning this on is a deliberate
+     * statement that the feed group contains only staff.
+     */
+    TELEGRAM_FEED_FULL_DETAIL: optionalFlag(),
+
+    /**
+     * How often the worker posts the activity report by itself. Whole hours, 1..168 (a week).
+     *
+     * DEFAULT 6 when the line is ABSENT — the schedule is opt-out, because a cashier group that has
+     * to remember to type /report ends up never seeing the numbers. 0, or a BLANK value, turns it
+     * off; /report keeps working either way. See optionalHours() for why blank and absent differ.
+     *
+     * WHERE the report is posted is NOT configured here: it is TELEGRAM_FEED_CHAT_ID when that is
+     * set and the admin group otherwise, so a single-group deployment still gets it. That also means
+     * a configured feed group receives the cashier float — see the SAFETY note above and
+     * services/report-schedule.cron.ts.
+     *
+     * Unlike the two variables above this does NOT transform to another type, so it survives into
+     * process.env — read it through AppConfigService anyway, like everything else.
+     */
+    REPORT_SCHEDULE_HOURS: optionalHours('REPORT_SCHEDULE_HOURS', 168).default(6),
 
     /** Comma-separated; every entry must be an origin (scheme + host, no path). */
     MINI_APP_ORIGIN: z

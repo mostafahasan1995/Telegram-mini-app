@@ -229,6 +229,77 @@ export function renderOpsCard(input: OpsCardInput): string {
   ].join('\n');
 }
 
+/** How many trailing characters of an identifier survive masking. */
+export const MASK_VISIBLE_CHARS = 3;
+
+/** What replaces everything that did not survive. Three bullets, never a variable-length run. */
+const MASK_PREFIX = '•••';
+
+/**
+ * Identifier -> '•••785'. Used for anything that identifies a PERSON on a card that customers can
+ * read: the Telegram user id, the Ichancy login, the Ichancy player id.
+ *
+ * WHY a fixed-length prefix rather than one bullet per hidden character: the run length would leak
+ * the identifier's length, which for a Telegram id narrows the account's age bracket and for a
+ * login is a free hint to anyone trying to guess it.
+ *
+ * WHY a value of MASK_VISIBLE_CHARS or fewer reveals NOTHING: "the last three characters" of a
+ * two-character value is the whole value. The tail exists so a player can recognise their own row,
+ * and a value that short is not recognisable anyway — so the safe branch costs nothing.
+ *
+ * Returns the same em-dash the full card uses for a missing value, so both cards read alike.
+ * The result is NOT HTML-escaped: the caller escapes, exactly as it does for every other field.
+ */
+export function mask(value: string | bigint | null | undefined): string {
+  if (value === null || value === undefined) return NO_VALUE;
+  const text = typeof value === 'bigint' ? value.toString() : value.trim();
+  if (text.length === 0) return NO_VALUE;
+  if (text.length <= MASK_VISIBLE_CHARS) return MASK_PREFIX;
+  return `${MASK_PREFIX}${text.slice(-MASK_VISIBLE_CHARS)}`;
+}
+
+/**
+ * The feed card's input. Deliberately the ops card MINUS the two float fields: the customer-facing
+ * variant must not be able to render the cashier's working capital even by accident, and the
+ * cheapest way to guarantee that is for the renderer to have no name for it.
+ */
+export type PublicOpsCardInput = Omit<OpsCardInput, 'floatBeforeMinor' | 'floatAfterMinor'>;
+
+/**
+ * The credited card for the OPTIONAL feed group — same product, safe to read in a room that
+ * contains customers.
+ *
+ * WHAT IS REMOVED AND WHY:
+ *  - رصيد الكاشيرة قبل/بعد: the operator's working capital. Published to customers it tells a
+ *    competitor what we can pay out and tells a fraudster when we are too thin to absorb a loss.
+ *    Not masked — ABSENT. There is no safe partial rendering of a float.
+ *  - Telegram id / Ichancy login / player id: they identify a real person, and a group member can
+ *    turn a Telegram id into a profile. Masked to the last few characters, which is enough for the
+ *    player themself to recognise their own credit and useless to everyone else.
+ *
+ * WHAT STAYS: the amount, the payment method, the reference and the time — the four things that
+ * make the post a public receipt rather than a rumour.
+ *
+ * Deterministic like renderOpsCard: same inputs, same bytes.
+ */
+export function renderOpsCardPublic(input: PublicOpsCardInput): string {
+  // Kept inline rather than shared with renderOpsCard: that function is the money record read by
+  // operators all day and is deliberately left byte-for-byte untouched by this feature.
+  const time = `${input.creditedAt.toISOString().slice(0, 19).replace('T', ' ')} UTC`;
+
+  return [
+    '📥 <b>عملية شحن على المنصة</b>',
+    `👤 مستخدم التيليغرام: <code>${esc(mask(input.telegramUserId))}</code>`,
+    `🎮 حساب المنصة: <code>${esc(mask(input.ichancyLogin))}</code>`,
+    `🆔 ID اللاعب: <code>${esc(mask(input.ichancyPlayerId))}</code>`,
+    `💰 المبلغ المشحون: <b>${esc(dualNsp(input.amountMinor))}</b>`,
+    `🧾 المرجع: <code>${esc(input.shortId)}</code>`,
+    `💳 وسيلة الدفع: ${esc(input.paymentMethodName)}`,
+    `📅 الوقت: ${esc(time)}`,
+    '✅ تم شحن الرصيد بنجاح',
+  ].join('\n');
+}
+
 function orderRisk(flags: readonly RiskFlag[]): RiskFlag[] {
   return [...flags].sort((a, b) => RISK_FLAG_SEVERITY[b] - RISK_FLAG_SEVERITY[a]);
 }

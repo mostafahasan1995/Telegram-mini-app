@@ -28,7 +28,8 @@
     "prisma:deploy": "prisma migrate deploy",
     "prisma:studio": "prisma studio",
     "seed": "cross-env NODE_ENV=development ts-node -r tsconfig-paths/register prisma/seed.ts",
-    "webhook:set": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts webhook:set"
+    "webhook:set": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts webhook:set",
+    "bot:setup": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts bot:setup"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.888.0",

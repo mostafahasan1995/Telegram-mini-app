@@ -17,6 +17,7 @@ import { CacheService } from '../cache/cache.service';
 import { redisUrlToOptions } from '../cache/redis-url.util';
 import { TelegramWebhookController } from './controllers/webhook.controller';
 import { SetWebhookCommand } from './commands/set-webhook.command';
+import { SetupBotCommand } from './commands/setup-bot.command';
 import { BotService } from './services/bot.service';
 import { createTelegramBot } from './services/bot.factory';
 import { TelegramHandlerRegistrar } from './services/handler-registrar.service';
@@ -47,6 +48,7 @@ import { TELEGRAM_BOT, TELEGRAM_UPDATE_QUEUE } from './telegram.constants';
     UpdateDedupeService,
     TelegramHandlerRegistrar,
     SetWebhookCommand,
+    SetupBotCommand,
   ],
   // BullModule is re-exported so a feature module importing TelegramModule can inject the same
   // queue with @InjectQueue(TELEGRAM_UPDATE_QUEUE) instead of registering a second one.

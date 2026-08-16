@@ -53,6 +53,27 @@ export interface TelegramSettings {
   /** Absolute URL to hand to setWebhook. */
   readonly webhookUrl: string;
   readonly adminChatId: bigint;
+  /**
+   * OPTIONAL second group that also receives the credited-deposit card. Null = the feature is off
+   * and BotService.notifyFeed is a no-op. Never used for operational alerts: this group may contain
+   * customers, so only the masked credit card goes there.
+   */
+  readonly feedChatId: bigint | null;
+  /**
+   * True => the feed group gets the FULL card (cashier float + player identifiers) instead of the
+   * masked one. Defaults to false: masked is the only safe default for a group we do not control
+   * the membership of.
+   */
+  readonly feedFullDetail: boolean;
+  /**
+   * Hours between automatic postings of the activity report. 0 = the schedule is OFF (the /report
+   * command is unaffected).
+   *
+   * The schedule posts to `feedChatId ?? adminChatId` — the feed group when there is one, the admin
+   * group when there is not, so the feature is never silent just because the OPTIONAL feed group was
+   * never configured. See modules/admin/services/report-schedule.cron.ts.
+   */
+  readonly reportScheduleHours: number;
 }
 
 export interface IchancySettings {
@@ -129,6 +150,11 @@ export class AppConfigService {
       webhookPath,
       webhookUrl: `${env.API_BASE_URL}${webhookPath}`,
       adminChatId: env.TELEGRAM_ADMIN_CHAT_ID,
+      feedChatId: env.TELEGRAM_FEED_CHAT_ID ?? null,
+      // Unset => masked. The unsafe variant must always be an explicit choice.
+      feedFullDetail: env.TELEGRAM_FEED_FULL_DETAIL ?? false,
+      // Already defaulted (6) and range-checked by the schema; 0 means the operator turned it off.
+      reportScheduleHours: env.REPORT_SCHEDULE_HOURS,
     });
 
     this._ichancy = Object.freeze({
