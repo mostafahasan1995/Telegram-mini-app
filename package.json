@@ -10,7 +10,7 @@
   "scripts": {
     "dev:api": "cross-env APP_ROLE=api nest start --watch",
     "dev:worker": "cross-env APP_ROLE=worker nest start --watch --entryFile main.worker --path tsconfig.worker.json",
-    "build": "nest build -p tsconfig.build.json",
+    "build": "prisma generate && nest build -p tsconfig.build.json",
     "start:api": "cross-env APP_ROLE=api node dist/main.js",
     "start:worker": "cross-env APP_ROLE=worker node dist/main.worker.js",
     "lint": "eslint .",
