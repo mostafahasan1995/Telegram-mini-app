@@ -30,7 +30,8 @@
     "seed": "cross-env NODE_ENV=development ts-node -r tsconfig-paths/register prisma/seed.ts",
     "webhook:set": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts webhook:set",
     "tunnel:sync": "ts-node -r tsconfig-paths/register scripts/tunnel-sync.ts",
-    "bot:setup": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts bot:setup"
+    "bot:setup": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts bot:setup",
+    "admin:code": "ts-node -r tsconfig-paths/register scripts/admin-login-code.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.888.0",

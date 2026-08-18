@@ -6,6 +6,19 @@
  * to exist before a referrer can be attached to it. /start is also the first contact for most
  * users, well before they ever open the mini app, and a row here costs nothing.
  *
+ * WHY /start ALSO CREATES THE ICHANCY ACCOUNT: this bot is the PLAYER-facing surface, and the one
+ * Ichancy identity it holds is the AGENT's (ICHANCY_USERNAME/ICHANCY_PASSWORD, signed in by the
+ * worker). Every account it opens is registered with `parentId: ICHANCY_AGENT_ID`, i.e. as a CHILD
+ * of that agent — that is what makes the money flow legal: a credit is drawn from the agent's float
+ * into an account the agent owns. Pressing Start therefore has to end with the player owning such an
+ * account, not with a row that only becomes a real account at the first credit. See
+ * ensureGamingAccount below for why it happens AFTER the greeting and why a failure is not fatal.
+ *
+ * WHY A PLAYER-FACING FILE POSTS INTO THE ADMIN GROUP: a new arrival is the one player event
+ * operators must see without going looking for it — it is who they will be crediting, and the first
+ * chance to spot a fake-looking account or a referral farm. The card is sent silently and only for a
+ * row that was genuinely inserted; see announceNewPlayer for why it uses ctx.api and not BotService.
+ *
  * WHY nothing in this file throws on a Telegram failure: the registrar swallows and logs handler
  * errors so that a failed reply cannot make BullMQ retry the whole update — replaying an update
  * whose side effect already happened is precisely what the dedupe layer exists to prevent. Handlers
@@ -50,6 +63,10 @@ import { AppConfigService } from '@core/config/config.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { RedisService } from '@core/cache/redis.service';
 import { AdminIdentityService } from '@core/auth/services/admin-identity.service';
+import {
+  LoginCodeService,
+  LOGIN_CODE_TTL_MINUTES,
+} from '@core/auth/services/login-code.service';
 import { OnCallback, OnCommand } from '@core/telegram/decorators/handlers.decorator';
 import {
   CALLBACK_DATA_MAX_BYTES,
@@ -62,10 +79,12 @@ import { formatMinorToDecimal, parseDecimalToMinor } from '@common/helpers/money
 import { playerActor, type Actor } from '@common/types/actor.type';
 
 import { PlayerService } from '../services/player.service';
-import { ReferralService } from '../services/referral.service';
+import { PlayerLinkService } from '../services/player-link.service';
+import { ReferralService, type ReferralCaptureResult } from '../services/referral.service';
 import { PlayerRepository } from '../repositories/player.repository';
 import { toPlayerView } from '../dtos/player.view';
 import { PlayerErrorCodes } from '../player.constants';
+import type { LinkedIchancyAccount } from '../player-link.port';
 
 const ABOUT_NAME = 'Ichancy Cashier';
 
@@ -268,6 +287,16 @@ interface DepositCreatePort {
   create(actor: Actor, input: CreateDepositPortInput): Promise<CreatedDepositView>;
 }
 
+/**
+ * What ensurePlayerRow learned about the row behind this update. `isNew` is read inside the same
+ * transaction as the upsert, so exactly one update in a player's life carries it — which is what
+ * makes it safe to hang a once-only side effect (the admin arrivals card) off it.
+ */
+interface PlayerRegistration {
+  readonly playerId: string;
+  readonly isNew: boolean;
+}
+
 /** Shape check before an unknown container instance is trusted with a deposit. */
 function isDepositCreatePort(value: unknown): value is DepositCreatePort {
   if (typeof value !== 'object' || value === null) return false;
@@ -325,21 +354,77 @@ export class PlayerTelegramHandlers {
     private readonly prisma: PrismaService,
     private readonly players: PlayerService,
     private readonly playerRepo: PlayerRepository,
+    // Same module, so this is a plain injection — no port and no DiscoveryService magic. It is what
+    // registers the player under our agent (parentId), and the deposit credit path calls the very
+    // same method, which is why calling it here can only ever be early, never duplicated.
+    private readonly links: PlayerLinkService,
     private readonly referrals: ReferralService,
     private readonly config: AppConfigService,
     @Inject(ICHANCY_PORT) private readonly ichancy: IchancyPort,
     private readonly redis: RedisService,
     private readonly admins: AdminIdentityService,
+    private readonly loginCodes: LoginCodeService,
     private readonly discovery: DiscoveryService,
   ) {}
+
+  /**
+   * /login — hand this Telegram account a one-time code for the mobile app.
+   *
+   * WHY THE APP CANNOT JUST LOG ITSELF IN: the mini-app authenticates with Telegram initData, which
+   * is signed by the webview. A native Android/iOS binary cannot produce it. This bot can, because
+   * Telegram signed the update that reached it, so the code carries that proof across.
+   *
+   * WHY IT REFUSES OUTSIDE A PRIVATE CHAT: `ctx.reply` answers wherever the command was sent, and a
+   * login code posted in a group is that account handed to everyone who can read it. The check is
+   * the security boundary, not politeness.
+   *
+   * WHY ensurePlayerRow FIRST: redemption looks the player up and refuses if the row is missing.
+   * Somebody who has only ever pressed a menu button might not have one yet, and a code that is
+   * guaranteed to fail is worse than no code.
+   */
+  @OnCommand('login')
+  async onLogin(ctx: Context): Promise<void> {
+    const from = ctx.from;
+    if (from === undefined || from.is_bot) return;
+
+    if (ctx.chat?.type !== 'private') {
+      await ctx.reply(
+        'Not here — a login code must never be posted in a group. '
+          + 'Open a direct chat with me and send /login there.',
+      );
+      return;
+    }
+
+    const registration = await this.ensurePlayerRow(ctx);
+    if (registration === null) return;
+    const { playerId } = registration;
+
+    try {
+      const { code } = await this.loginCodes.mint('player', BigInt(from.id));
+      await ctx.reply(
+        `<b>تسجيل الدخول للتطبيق</b>\n\n`
+          + `<code>${code}</code>\n\n`
+          + `صالح ${LOGIN_CODE_TTL_MINUTES} دقائق، ولمرة واحدة فقط.\n`
+          + `أدخله في شاشة تسجيل الدخول بالتطبيق.\n\n`
+          + `إذا لم تطلب هذا الرمز، تجاهله — الرمز بلا فائدة بدون التطبيق، `
+          + `وإرسال /login مرة أخرى يلغي هذا الرمز.`,
+        { parse_mode: 'HTML' },
+      );
+    } catch (error: unknown) {
+      // Same contract as every handler here: never throw, always leave the player an answer.
+      this.logger.error(`/login failed for player ${playerId}: ${describeError(error)}`);
+      await ctx.reply('تعذّر إنشاء رمز الآن. حاول بعد قليل.');
+    }
+  }
 
   @OnCommand('start')
   async onStart(ctx: Context): Promise<void> {
     const from = ctx.from;
     if (from === undefined || from.is_bot) return;
 
-    const playerId = await this.ensurePlayerRow(ctx);
-    if (playerId === null) return;
+    const registration = await this.ensurePlayerRow(ctx);
+    if (registration === null) return;
+    const { playerId, isNew } = registration;
 
     // `ctx.match` is whatever followed "/start". grammY types it as string | RegExpMatchArray
     // depending on how the listener was registered, so it is narrowed rather than trusted.
@@ -366,6 +451,155 @@ export class PlayerTelegramHandlers {
     greeting.push('', 'اختر من القائمة:');
 
     await this.reply(ctx, greeting.join('\n'), this.buildMenuKeyboard());
+
+    // LAST, on purpose: the menu must not wait behind two HTTP calls to Ichancy.
+    const link = await this.ensureGamingAccount(ctx, playerId);
+
+    // AFTER the link attempt, so the operators' card can carry the Ichancy login and id — the whole
+    // point of the card is that a human can find this person in all three systems from one message.
+    if (isNew) await this.announceNewPlayer(ctx, playerId, referral, link);
+  }
+
+  /**
+   * Opens the player's Ichancy account — as a CHILD of our agent — the moment they press Start.
+   *
+   * The parent link itself is not decided here: PlayerLinkService derives the credentials and
+   * HttpIchancyAdapter.ensurePlayer sends `parentId: ICHANCY_AGENT_ID` on registerPlayer, so every
+   * account this bot creates hangs off the one agent the worker is signed in as. This method only
+   * decides WHEN that happens.
+   *
+   * WHY AFTER THE GREETING: registering is a registerPlayer call plus a getPlayersForCurrentAgent
+   * lookup (the API answers the number 1, never an id), each bounded by ICHANCY_TIMEOUT_MS. Someone
+   * who just pressed Start must see the menu immediately, so nothing they read is behind this call.
+   *
+   * WHY A FAILURE IS ONLY LOGGED, never shown: DepositCreditService calls the SAME ensureLinked
+   * before it moves money, so an account we could not open now is opened then — the pre-existing lazy
+   * path is still there, and this is an early attempt rather than a new requirement. Telling a player
+   * "account setup failed" as their first ever message would be alarming and, because of that
+   * fallback, wrong.
+   *
+   * WHY IT IS SAFE ON EVERY /start: ensureLinked is idempotent three ways over — credentials derived
+   * from the player id, "Duplicate login" treated as success, and a compare-and-set persist behind a
+   * distributed lock. Ten taps on Start still produce exactly one account, and `created` is true only
+   * for the call that actually registered, so the confirmation is sent once and never to a returning
+   * player.
+   */
+  private async ensureGamingAccount(
+    ctx: Context,
+    playerId: string,
+  ): Promise<LinkedIchancyAccount | null> {
+    try {
+      const link = await this.links.ensureLinked(playerId, 'telegram:/start');
+      if (!link.created) return link;
+
+      await this.reply(
+        ctx,
+        [
+          '✅ <b>تم إنشاء حساب اللعب الخاص بك.</b>',
+          'صار فيك تشحن رصيدك من القائمة فوق — أو اكتب <code>/deposit 50000</code>.',
+        ].join('\n'),
+      );
+      return link;
+    } catch (error: unknown) {
+      // ICHANCY_LINK_REJECTED means their API refused outright and a human should look; the other
+      // codes (in-progress, ambiguous) are ordinary contention or a slow upstream and resolve on the
+      // next attempt. Either way the player is told nothing — see the header.
+      const code = isAppException(error) ? error.errorCode : 'UNKNOWN';
+      const detail = `player ${playerId}: ${code} — ${describeError(error)}`;
+      if (code === PlayerErrorCodes.ICHANCY_LINK_REJECTED) {
+        this.logger.error(`Ichancy refused to open an account on /start for ${detail}`);
+      } else {
+        this.logger.warn(`Deferring Ichancy account creation from /start for ${detail}`);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Tells the operators' group that somebody new arrived, with everything a human needs to find that
+   * person in all three systems at once: Telegram (the tappable mention plus the raw id), our
+   * database (the Player uuid) and the Ichancy back-office (the login and their player id).
+   *
+   * WHY IT FIRES ONLY FOR A ROW THAT WAS ACTUALLY INSERTED: `isNew` is decided inside the same
+   * transaction as the upsert, so a returning player — who sends /start again every time they reopen
+   * the chat — produces nothing. This is an ARRIVALS feed; the activity report already covers volume.
+   * A row first created by /login is deliberately not announced either: /login is a returning
+   * player's command, and a card that says "new player" for one would be a lie.
+   *
+   * WHY ctx.api RATHER THAN BotService.notifyAdmins: BotService lives in @core/telegram, which
+   * PlayerModule does not import — and importing it would drag the Bot factory (a getMe round trip at
+   * construction) into every graph that boots PlayerModule on its own, including
+   * src/modules/modules.int.spec.ts. `ctx.api` IS the very Api instance serving this update, autoRetry
+   * included; the only thing given up is BotService's blocked/unreachable classification, which the
+   * catch below replaces. A card that cannot be delivered must never cost the player their /start.
+   *
+   * WHY THE COUNT IS BEST-EFFORT: `#1207` answers "are we growing?" at a glance, but it is one extra
+   * query on the arrival path and worth exactly nothing if it fails — so it degrades to no ordinal
+   * rather than to no card.
+   */
+  private async announceNewPlayer(
+    ctx: Context,
+    playerId: string,
+    referral: ReferralCaptureResult | null,
+    link: LinkedIchancyAccount | null,
+  ): Promise<void> {
+    const from = ctx.from;
+    if (from === undefined) return;
+
+    const ordinal = await this.prisma.player.count().catch((error: unknown) => {
+      this.logger.debug(`Could not count players for the arrivals card: ${describeError(error)}`);
+      return null;
+    });
+
+    const name = [from.first_name, from.last_name]
+      .filter((part): part is string => part !== undefined && part.length > 0)
+      .join(' ');
+    // tg://user?id= is Telegram's own inline mention. It resolves for anyone who has talked to the
+    // bot, which this person has by definition — they just pressed Start.
+    const label = name.length > 0 ? esc(name) : `id ${from.id}`;
+    const mention = `<a href="tg://user?id=${from.id}">${label}</a>`;
+
+    const lines = [
+      ordinal === null ? '🆕 <b>New player</b>' : `🆕 <b>New player</b> · #${ordinal}`,
+      '',
+      from.username === undefined ? mention : `${mention} · @${esc(from.username)}`,
+      `Telegram id: <code>${from.id}</code>`,
+      `Player id: <code>${esc(playerId)}</code>`,
+      `Language: ${esc(from.language_code ?? '—')} · Currency: ${esc(this.config.ichancy.currency)}`,
+    ];
+
+    // Only a binding that was made (or was already there) names a referrer; the other outcomes mean
+    // there is nobody to credit and printing them would be noise.
+    const binding = referral?.binding;
+    if (binding !== undefined) {
+      lines.push(
+        `Referred by: <code>${esc(binding.referrerTelegramUserId)}</code>` +
+          `${referral?.outcome === 'ALREADY_BOUND' ? ' <i>(existing binding)</i>' : ''}`,
+      );
+    }
+
+    lines.push(
+      link === null
+        ? '⚠️ Gaming account: <b>not created</b> — it will be opened before the first credit.'
+        : `Gaming account: <b>${link.created ? 'created ✅' : 'already existed'}</b>` +
+            `\nIchancy login: <code>${esc(link.ichancyLogin)}</code>` +
+            `\nIchancy id: <code>${esc(link.ichancyPlayerId)}</code>`,
+      '',
+      `<i>${this.formatWhen(new Date())}</i>`,
+    );
+
+    try {
+      await ctx.api.sendMessage(this.config.telegram.adminChatId.toString(), lines.join('\n'), {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        // The group is watching a review queue, not an arrivals board: this must not buzz phones.
+        disable_notification: true,
+      });
+    } catch (error: unknown) {
+      this.logger.warn(
+        `Could not announce new player ${playerId} in the admin chat: ${describeError(error)}`,
+      );
+    }
   }
 
   /**
@@ -486,12 +720,18 @@ export class PlayerTelegramHandlers {
       return;
     }
 
-    // Deliberately NOT calling PlayerLinkService: /balance must not create an Ichancy account. The
-    // mirror is created just before the first credit, and a curious tap on /balance is not that.
+    // Deliberately NOT calling PlayerLinkService: /balance must not create an Ichancy account. /start
+    // opens it and the credit path re-checks before any money moves; a curious tap on /balance is
+    // neither of those, and a read must not be able to create anything.
     if (player.ichancyPlayerId === null) {
       await this.reply(
         ctx,
-        'Your gaming account is created with your first deposit. Open the app to make one.',
+        [
+          'حسابك قيد التجهيز — أرسل /start مرة أخرى بعد قليل.',
+          '',
+          'Your gaming account is still being prepared. Send /start again in a moment;'
+            + ' it is also created automatically with your first deposit.',
+        ].join('\n'),
         this.miniAppKeyboard(),
       );
       return;
@@ -565,7 +805,7 @@ export class PlayerTelegramHandlers {
     lines.push(
       view.ichancyLinked
         ? 'Gaming account: <b>linked ✅</b>'
-        : 'Gaming account: <b>not yet</b> — it is created with your first deposit.',
+        : 'Gaming account: <b>being prepared</b> — send /start again in a moment.',
       '',
       `Referral code: <code>${esc(referralCode)}</code>`,
       username === null
@@ -1239,13 +1479,20 @@ export class PlayerTelegramHandlers {
     return null;
   }
 
-  /** Upserts the player behind an update. Returns null when the row could not be written. */
-  private async ensurePlayerRow(ctx: Context): Promise<string | null> {
+  /**
+   * Upserts the player behind an update. Returns null when the row could not be written.
+   *
+   * `isNew` is carried out of the transaction rather than recomputed: PlayerService decides it from a
+   * read taken inside the same transaction as the insert (and writes the `player.registered` audit
+   * row off the same decision), so it is the one signal that cannot disagree with the audit trail
+   * about who is genuinely new.
+   */
+  private async ensurePlayerRow(ctx: Context): Promise<PlayerRegistration | null> {
     const from = ctx.from;
     if (from === undefined) return null;
 
     try {
-      const { playerId } = await this.prisma.runInTransaction((tx) =>
+      const { playerId, isNew } = await this.prisma.runInTransaction((tx) =>
         this.players.upsertFromTelegram(
           tx,
           {
@@ -1258,7 +1505,7 @@ export class PlayerTelegramHandlers {
           this.config.ichancy.currency,
         ),
       );
-      return playerId;
+      return { playerId, isNew };
     } catch (error: unknown) {
       this.logger.error(
         `Failed to upsert player for Telegram user ${from.id}: ${describeError(error)}`,

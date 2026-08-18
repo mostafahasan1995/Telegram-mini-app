@@ -113,6 +113,27 @@ describe('ALLOWED_TRANSITIONS', () => {
     expect(ALLOWED_TRANSITIONS[DepositStatus.REVERSED]).toEqual([]);
   });
 
+  /**
+   * REGRESSION. `transition()` asserts EVERY declared `from` before it reads the row, so one missing
+   * edge does not degrade a single case — it makes the whole call throw, always, for every deposit.
+   * Two callers shipped with exactly that hole and nothing noticed, because every existing test
+   * exercised a single-valued `from`:
+   *
+   *   claim  -> from [SUBMITTED, UNDER_REVIEW]              to UNDER_REVIEW   (self-edge was absent)
+   *   retry  -> from [CREDIT_FAILED, NEEDS_RECONCILIATION]  to APPROVED       (second leg was absent)
+   *
+   * Both were a guaranteed 500, over HTTP and from the bot's buttons. This table is the contract
+   * those services depend on, so it is asserted here rather than left to an integration test.
+   */
+  it.each([
+    ['claim, first take', DepositStatus.SUBMITTED, DepositStatus.UNDER_REVIEW],
+    ['claim, re-take or steal a stale hold', DepositStatus.UNDER_REVIEW, DepositStatus.UNDER_REVIEW],
+    ['operator retry after an explicit rejection', DepositStatus.CREDIT_FAILED, DepositStatus.APPROVED],
+    ['operator retry after an ambiguous credit', DepositStatus.NEEDS_RECONCILIATION, DepositStatus.APPROVED],
+  ])('allows the edge every multi-from caller declares: %s', (_why, from, to) => {
+    expect(ALLOWED_TRANSITIONS[from]).toContain(to);
+  });
+
   it('classifies statuses consistently', () => {
     expect(isTerminal(DepositStatus.CREDITED)).toBe(true);
     expect(isTerminal(DepositStatus.CREDITING)).toBe(false);

@@ -40,11 +40,13 @@ import { IchancyModule } from '@core/ichancy/ichancy.module';
 import { TelegramModule } from '@core/telegram/telegram.module';
 
 import { AdminApprovalLimitController } from './controllers/admin-approval-limit.controller';
+import { AdminAuthController } from './controllers/admin-auth.controller';
 import { AdminUserController } from './controllers/admin-user.controller';
 import { AdminApprovalLimitRepository } from './repositories/admin-approval-limit.repository';
 import { AdminUserRepository } from './repositories/admin-user.repository';
 import { ActivityReportService } from './services/activity-report.service';
 import { AdminApprovalLimitService } from './services/admin-approval-limit.service';
+import { AdminLoginCodeService } from './services/admin-login-code.service';
 import { AdminUserService } from './services/admin-user.service';
 import { ReportScheduleCron } from './services/report-schedule.cron';
 import { AdminTelegramHandlers } from './telegram/admin.handlers';
@@ -52,7 +54,7 @@ import { APPROVAL_LIMIT_PORT } from './approval-limit.port';
 
 @Module({
   imports: [AuthModule, IchancyModule, TelegramModule],
-  controllers: [AdminUserController, AdminApprovalLimitController],
+  controllers: [AdminUserController, AdminApprovalLimitController, AdminAuthController],
   providers: [
     AdminUserRepository,
     AdminApprovalLimitRepository,
@@ -60,6 +62,9 @@ import { APPROVAL_LIMIT_PORT } from './approval-limit.port';
     AdminApprovalLimitService,
     ActivityReportService,
     ReportScheduleCron,
+    // Provided unconditionally like AdminTelegramHandlers: the api role serves the redemption
+    // route and the worker role mints codes from the bot, so BOTH processes need it.
+    AdminLoginCodeService,
     AdminTelegramHandlers,
     { provide: APPROVAL_LIMIT_PORT, useExisting: AdminApprovalLimitService },
   ],

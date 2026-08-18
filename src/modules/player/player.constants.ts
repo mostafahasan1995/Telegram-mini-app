@@ -18,6 +18,13 @@ export const PlayerErrorCodes = {
   /** Another request is already linking this player. */
   ICHANCY_LINK_IN_PROGRESS: 'ICHANCY_LINK_IN_PROGRESS',
 
+  /**
+   * The one-time bot code is unknown, already used, expired, or was minted in the admin scope.
+   * Deliberately ONE code for all four: telling a caller that a code was real but late confirms a
+   * guess, which turns the exchange route into an oracle for the code space.
+   */
+  BOT_CODE_INVALID: 'BOT_CODE_INVALID',
+
   REFERRAL_ALREADY_BOUND: 'REFERRAL_ALREADY_BOUND',
   REFERRAL_SELF: 'REFERRAL_SELF',
   REFERRAL_UNKNOWN_REFERRER: 'REFERRAL_UNKNOWN_REFERRER',

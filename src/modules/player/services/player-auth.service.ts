@@ -25,7 +25,10 @@ import { PrismaService } from '@core/prisma/prisma.service';
 import { LockService } from '@core/cache/lock.service';
 import { AuditService } from '@core/audit/audit.service';
 import { InitDataService } from '@core/auth/services/init-data.service';
+import { LoginCodeService } from '@core/auth/services/login-code.service';
 import { SessionService } from '@core/auth/services/session.service';
+import { UnauthorizedError } from '@common/exceptions/app.exception';
+import { PlayerErrorCodes } from '../player.constants';
 import { initDataNonceKey } from '@core/auth/auth.constants';
 import type { IssuedSession, SessionContext } from '@core/auth/auth.types';
 
@@ -49,6 +52,7 @@ export class PlayerAuthService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly initData: InitDataService,
+    private readonly codes: LoginCodeService,
     private readonly sessions: SessionService,
     private readonly players: PlayerService,
     private readonly referrals: ReferralService,
@@ -118,6 +122,68 @@ export class PlayerAuthService {
       await this.locks.releaseClaim(initDataNonceKey(verified.hash)).catch(() => undefined);
       throw error;
     }
+  }
+
+  /**
+   * Sign in with a one-time code the bot sent the player in a direct chat.
+   *
+   * WHY THIS EXISTS ALONGSIDE initData: initData is signed by the Telegram webview and a native
+   * Android/iOS binary cannot produce it. The bot, though, already knows who is talking to it, so a
+   * code minted there carries that proof to the app. Same mechanism the staff console uses, in a
+   * separate Redis scope so neither code type can be redeemed on the other's route.
+   *
+   * WHY THERE IS NO upsertFromTelegram HERE, unlike the initData path: the code can only have been
+   * minted inside a bot chat, and the bot's own handler calls `ensurePlayerRow` before it will mint
+   * one. So the Player row provably exists by the time a code can be presented. Finding nothing
+   * therefore means the row was deleted between minting and redeeming, which is a refusal and not a
+   * reason to quietly create an account from an id we cannot see profile fields for.
+   *
+   * WHY NO REFERRAL CAPTURE: referrals arrive as a `start_param` on the first /start, which has
+   * already happened by the time this player can run /login. Re-binding here would let somebody
+   * re-attribute an existing account by signing in again.
+   */
+  async loginWithBotCode(rawCode: string, context: SessionContext): Promise<LoginResult> {
+    const telegramUserId = await this.codes.redeem('player', rawCode);
+    if (telegramUserId === null) {
+      throw new UnauthorizedError(
+        PlayerErrorCodes.BOT_CODE_INVALID,
+        'That code is not valid. Send /login to the bot for a new one.',
+      );
+    }
+
+    const row = await this.prisma.player.findUnique({
+      where: { telegramUserId },
+      select: { id: true },
+    });
+    if (row === null) {
+      throw new UnauthorizedError(
+        PlayerErrorCodes.BOT_CODE_INVALID,
+        'That code is not valid. Send /login to the bot for a new one.',
+      );
+    }
+    const playerId = row.id;
+
+    await this.prisma.runInTransaction(async (tx) => {
+      await this.audit.write(tx, {
+        action: 'player.login',
+        actor: { type: 'PLAYER', id: playerId },
+        subjectType: 'Player',
+        subjectId: playerId,
+        after: { method: 'bot-code' },
+      });
+    });
+
+    const player = await this.players.getOwnView(playerId);
+    const issued = await this.sessions.issueForPlayer(playerId, telegramUserId, context);
+
+    return {
+      player,
+      tokens: this.toTokensView(issued),
+      // A bot code can only be minted for a player row that already exists, so this sign-in is by
+      // definition never the one that created the account.
+      isNewPlayer: false,
+      referral: 'IGNORED_NO_PAYLOAD',
+    };
   }
 
   async refresh(rawRefreshToken: string, context: SessionContext): Promise<AuthTokensView> {

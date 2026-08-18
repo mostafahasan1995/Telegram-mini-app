@@ -48,6 +48,10 @@ import { PrismaService } from '@core/prisma/prisma.service';
 import { OnCommand } from '@core/telegram/decorators/handlers.decorator';
 
 import {
+  AdminLoginCodeService,
+  LOGIN_CODE_TTL_MINUTES,
+} from '../services/admin-login-code.service';
+import {
   ActivityReportService,
   REPORT_USAGE,
   WAITING_STATUSES,
@@ -100,8 +104,67 @@ export class AdminTelegramHandlers {
     private readonly admins: AdminIdentityService,
     private readonly activityReport: ActivityReportService,
     private readonly config: AppConfigService,
+    private readonly loginCodes: AdminLoginCodeService,
     @Inject(ICHANCY_PORT) private readonly ichancy: IchancyPort,
   ) {}
+
+  // ---------------------------------------------------------------------------------------------
+  // /login — hand this Telegram account a one-time code for the manager console
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * WHY THIS COMMAND EXISTS: the native admin console cannot produce Telegram initData, so it has no
+   * way to prove who it is. This bot already knows — Telegram signed the update, and
+   * AdminIdentityService mapped it to active staff. The code carries that proof to the app.
+   *
+   * WHY IT IS `/console` AND NOT `/login`: `/login` belongs to the PLAYER app, which every user of
+   * this bot can reach. grammY's `bot.command()` registers middleware, so two handlers on the same
+   * command means only the first-registered one ever runs — and since this handler returns silently
+   * for non-admins, a player sending /login would have got nothing at all. Most people here are
+   * players, so they keep the obvious verb; staff type a word that names the thing they are opening.
+   * A person who is BOTH (the owner is) then gets to say which credential they want, instead of the
+   * bot guessing.
+   *
+   * WHY IT REFUSES OUTSIDE A PRIVATE CHAT, LOUDLY: a login code posted in the admin supergroup is a
+   * credential handed to everyone in it, and `ctx.reply` answers wherever the command was sent. The
+   * group check is therefore not politeness, it is the security boundary. This is also the ONE place
+   * in this file that answers a non-private chat instead of returning silently — the caller is
+   * already a confirmed admin, so there is no surface to leak, and silence here would read as "the
+   * bot is broken" and get retried in the group.
+   */
+  @OnCommand('console')
+  async onConsoleLogin(ctx: Context): Promise<void> {
+    const admin = await this.requireAdmin(ctx);
+    if (admin === null) return;
+
+    if (ctx.chat?.type !== 'private') {
+      await ctx.reply(
+        'Not here — a login code must never be posted in a group. ' +
+          // /console, not /login: /login is the PLAYER command and would hand an admin a player
+          // code, redeemable only on the player route (LoginCodeService scopes the two apart).
+          'Open a direct chat with me and send /console there.',
+      );
+      return;
+    }
+
+    try {
+      const { code } = await this.loginCodes.mint(admin);
+
+      await ctx.reply(
+        `<b>Manager console login</b>\n\n` +
+          `<code>${esc(code)}</code>\n\n` +
+          `Valid for ${LOGIN_CODE_TTL_MINUTES} minutes, once. ` +
+          `Type it into the console's sign-in screen.\n\n` +
+          `If you did not ask for this, ignore it — a code is useless without the app, ` +
+          `and sending /console again cancels this one.`,
+        { parse_mode: 'HTML' },
+      );
+    } catch (error: unknown) {
+      // Same contract as every handler here: never throw, always leave the operator an answer.
+      this.logger.error(`/login failed for ${admin.adminUserId}: ${describeError(error)}`);
+      await ctx.reply('Could not issue a code right now. Try again in a moment.');
+    }
+  }
 
   // ---------------------------------------------------------------------------------------------
   // /queue — the review backlog (mirrors GET /v1/admin/deposits)

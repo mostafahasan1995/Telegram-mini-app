@@ -19,6 +19,21 @@ export class TelegramAuthDto {
   initData: string;
 }
 
+/**
+ * WHY the code is NOT normalized here: LoginCodeService owns normalization (uppercase, strip
+ * separators), and a DTO that half-normalized would leave two places deciding what "the same code"
+ * means. This only bounds the shape so a huge body never reaches a hash function.
+ *
+ * The ceiling is loose relative to the 9-character printed form (`ABCD-EFGH`) because people paste
+ * with trailing whitespace, invisible characters, and sometimes a whole sentence around it.
+ */
+export class BotCodeDto {
+  @IsString()
+  @IsNotEmpty({ message: 'code is required' })
+  @MaxLength(64, { message: 'code is implausibly long' })
+  code: string;
+}
+
 export class RefreshTokenDto {
   @IsString()
   @IsNotEmpty({ message: 'refreshToken is required' })

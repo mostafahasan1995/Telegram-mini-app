@@ -66,6 +66,14 @@ export const ALLOWED_TRANSITIONS: Readonly<Record<DepositStatus, readonly Deposi
     [DepositStatus.UNDER_REVIEW]: [
       // Back to SUBMITTED when a claim is released or expires.
       DepositStatus.SUBMITTED,
+      // SELF-EDGE, and it is load-bearing. `DepositReviewService.claim` declares
+      // `from: [SUBMITTED, UNDER_REVIEW] -> to: UNDER_REVIEW`, and `transition()` asserts EVERY
+      // declared `from` up front, before touching the row. Without this entry the assertion threw
+      // on the UNDER_REVIEW leg of every single call, so claim was a guaranteed 500 — over HTTP and
+      // from the bot's Claim button alike — no matter what state the deposit was actually in.
+      // The re-claim is not a no-op either: the CAS guard lets the SAME admin refresh their hold,
+      // and lets another admin take over one that has gone stale.
+      DepositStatus.UNDER_REVIEW,
       DepositStatus.PENDING_SECOND_APPROVAL,
       DepositStatus.APPROVED,
       DepositStatus.REJECTED,
@@ -94,6 +102,12 @@ export const ALLOWED_TRANSITIONS: Readonly<Record<DepositStatus, readonly Deposi
     [DepositStatus.NEEDS_RECONCILIATION]: [
       DepositStatus.CREDITED,
       DepositStatus.CREDIT_FAILED,
+      // Same defect as the UNDER_REVIEW self-edge above: `DepositRetryService` declares
+      // `from: [CREDIT_FAILED, NEEDS_RECONCILIATION] -> to: APPROVED`, CREDIT_FAILED had the edge
+      // and this one did not, so the up-front assertion threw on every retry attempt. A human who
+      // has checked Ichancy and confirmed the credit never landed must be able to re-run it; that
+      // is the entire purpose of the operator retry, and it bumps creditKeyEpoch on the way.
+      DepositStatus.APPROVED,
       DepositStatus.REVERSED,
     ],
     [DepositStatus.REJECTED]: [],

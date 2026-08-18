@@ -13,7 +13,12 @@ import { Body, Controller, HttpCode, HttpStatus, Headers, Ip, Post } from '@nest
 import { CurrentPlayer } from '@common/decorators/current-principal.decorator';
 import { Public, PlayerAuth } from '@common/decorators/auth.decorator';
 
-import { RefreshTokenDto, TelegramAuthDto, type AuthTokensView } from '../dtos/auth.dto';
+import {
+  BotCodeDto,
+  RefreshTokenDto,
+  TelegramAuthDto,
+  type AuthTokensView,
+} from '../dtos/auth.dto';
 import { PlayerAuthService, type LoginResult } from '../services/player-auth.service';
 
 @Controller('v1/auth')
@@ -33,6 +38,29 @@ export class PlayerAuthController {
     @Headers('user-agent') userAgent?: string,
   ): Promise<LoginResult> {
     return this.auth.loginWithInitData(body.initData, {
+      ip,
+      userAgent: userAgent ?? null,
+    });
+  }
+
+  /**
+   * Exchange a one-time bot code for a session.
+   *
+   * WHY THIS EXISTS BESIDE /telegram: initData is signed by the Telegram webview, and a native
+   * Android/iOS app cannot produce it. The bot can, because Telegram signed the update that reached
+   * it. A player sends /login in a direct chat, gets a code, and types it here.
+   *
+   * 200, not 201, for the same reason as /telegram: a session is not an addressable resource.
+   */
+  @Public()
+  @Post('bot-code')
+  @HttpCode(HttpStatus.OK)
+  loginWithBotCode(
+    @Body() body: BotCodeDto,
+    @Ip() ip: string,
+    @Headers('user-agent') userAgent?: string,
+  ): Promise<LoginResult> {
+    return this.auth.loginWithBotCode(body.code, {
       ip,
       userAgent: userAgent ?? null,
     });

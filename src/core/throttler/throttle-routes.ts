@@ -58,6 +58,31 @@ export const THROTTLE_RULES: readonly ThrottleRule[] = Object.freeze([
     samplePath: '/v1/auth/telegram',
   },
   {
+    name: 'player-bot-code',
+    method: 'POST',
+    // The player app's sign-in exchange. Kept apart from `auth-exchange` because this one is a
+    // guessable secret rather than a signed blob: initData either verifies or it does not, while a
+    // code can be brute-forced in principle. Still generous enough for a shared carrier-grade NAT,
+    // since the code space (32^8) and the 5-minute TTL do the real work.
+    pattern: /^\/v1\/auth\/bot-code$/,
+    limit: 20,
+    ttlMs: MINUTE,
+    blockMs: 5 * MINUTE,
+    samplePath: '/v1/auth/bot-code',
+  },
+  {
+    name: 'admin-bot-code',
+    method: 'POST',
+    // The admin console's sign-in exchange. Stricter than the player rule and blocked for longer:
+    // the NAT argument above is about a crowd of players sharing an IP, and staff are a handful of
+    // people who type one code each. A guessing loop here is never legitimate traffic.
+    pattern: /^\/v1\/admin\/auth\/bot-code$/,
+    limit: 10,
+    ttlMs: MINUTE,
+    blockMs: 5 * MINUTE,
+    samplePath: '/v1/admin/auth/bot-code',
+  },
+  {
     name: 'deposit-create',
     method: 'POST',
     pattern: /^\/v1\/deposits$/,

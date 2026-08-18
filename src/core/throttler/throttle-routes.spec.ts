@@ -91,6 +91,8 @@ describe('throttle rules', () => {
       const routes = [
         { method: 'post', path: '/v1/auth/telegram' },
         { method: 'post', path: '/v1/auth/refresh' },
+        { method: 'post', path: '/v1/auth/bot-code' },
+        { method: 'post', path: '/v1/admin/auth/bot-code' },
         { method: 'post', path: '/v1/deposits' },
         { method: 'post', path: '/v1/deposits/{shortId}/proof' },
       ];
@@ -100,6 +102,8 @@ describe('throttle rules', () => {
     it('understands the express :param dialect as well as OpenAPI {param}', () => {
       const routes = [
         { method: 'post', path: '/v1/auth/telegram' },
+        { method: 'post', path: '/v1/auth/bot-code' },
+        { method: 'post', path: '/v1/admin/auth/bot-code' },
         { method: 'post', path: '/v1/deposits' },
         { method: 'post', path: '/v1/deposits/:shortId/proof' },
       ];
@@ -109,6 +113,8 @@ describe('throttle rules', () => {
     it('catches a renamed route — the silent failure this exists for', () => {
       const routes = [
         { method: 'post', path: '/v1/auth/telegram' },
+        { method: 'post', path: '/v1/auth/bot-code' },
+        { method: 'post', path: '/v1/admin/auth/bot-code' },
         { method: 'post', path: '/v1/deposits' },
         // proof moved to /v1/deposits/{shortId}/receipt and nobody updated the rule
         { method: 'post', path: '/v1/deposits/{shortId}/receipt' },
