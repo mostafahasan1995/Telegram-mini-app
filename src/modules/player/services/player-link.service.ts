@@ -55,6 +55,8 @@ export class PlayerLinkService implements PlayerLinkPort {
   /** Derived once: it depends only on the root secret, and HKDF is not free. */
   private readonly encryptionKey: Buffer;
   private readonly rootSecret: string;
+  /** Deployment config, not a constant: Ichancy validates the TLD. See ICHANCY_PLAYER_EMAIL_DOMAIN. */
+  private readonly emailDomain: string;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -70,6 +72,7 @@ export class PlayerLinkService implements PlayerLinkPort {
     // PLAYER_CREDENTIAL_SECRET would be strictly better and is a one-line change here.
     this.rootSecret = config.jwt.secret;
     this.encryptionKey = deriveKey(this.rootSecret, CREDENTIAL_INFO_ENCRYPTION);
+    this.emailDomain = config.ichancy.playerEmailDomain;
   }
 
   /** Fast path for callers that only want to know, without ever creating anything. */
@@ -143,7 +146,15 @@ export class PlayerLinkService implements PlayerLinkPort {
         password: openSecret(this.encryptionKey, player.ichancyPasswordEnc),
       };
     }
-    return deriveIchancyCredentials(this.rootSecret, player.id);
+    // The Telegram id goes into the login so the agent can identify the row in their own panel; the
+    // player id still keys the secret part. Both come off the SAME row, so a stored login and a
+    // recomputed one can never describe different people.
+    return deriveIchancyCredentials(
+      this.rootSecret,
+      player.id,
+      player.telegramUserId,
+      this.emailDomain,
+    );
   }
 
   private async register(

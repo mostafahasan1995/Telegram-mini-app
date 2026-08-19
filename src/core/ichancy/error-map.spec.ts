@@ -198,3 +198,24 @@ describe('error-map — transport failures', () => {
     expect(classified.rule).toBe('TRANSPORT_ERROR');
   });
 });
+
+describe('field validation verdicts are definite, not ambiguous', () => {
+  /**
+   * REGRESSION. The first real registerPlayer came back with "Email field contains invalid
+   * characters." and no rule matched, so the safe default (`ambiguous`) fired. Ambiguous is right
+   * for an unknown MONEY outcome; here it made the caller answer "we could not confirm your
+   * account" for a payload that could never succeed no matter how often it was retried.
+   */
+  it('classifies "field contains invalid characters" as a rejection', () => {
+    const classification = classifyErrorContent('Email field contains invalid characters.');
+    expect(classification.outcome).toBe('rejected');
+    expect(classification.code).toBe(IchancyRejectionCodes.VALIDATION_FAILED);
+  });
+
+  it('matches the same sentence for any field', () => {
+    for (const field of ['Email', 'Login', 'Password']) {
+      const classification = classifyErrorContent(`${field} field contains invalid characters.`);
+      expect(classification.outcome).toBe('rejected');
+    }
+  });
+});

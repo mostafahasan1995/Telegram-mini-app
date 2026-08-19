@@ -19,7 +19,6 @@ import { createHmac } from 'node:crypto';
 import {
   CREDENTIAL_INFO_LOGIN,
   CREDENTIAL_INFO_PASSWORD,
-  ICHANCY_PLAYER_EMAIL_DOMAIN,
 } from '../player.constants';
 
 export interface IchancyCredentials {
@@ -35,10 +34,12 @@ export interface IchancyCredentials {
 const LOGIN_ALPHABET = 'abcdefghijkmnpqrstuvwxyz23456789';
 
 /**
- * 15 encoded characters over a 32-symbol alphabet = 75 bits. Collision probability across even
- * 10^9 players is negligible, and the login stays short enough for any sane form validation.
+ * 8 encoded characters over a 32-symbol alphabet = 40 bits, keyed by the root secret. It is not a
+ * uniqueness device — the Telegram id in front of it already guarantees that — it exists so the
+ * login cannot be GUESSED from a Telegram id, which is public to anyone in a group chat with the
+ * player.
  */
-const LOGIN_BODY_LENGTH = 15;
+const LOGIN_SUFFIX_LENGTH = 8;
 
 /**
  * Leading letter: some systems reject a username that starts with a digit, and finding that out
@@ -46,8 +47,26 @@ const LOGIN_BODY_LENGTH = 15;
  */
 const LOGIN_PREFIX = 'p';
 
-/** Their documented rule is ">= 3 characters"; we have no reason to be near that floor. */
-const PASSWORD_BODY_LENGTH = 24;
+/**
+ * Separator between the readable part and the keyed part. Underscore is known-good: the agent's own
+ * panel-created players use it (`Ahmad379_79968`), so Ichancy certainly accepts it in a login.
+ */
+const LOGIN_SEPARATOR = '_';
+
+/**
+ * The password is 12 derived characters + the 4-character class suffix = EXACTLY 16.
+ *
+ * WHY 16 AND NOT MORE: the published docs state only a MINIMUM ("Password should contain at least 3
+ * characters"), so this was 24+4=28 — and the live API refused it on 2026-08-19 with
+ *
+ *     "Password should contain maximum 16 characters."
+ *
+ * an undocumented ceiling, discovered only by registering for real. 16 is therefore not a
+ * preference, it is the hard upper bound; the value below is the largest body that fits with the
+ * class suffix. 12 base64url characters is ~72 bits, which is far beyond what matters for a
+ * credential no human ever types and that only our backend holds.
+ */
+const PASSWORD_BODY_LENGTH = 12;
 
 /**
  * Guarantees the password contains an uppercase letter, a lowercase letter, a digit and a symbol.
@@ -74,18 +93,42 @@ function derive(rootSecret: string, info: string, playerId: string): Buffer {
 }
 
 /**
- * Deterministic for a given (rootSecret, playerId). Changing the root secret changes every
- * derived credential, which is why rotating it requires a migration that re-reads the stored
+ * Deterministic for a given (rootSecret, playerId, telegramUserId). Changing the root secret changes
+ * every derived credential, which is why rotating it requires a migration that re-reads the stored
  * `ichancyLogin` rather than recomputing it — the STORED login always wins over a recomputed one.
+ *
+ * ══ WHY THE TELEGRAM ID IS IN THE LOGIN ═══════════════════════════════════════════════════════
+ * `p912911246_k3mq9x2v`, not `p7k3mq9x2vn4bcd`. The agent reads their player list in the Ichancy
+ * panel, and an opaque login makes every row there unidentifiable — matching one back to a person
+ * meant a database query. The Telegram id is the handle every other surface already prints (the
+ * arrivals card, the deposit card, /register), so putting it in the login makes the panel joinable
+ * to everything else by eye.
+ *
+ * The keyed suffix stays because the Telegram id is PUBLIC: anyone in a group with the player can
+ * read it. Without the suffix the login would be guessable for any known person, leaving only the
+ * password between an attacker and a named account. With it, knowing who somebody is tells you
+ * nothing you can use.
+ *
+ * ══ WHY THIS COULD ONLY BE CHANGED BEFORE THE FIRST REAL REGISTRATION ═════════════════════════
+ * The derived login is the ONLY handle that can reconnect us to an account whose registration timed
+ * out (registerPlayer answers `1`, never an id — see the header). Change the derivation while such
+ * an orphan exists and it is stranded forever: we would look up a login that was never registered,
+ * find nothing, and register a second account. This was changed on 2026-08-19, when the count of
+ * accounts THIS SYSTEM had registered on the real API was exactly zero. Changing it again later is
+ * not a refactor; it is a data migration that must first re-read every stored login.
  */
-export function deriveIchancyCredentials(rootSecret: string, playerId: string): IchancyCredentials {
-  const login =
-    LOGIN_PREFIX +
-    encodeAlphabet(
-      derive(rootSecret, CREDENTIAL_INFO_LOGIN, playerId),
-      LOGIN_ALPHABET,
-      LOGIN_BODY_LENGTH,
-    );
+export function deriveIchancyCredentials(
+  rootSecret: string,
+  playerId: string,
+  telegramUserId: bigint,
+  emailDomain: string,
+): IchancyCredentials {
+  const suffix = encodeAlphabet(
+    derive(rootSecret, CREDENTIAL_INFO_LOGIN, playerId),
+    LOGIN_ALPHABET,
+    LOGIN_SUFFIX_LENGTH,
+  );
+  const login = `${LOGIN_PREFIX}${telegramUserId.toString()}${LOGIN_SEPARATOR}${suffix}`;
 
   const password =
     derive(rootSecret, CREDENTIAL_INFO_PASSWORD, playerId)
@@ -94,7 +137,7 @@ export function deriveIchancyCredentials(rootSecret: string, playerId: string): 
 
   return {
     login,
-    email: `${login}@${ICHANCY_PLAYER_EMAIL_DOMAIN}`,
+    email: `${login}@${emailDomain}`,
     password,
   };
 }

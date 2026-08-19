@@ -28,6 +28,10 @@ import { ICHANCY_AUTH_CLIENT, IchancyHttpClient } from './ichancy-http.client';
 import { IchancySessionService } from './ichancy-session.service';
 import { ICHANCY_SESSION_STORE, RedisIchancySessionStore } from './ichancy-session.store';
 import { ICHANCY_PORT, type IchancyPort } from './ichancy.port';
+import { IchancyCheckCommand } from './commands/ichancy-check.command';
+import { BrowserIchancyTransport } from './transport/browser.transport';
+import { FetchIchancyTransport } from './transport/fetch.transport';
+import { ICHANCY_TRANSPORT, type IchancyTransport } from './transport/ichancy-transport';
 
 const TRUTHY = new Set(['1', 'true', 'yes', 'on']);
 
@@ -62,10 +66,39 @@ const portProvider: Provider = {
   inject: [AppConfigService, HttpIchancyAdapter, FakeIchancyAdapter],
 };
 
+/**
+ * WHICH TRANSPORT the HTTP client uses — Node's fetch, or a real Chromium.
+ *
+ * Both are constructed either way, which is free: neither opens anything at construction time (the
+ * browser is launched lazily on the first call, and only if it is the one selected). Selecting by
+ * env keeps "how bytes leave the process" a deployment decision rather than a code change — the same
+ * reasoning as the fake/real adapter split above.
+ */
+const transportProvider: Provider = {
+  provide: ICHANCY_TRANSPORT,
+  useFactory: (
+    config: AppConfigService,
+    fetchTransport: FetchIchancyTransport,
+    browserTransport: BrowserIchancyTransport,
+  ): IchancyTransport => {
+    const useBrowser = config.ichancy.transport === 'browser';
+    new Logger('IchancyModule').log(
+      useBrowser
+        ? 'Ichancy transport: BROWSER (Chromium solves the Cloudflare challenge itself)'
+        : 'Ichancy transport: fetch',
+    );
+    return useBrowser ? browserTransport : fetchTransport;
+  },
+  inject: [AppConfigService, FetchIchancyTransport, BrowserIchancyTransport],
+};
+
 @Module({
   providers: [
     IchancyCallLogService,
     { provide: ICHANCY_CALL_LOG, useExisting: IchancyCallLogService },
+    FetchIchancyTransport,
+    BrowserIchancyTransport,
+    transportProvider,
     IchancyHttpClient,
     { provide: ICHANCY_AUTH_CLIENT, useExisting: IchancyHttpClient },
     RedisIchancySessionStore,
@@ -74,6 +107,9 @@ const portProvider: Provider = {
     HttpIchancyAdapter,
     FakeIchancyAdapter,
     portProvider,
+    // A read-only diagnostic; nest-commander only instantiates it when main.cli.ts drives the app,
+    // exactly as TelegramModule carries webhook:set and bot:setup.
+    IchancyCheckCommand,
   ],
   exports: [
     ICHANCY_PORT,

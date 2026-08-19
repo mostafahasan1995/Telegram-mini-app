@@ -100,3 +100,39 @@ describe('REPORT_SCHEDULE_HOURS', () => {
     }
   });
 });
+
+
+/** A complete, valid environment plus whatever the case under test wants to say about Ichancy. */
+function ichancyEnvFor(overrides: Record<string, string>): ReturnType<typeof validateEnv> {
+  applyTestEnv({
+    DATABASE_URL: 'postgresql://app:app@localhost:5432/ichancy?schema=public',
+    REDIS_URL: 'redis://localhost:6379',
+  });
+  return validateEnv({ ...process.env, ...overrides });
+}
+
+describe('ICHANCY_USER_AGENT / ICHANCY_COOKIE', () => {
+  /**
+   * REGRESSION. .env.example tells operators to leave both blank once the server IP is allowlisted,
+   * and `ICHANCY_USER_AGENT=` parses as an EMPTY STRING, not undefined — a `.default()` fills only
+   * undefined. The first version of this schema therefore refused to boot on its own documented
+   * configuration, with "Too small: expected string to have >=1 characters".
+   */
+  it('treats a blank ICHANCY_USER_AGENT as unset and falls back to the default', () => {
+    expect(ichancyEnvFor({ ICHANCY_USER_AGENT: '' }).ICHANCY_USER_AGENT).toContain('Mozilla/5.0');
+  });
+
+  it('treats whitespace the same way', () => {
+    expect(ichancyEnvFor({ ICHANCY_USER_AGENT: '   ' }).ICHANCY_USER_AGENT).toContain('Mozilla/5.0');
+  });
+
+  it('keeps an explicit User-Agent, trimmed', () => {
+    expect(ichancyEnvFor({ ICHANCY_USER_AGENT: '  CustomAgent/1.0  ' }).ICHANCY_USER_AGENT).toBe(
+      'CustomAgent/1.0',
+    );
+  });
+
+  it('accepts a blank cookie — the allowlisted-IP case needs none', () => {
+    expect(() => ichancyEnvFor({ ICHANCY_COOKIE: '' })).not.toThrow();
+  });
+});

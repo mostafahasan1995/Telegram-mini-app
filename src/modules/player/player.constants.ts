@@ -4,6 +4,7 @@
  * the mini-app switches on them to decide what to render, and support quotes them. Same rules
  * apply: SCREAMING_SNAKE, never renamed, never reused, no values baked into the code itself.
  */
+import type { AdminRole } from '@prisma/client';
 
 export const PlayerErrorCodes = {
   PLAYER_NOT_FOUND: 'PLAYER_NOT_FOUND',
@@ -34,13 +35,31 @@ export const PlayerErrorCodes = {
 export type PlayerErrorCode = (typeof PlayerErrorCodes)[keyof typeof PlayerErrorCodes];
 
 /**
- * Domain of the synthetic mailbox we hand Ichancy. The address must be syntactically valid (their
- * API validates it) but must never be deliverable — the player never sees these credentials and no
- * mail may ever reach a real inbox from them.
+ * FALLBACK domain for the synthetic mailbox we hand Ichancy, used when ICHANCY_PLAYER_EMAIL_DOMAIN
+ * is not configured. The real value is deployment-specific — see that variable in .env.example.
  *
- * A `.invalid` TLD is reserved by RFC 2606 exactly for this: guaranteed never to resolve.
+ * ══ WHY THIS IS NO LONGER `.invalid` ══════════════════════════════════════════════════════════
+ * It was `players.ichancy-cashier.invalid`, chosen because RFC 2606 reserves `.invalid` precisely
+ * so it can never resolve, which made an undeliverable address provable rather than hoped for.
+ * Ichancy rejects it: the first real registerPlayer, on 2026-08-19, came back
+ *
+ *     "Email field contains invalid characters."
+ *
+ * and probing showed the TLD is the reason — the same address on `.com` was accepted, while the
+ * underscore, the digits and the hyphen were all fine. Their validator checks the TLD against a
+ * list, and a reserved one is not on it.
+ *
+ * `example.com` is the replacement because RFC 2606 ALSO reserves it, IANA holds it permanently, and
+ * it carries an ordinary TLD that passes validation. Nobody can ever register it and start receiving
+ * mail meant for our players — which is the property that matters, because Ichancy may send account
+ * mail to these addresses. A domain we do not control would eventually hand a stranger the ability
+ * to receive our players' account email.
  */
-export const ICHANCY_PLAYER_EMAIL_DOMAIN = 'players.ichancy-cashier.invalid';
+/**
+ * The VALUE now lives in @core/config (ICHANCY_PLAYER_EMAIL_DOMAIN in env.schema.ts, surfaced as
+ * `config.ichancy.playerEmailDomain`), because it is deployment configuration rather than a domain
+ * fact — and because core may not import from modules. PlayerLinkService passes it in.
+ */
 
 /** Derivation labels. Distinct labels are what make reusing one root secret safe. */
 export const CREDENTIAL_INFO_LOGIN = 'ichancy-player-login:v1';
@@ -61,3 +80,38 @@ export const playerLinkLockKey = (playerId: string): string => `player-link:${pl
 export const REFERRAL_BIND_LOCK_TTL_MS = 5_000;
 
 export const referralBindLockKey = (playerId: string): string => `player-referral:${playerId}`;
+
+// -------------------------------------------------------------------------------------------------
+// Staff access to the player directory
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * WHY these live here and not in modules/admin: `eslint-plugin-boundaries` forbids
+ * modules/player -> modules/admin, and the routes they guard (`/v1/admin/players`) are served by
+ * THIS module — exactly as modules/payment-method owns PAYMENT_METHOD_READER_ROLES for its own
+ * `/v1/admin/payment-methods`. AdminRole is a Prisma enum, i.e. @core, so both sides may name it.
+ */
+
+/**
+ * Who may READ the player directory. SUPPORT is included because answering "where is my deposit?"
+ * starts with finding the person, and REVIEWER because a review card names a player they may need
+ * to look up.
+ */
+export const PLAYER_READER_ROLES: readonly AdminRole[] = Object.freeze([
+  'SUPER_ADMIN',
+  'FINANCE_ADMIN',
+  'REVIEWER',
+  'SUPPORT',
+]);
+
+/**
+ * Who may CREATE the Ichancy account for a player.
+ *
+ * Deliberately narrower than the readers: this writes to a third-party system, under our agent, and
+ * it cannot be undone from here — there is no deletePlayer endpoint in the agent API. SUPPORT and
+ * REVIEWER can see that an account is missing and say so; they cannot mint one.
+ */
+export const PLAYER_ICHANCY_MANAGER_ROLES: readonly AdminRole[] = Object.freeze([
+  'SUPER_ADMIN',
+  'FINANCE_ADMIN',
+]);

@@ -29,6 +29,7 @@ import { DiscoveryModule } from '@nestjs/core';
 import { AuthModule } from '@core/auth/auth.module';
 import { IchancyModule } from '@core/ichancy/ichancy.module';
 
+import { PlayerAdminController } from './controllers/player-admin.controller';
 import { PlayerAuthController } from './controllers/player-auth.controller';
 import { PlayerController } from './controllers/player.controller';
 import { PlayerRepository } from './repositories/player.repository';
@@ -38,11 +39,12 @@ import { PlayerLinkService } from './services/player-link.service';
 import { PlayerService } from './services/player.service';
 import { ReferralService } from './services/referral.service';
 import { PlayerTelegramHandlers } from './telegram/player.handlers';
+import { RegisterPlayerCommand } from './commands/register-player.command';
 import { PLAYER_LINK_PORT } from './player-link.port';
 
 @Module({
   imports: [AuthModule, IchancyModule, DiscoveryModule],
-  controllers: [PlayerAuthController, PlayerController],
+  controllers: [PlayerAuthController, PlayerController, PlayerAdminController],
   providers: [
     PlayerRepository,
     PlayerService,
@@ -51,6 +53,8 @@ import { PLAYER_LINK_PORT } from './player-link.port';
     PlayerLinkService,
     ReferralService,
     PlayerTelegramHandlers,
+    // CLI: npm run player:register. Inert outside main.cli.ts — see TelegramModule's commands.
+    RegisterPlayerCommand,
     { provide: PLAYER_LINK_PORT, useExisting: PlayerLinkService },
   ],
   exports: [

@@ -29,7 +29,7 @@ const PLAYER_COMMANDS: readonly BotCommand[] = Object.freeze([
   { command: 'methods', description: '💳 طرق الدفع' },
   { command: 'deposits', description: '🧾 إيداعاتي' },
   { command: 'balance', description: '💵 رصيدي' },
-  { command: 'profile', description: '👤 حسابي' },
+  { command: 'profile', description: '👤 حسابي وبيانات الدخول' },
   { command: 'about', description: '✅ حالة الخدمة' },
   { command: 'terms', description: '📄 الشروط' },
   { command: 'paysupport', description: '🆘 مشكلة بالدفع' },
@@ -47,6 +47,7 @@ const ADMIN_EXTRA_COMMANDS: readonly BotCommand[] = Object.freeze([
   { command: 'report', description: '📊 تقرير النشاط' },
   { command: 'float', description: '🏦 رصيد الكاشيرة' },
   { command: 'breaks', description: '⚠️ مشاكل التسوية' },
+  { command: 'register', description: '🆕 إنشاء حساب لاعب' },
 ]);
 
 /** Shown on the empty chat screen BEFORE the player taps Start. Bot API cap: 512 characters. */

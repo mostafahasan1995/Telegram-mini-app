@@ -35,8 +35,8 @@
  * Same contract as every other handler in this project: the registrar swallows and logs, so a
  * throw would only cost the operator their answer. Each command degrades to a plain message.
  */
-import { Inject, Injectable, Logger } from '@nestjs/common';
-import { BreakStatus } from '@prisma/client';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
+import { AdminRole, BreakStatus } from '@prisma/client';
 import type { Context } from 'grammy';
 
 import type { AuthenticatedAdmin } from '@common/decorators/auth.types';
@@ -73,6 +73,39 @@ const LOUD_SEVERITY = 4;
 /** A phone screen, not a report. Anything longer belongs in the admin panel. */
 const LIST_LIMIT = 5;
 
+// ── the registration we cannot import ───────────────────────────────────────────────────────────
+//
+// modules/admin -> modules/player is a build failure (eslint-plugin-boundaries), so the token is
+// named as a string literal and the shape is RESTATED here, exactly as
+// src/modules/deposit/ports/index.ts restates it for the credit worker and as
+// src/modules/player/telegram/player.handlers.ts restates DepositService.create. The binding is made
+// by FeaturePortsModule at the composition root, so this resolves in the api and worker graphs and
+// is simply absent anywhere else — hence @Optional below.
+
+const PLAYER_LINK_PORT = 'PLAYER_LINK_PORT';
+
+/** MUST stay structurally identical to LinkedIchancyAccount in modules/player/player-link.port.ts. */
+interface LinkedIchancyAccount {
+  readonly playerId: string;
+  readonly ichancyPlayerId: string;
+  readonly ichancyLogin: string;
+  readonly created: boolean;
+}
+
+interface PlayerLinkPort {
+  ensureLinked(playerId: string, correlationId?: string | null): Promise<LinkedIchancyAccount>;
+}
+
+/**
+ * Who may open an Ichancy account from the bot. MIRRORS PLAYER_ICHANCY_MANAGER_ROLES in
+ * src/modules/player/player.constants.ts, which guards the HTTP route doing the same thing: the two
+ * must not disagree about who is allowed to create an account on a third-party system.
+ */
+const REGISTER_ROLES: readonly AdminRole[] = Object.freeze([
+  AdminRole.SUPER_ADMIN,
+  AdminRole.FINANCE_ADMIN,
+]);
+
 /** Telegram's HTML parse mode needs exactly these three escaped, and nothing else. */
 function esc(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -106,6 +139,10 @@ export class AdminTelegramHandlers {
     private readonly config: AppConfigService,
     private readonly loginCodes: AdminLoginCodeService,
     @Inject(ICHANCY_PORT) private readonly ichancy: IchancyPort,
+    // @Optional because this module is booted WITHOUT the composition root in
+    // src/modules/modules.int.spec.ts. Undefined there, bound in both real graphs; /register says so
+    // rather than failing to construct the whole handler class.
+    @Optional() @Inject(PLAYER_LINK_PORT) private readonly playerLink: PlayerLinkPort | null,
   ) {}
 
   // ---------------------------------------------------------------------------------------------
@@ -163,6 +200,91 @@ export class AdminTelegramHandlers {
       // Same contract as every handler here: never throw, always leave the operator an answer.
       this.logger.error(`/login failed for ${admin.adminUserId}: ${describeError(error)}`);
       await ctx.reply('Could not issue a code right now. Try again in a moment.');
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // /register <telegram id> — open a player's Ichancy account (mirrors POST /v1/admin/players/:id/ichancy-account)
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * The manual repair for "this player has no gaming account". /start opens one automatically and
+   * the credit worker opens one before it moves money, so this is for the case where both are out
+   * of reach: a player who started during a Cloudflare outage, or one whose registration was
+   * rejected and has since been fixed on Ichancy's side.
+   *
+   * WHY IT TAKES A TELEGRAM ID AND NOT OUR UUID: this is typed on a phone, usually straight off a
+   * deposit card or the new-player card, both of which print the Telegram id.
+   *
+   * WHY IT IS ROLE-GATED WHERE /queue IS NOT: reading a queue is free; this creates an account on a
+   * third-party system under our agent, and the agent API has no way to delete one. A REVIEWER can
+   * see that an account is missing (the deposit card says so) and ask; they cannot mint it.
+   *
+   * WHY A NON-MANAGER ADMIN GETS SILENCE RATHER THAN "FORBIDDEN": same reason as the whole file —
+   * the command surface is not something the bot should confirm to anyone who guesses at it.
+   */
+  @OnCommand('register')
+  async onRegister(ctx: Context): Promise<void> {
+    const admin = await this.requireAdmin(ctx);
+    if (admin === null) return;
+    if (!REGISTER_ROLES.includes(admin.role)) return;
+
+    if (this.playerLink === null) {
+      // Only reachable in a graph without the composition root, i.e. never in production.
+      this.logger.error('/register used in a process where PLAYER_LINK_PORT is not bound');
+      await this.reply(ctx, '⚠️ Registration is not available in this process.');
+      return;
+    }
+
+    const raw = typeof ctx.match === 'string' ? ctx.match.trim() : '';
+    if (!/^\d{1,19}$/.test(raw)) {
+      await this.reply(
+        ctx,
+        [
+          'Usage: <code>/register &lt;telegram id&gt;</code>',
+          '',
+          'The Telegram id is printed on the new-player card and on every deposit card.',
+        ].join('\n'),
+      );
+      return;
+    }
+
+    const player = await this.prisma.player.findUnique({
+      where: { telegramUserId: BigInt(raw) },
+      select: { id: true, ichancyPlayerId: true },
+    });
+    if (player === null) {
+      await this.reply(
+        ctx,
+        `No player with Telegram id <code>${esc(raw)}</code>. They must press /start once first — ` +
+          'their Telegram account IS the identity here, so there is nothing to register until then.',
+      );
+      return;
+    }
+
+    try {
+      const link = await this.playerLink.ensureLinked(player.id, `telegram:/register:${admin.adminUserId}`);
+      await this.reply(
+        ctx,
+        [
+          link.created ? '✅ <b>Account created</b>' : 'ℹ️ <b>Account already existed</b>',
+          '',
+          `Telegram id: <code>${esc(raw)}</code>`,
+          `Player id: <code>${esc(link.playerId)}</code>`,
+          `Ichancy login: <code>${esc(link.ichancyLogin)}</code>`,
+          `Ichancy id: <code>${esc(link.ichancyPlayerId)}</code>`,
+          '',
+          `<i>Registered under agent ${esc(this.config.ichancy.agentId)}.</i>`,
+        ].join('\n'),
+      );
+    } catch (error: unknown) {
+      // The player-facing paths swallow this and retry later; an operator who typed the command is
+      // owed the reason, because the reason is usually something only they can fix.
+      this.logger.error(`/register failed for player ${player.id}: ${describeError(error)}`);
+      await this.reply(
+        ctx,
+        `⚠️ Could not open the account: <code>${esc(describeError(error))}</code>`,
+      );
     }
   }
 

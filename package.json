@@ -31,7 +31,10 @@
     "webhook:set": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts webhook:set",
     "tunnel:sync": "ts-node -r tsconfig-paths/register scripts/tunnel-sync.ts",
     "bot:setup": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts bot:setup",
-    "admin:code": "ts-node -r tsconfig-paths/register scripts/admin-login-code.ts"
+    "admin:code": "ts-node -r tsconfig-paths/register scripts/admin-login-code.ts",
+    "ichancy:check": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts ichancy:check",
+    "ichancy:check:signin": "cross-env APP_ROLE=worker ts-node -r tsconfig-paths/register src/main.cli.ts ichancy:check",
+    "player:register": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts player:register"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.888.0",
@@ -98,5 +101,8 @@
   "prisma": {
     "schema": "prisma/schema.prisma",
     "seed": "ts-node -r tsconfig-paths/register prisma/seed.ts"
+  },
+  "optionalDependencies": {
+    "playwright": "^1.62.1"
   }
 }

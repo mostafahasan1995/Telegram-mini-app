@@ -86,6 +86,25 @@ export interface IchancySettings {
   readonly timeoutMs: number;
   /** True => every Ichancy call is served by the in-memory fake. No real money can move. */
   readonly fake: boolean;
+  /**
+   * Raw `Cookie:` header sent with every agent-API call. Null = send none.
+   *
+   * WHY THIS IS NEEDED AT ALL: agents.ichancy.com sits behind Cloudflare's bot protection, which
+   * answers a plain server-to-server POST with a challenge page instead of JSON. The `cf_clearance`
+   * cookie a human earned in a browser is what gets past it — see ICHANCY_USER_AGENT, which must
+   * MATCH the browser that earned it, and the deployment note in .env.example about the IP.
+   */
+  readonly cookie: string | null;
+  /** Where PLAYERS sign in with the credentials we registered — never the agent panel. */
+  readonly playerSiteUrl: string;
+  /** How requests leave this process: Node fetch, or a real Chromium. See ICHANCY_TRANSPORT. */
+  readonly transport: 'fetch' | 'browser';
+  /** Run the browser transport headless. Ignored by the fetch transport. */
+  readonly browserHeadless: boolean;
+  /** Domain of the synthetic player mailboxes. See ICHANCY_PLAYER_EMAIL_DOMAIN in env.schema.ts. */
+  readonly playerEmailDomain: string;
+  /** Sent as `User-Agent`. cf_clearance is bound to it, so it is configuration, not decoration. */
+  readonly userAgent: string;
 }
 
 export interface S3Settings {
@@ -166,6 +185,16 @@ export class AppConfigService {
       timeoutMs: env.ICHANCY_TIMEOUT_MS,
       // Unset => fake only under test, so CI can never reach the real agent API by omission.
       fake: env.ICHANCY_FAKE ?? env.NODE_ENV === 'test',
+      // Trimmed and emptied-to-null so a blank line in .env is the same as "no cookie" rather than
+      // an empty header Cloudflare would treat as a malformed request.
+      cookie: env.ICHANCY_COOKIE?.trim() ? env.ICHANCY_COOKIE.trim() : null,
+      userAgent: env.ICHANCY_USER_AGENT,
+      // Already defaulted and shape-checked by the schema — a blank line there means "the default",
+      // so this is never empty and never needs a fallback of its own.
+      playerEmailDomain: env.ICHANCY_PLAYER_EMAIL_DOMAIN,
+      playerSiteUrl: env.ICHANCY_PLAYER_SITE_URL,
+      transport: env.ICHANCY_TRANSPORT,
+      browserHeadless: env.ICHANCY_BROWSER_HEADLESS,
     });
 
     this._s3 = Object.freeze({

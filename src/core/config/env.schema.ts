@@ -76,6 +76,30 @@ const httpUrl = (label: string) =>
 
 const nonEmpty = (label: string) => z.string().trim().min(1, `${label} is required`);
 
+/**
+ * Sent as `User-Agent` to the agent API when ICHANCY_USER_AGENT is unset or blank.
+ *
+ * A desktop Chrome string, deliberately NOT `node`/`undici`: bot protection scores a default runtime
+ * UA badly on its own, and `cf_clearance` is issued against the UA that earned it.
+ *
+ * ⚠️ THIS DEFAULT IS A FALLBACK, NOT A CORRECT VALUE. Whenever a cookie is in play, the UA must be
+ * the one from the browser that earned it — Cloudflare rejects a clearance presented under a
+ * different UA exactly as if no cookie had been sent, with nothing anywhere saying the two
+ * disagree. Proven on 2026-08-19: a valid, minutes-old cf_clearance was refused under Chrome/140
+ * and accepted under Chrome/150, which was the browser that produced it. Set ICHANCY_USER_AGENT
+ * explicitly and treat this constant as "something plausible for a host with no cookie at all".
+ */
+/**
+ * Fallback domain for the synthetic player mailboxes, used when ICHANCY_PLAYER_EMAIL_DOMAIN is unset
+ * or blank. See that variable below for why it is `example.com` and not the RFC 2606 `.invalid` TLD
+ * this project used until 2026-08-19.
+ */
+const DEFAULT_ICHANCY_PLAYER_EMAIL_DOMAIN = 'players.example.com';
+
+const DEFAULT_ICHANCY_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
+  'Chrome/150.0.0.0 Safari/537.36';
+
 const PLACEHOLDER_RE = /change_me|changeme|your_|xxxx/i;
 
 export const envSchema = z
@@ -185,6 +209,99 @@ export const envSchema = z
       .regex(/^[A-Z]{3}$/, 'ICHANCY_CURRENCY must be a 3-letter uppercase code')
       .default('NSP'),
     ICHANCY_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(60_000).default(8_000),
+    /**
+     * Raw `Cookie:` header for the agent API — in practice `cf_clearance` plus `__cf_bm` and the
+     * PHPSESSID, copied out of a browser that has passed Cloudflare's check.
+     *
+     * WHY THIS EXISTS: agents.ichancy.com is behind Cloudflare bot protection. A server-to-server
+     * POST with no cookie gets an HTML challenge page, never JSON — which is exactly what "it works
+     * in the browser but fails in Postman" means. Optional, because the fake adapter and any
+     * environment without the challenge need nothing here.
+     *
+     * OPERATIONAL WARNING: `cf_clearance` is bound to the CLIENT IP and the User-Agent that earned
+     * it. A cookie copied from a laptop will NOT work from a server with a different public IP —
+     * the durable fix is asking Ichancy to allowlist the server's IP.
+     */
+    /**
+     * Domain of the synthetic mailboxes we register players with, e.g. `players.example.com` ->
+     * `p912911246_7fszgwgh@players.example.com`.
+     *
+     * MUST have a TLD Ichancy's validator accepts. A reserved TLD does NOT work: registering with
+     * `.invalid` (RFC 2606, the obvious choice for an address that must never deliver) is refused
+     * with "Email field contains invalid characters." — proven against the live API on 2026-08-19,
+     * where the same local part on `.com` was accepted.
+     *
+     * MUST be a domain nobody else can ever own. Ichancy may send account mail to these addresses,
+     * so a domain we do not control is a stranger receiving our players' email one registration
+     * later. Either a domain you own with no MX record, or `example.com` (IANA-reserved forever).
+     *
+     * ⚠️ PERMANENT PER PLAYER. The address is stored on the row and is UNIQUE upstream; changing
+     * this only affects players registered afterwards, and a player registered under the old domain
+     * keeps it. Decide once, before the first real registration.
+     */
+    ICHANCY_PLAYER_EMAIL_DOMAIN: z
+      .string()
+      .optional()
+      // Blank means default, for the same reason as ICHANCY_USER_AGENT: `KEY=` in a .env file is an
+      // empty string, and an operator who clears a line means "use the default", not "boot with an
+      // empty domain and register everyone at `login@`".
+      .transform((value) =>
+        value === undefined || value.trim().length === 0
+          ? DEFAULT_ICHANCY_PLAYER_EMAIL_DOMAIN
+          : value.trim(),
+      )
+      .refine(
+        (value) => /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(value),
+        'ICHANCY_PLAYER_EMAIL_DOMAIN must look like a domain, e.g. players.example.com',
+      ),
+    /**
+     * HOW agent-API requests physically leave this process.
+     *
+     *   fetch    (default) Node's fetch plus a cookie jar. Correct for a host with no bot
+     *            protection, and the right answer once Ichancy allowlists a server IP.
+     *   browser  a real Chromium that performs the POST from inside the page. Needed because
+     *            agents.ichancy.com serves a Cloudflare Managed Challenge to server-side clients:
+     *            a browser-copied cf_clearance was measured surviving ~17 minutes, then a single
+     *            request, as the IP's trust score fell. A browser solves and refreshes the challenge
+     *            by itself, so nothing has to be pasted.
+     *
+     * `browser` requires the OPTIONAL playwright dependency:
+     *   npm install playwright && npx playwright install chromium
+     */
+    /**
+     * The PLAYER-facing site, where a player signs in with the credentials we registered for them.
+     * Not the agent panel (ICHANCY_BASE_URL) — that is staff-only and a player must never be sent
+     * there. Printed in the bot's account message, so it has to be the address that actually works.
+     */
+    ICHANCY_PLAYER_SITE_URL: httpUrl('ICHANCY_PLAYER_SITE_URL').default('https://ichancy.com'),
+    ICHANCY_TRANSPORT: z.enum(['fetch', 'browser']).default('fetch'),
+    /**
+     * Run the transport's Chromium headless. Default true.
+     *
+     * Set to false when a Managed Challenge refuses to clear headless — a visible browser is scored
+     * differently, and on a desktop it costs nothing to find out. On a server it needs a display
+     * (xvfb), so headless stays the default.
+     */
+    ICHANCY_BROWSER_HEADLESS: z
+      .enum(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off'])
+      .optional()
+      .transform((v) => (v === undefined ? true : ['true', '1', 'yes', 'on'].includes(v))),
+    ICHANCY_COOKIE: z.string().optional(),
+    /**
+     * Sent as `User-Agent`. MUST match the browser that produced ICHANCY_COOKIE, or Cloudflare
+     * invalidates the clearance. The default is a current desktop Chrome string — the common case —
+     * and is deliberately not `node`/`undici`, which bot protection scores badly on its own.
+     */
+    ICHANCY_USER_AGENT: z
+      .string()
+      .optional()
+      // `.default()` fills only `undefined`, and `ICHANCY_USER_AGENT=` in a .env file is an EMPTY
+      // STRING, not undefined — which failed `.min(1)` and refused to boot. Since .env.example
+      // tells operators to leave this empty when the server IP is allowlisted, "present but blank"
+      // is the COMMON case and has to mean "use the default", not "crash".
+      .transform((value) =>
+        value === undefined || value.trim().length === 0 ? DEFAULT_ICHANCY_USER_AGENT : value.trim(),
+      ),
     /**
      * Route every Ichancy call to the in-memory fake instead of the real agent API.
      *

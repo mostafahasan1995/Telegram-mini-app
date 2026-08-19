@@ -193,7 +193,7 @@ const HELP_TEXT = [
   '/balance — your gaming balance · رصيدك',
   '',
   '👤 <b>Account</b>',
-  '/profile — your details and your referral code · حسابك',
+  '/profile — your login, password and referral code · حسابك وبيانات الدخول',
   '/start — set up your account and open the cashier',
   '',
   'ℹ️ <b>Help</b>',
@@ -492,11 +492,18 @@ export class PlayerTelegramHandlers {
       const link = await this.links.ensureLinked(playerId, 'telegram:/start');
       if (!link.created) return link;
 
+      // The account is useless to the player until they know how to sign in to it, so the
+      // credentials follow immediately — but only where it is safe to print them.
+      if (ctx.chat?.type === 'private') {
+        await this.sendCredentials(ctx, playerId);
+        return link;
+      }
+
       await this.reply(
         ctx,
         [
           '✅ <b>تم إنشاء حساب اللعب الخاص بك.</b>',
-          'صار فيك تشحن رصيدك من القائمة فوق — أو اكتب <code>/deposit 50000</code>.',
+          'افتح محادثة خاصة معي واضغط 👤 حسابي لتحصل على اسم المستخدم وكلمة السر.',
         ].join('\n'),
       );
       return link;
@@ -513,6 +520,63 @@ export class PlayerTelegramHandlers {
       }
       return null;
     }
+  }
+
+  /**
+   * Renders the sign-in card. `justCreated` only changes the wording — a brand-new player is being
+   * congratulated, a returning one is being reminded.
+   *
+   * The login and password go in <code> tags because Telegram makes those tap-to-copy, and these are
+   * strings nobody can retype from memory.
+   */
+  private async credentialLines(playerId: string): Promise<string[]> {
+    const player = await this.playerRepo.findById(playerId);
+    if (player === null) return [];
+
+    let credentials: { login: string; password: string };
+    try {
+      credentials = this.links.credentialsFor(player);
+    } catch (error: unknown) {
+      // Only reachable if the stored secret cannot be opened — a rotated root secret, say. Say so
+      // rather than printing half an answer the player might try to type in.
+      this.logger.error(
+        `Could not read credentials for player ${playerId}: ${describeError(error)}`,
+      );
+      return ['', '⚠️ تعذّر عرض بيانات الدخول. تواصل مع الدعم عبر /paysupport.'];
+    }
+
+    return [
+      '',
+      '🔑 <b>بيانات الدخول للعبة</b>',
+      `الموقع: ${esc(this.config.ichancy.playerSiteUrl)}`,
+      `اسم المستخدم: <code>${esc(credentials.login)}</code>`,
+      `كلمة السر: <code>${esc(credentials.password)}</code>`,
+      '',
+      '⚠️ <b>احفظ هذه البيانات ولا تشاركها مع أي شخص.</b>',
+      'يُنصح بتغيير كلمة السر من الموقع بعد أول دخول — الشحن والسحب يبقى يشتغل عادي.',
+    ];
+  }
+
+  /**
+   * The sign-in details as their own message, sent once when the account is first created.
+   *
+   * WHY SEPARATE FROM THE PROFILE: a brand-new player has not opened a menu yet and would not know
+   * to look. Afterwards it lives in 👤 حسابي, which is where a person goes looking for "my account"
+   * — no extra command to discover or remember.
+   */
+  private async sendCredentials(ctx: Context, playerId: string): Promise<void> {
+    const lines = await this.credentialLines(playerId);
+    if (lines.length === 0) return;
+
+    await this.reply(
+      ctx,
+      [
+        '✅ <b>تم إنشاء حساب اللعب الخاص بك</b>',
+        ...lines,
+        '',
+        'تلاقيها دائماً في 👤 <b>حسابي</b>.',
+      ].join('\n'),
+    );
   }
 
   /**
@@ -806,6 +870,21 @@ export class PlayerTelegramHandlers {
       view.ichancyLinked
         ? 'Gaming account: <b>linked ✅</b>'
         : 'Gaming account: <b>being prepared</b> — send /start again in a moment.',
+    );
+
+    // The sign-in details, right here in the profile — this is where a player looks for "my
+    // account", and a separate command for it is one more thing to know about. In a GROUP the
+    // credentials are replaced by a pointer: ctx.reply answers wherever the command came from, and
+    // a working casino login posted in a group is handed to everyone who can read it.
+    if (view.ichancyLinked) {
+      if (ctx.chat?.type === 'private') {
+        lines.push(...(await this.credentialLines(player.id)));
+      } else {
+        lines.push('<i>افتح محادثة خاصة معي واضغط 👤 حسابي لعرض بيانات الدخول.</i>');
+      }
+    }
+
+    lines.push(
       '',
       `Referral code: <code>${esc(referralCode)}</code>`,
       username === null

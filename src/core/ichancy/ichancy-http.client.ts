@@ -13,6 +13,8 @@ import { AppConfigService } from '@core/config/config.service';
 import {
   classifyEnvelope,
   classifyTransportFailure,
+  cloudflareClassification,
+  isCloudflareChallenge,
   isTimeoutError,
   type IchancyClassification,
 } from './error-map';
@@ -38,6 +40,7 @@ import {
   type IchancyEnvelope,
   type IchancyTokenPair,
 } from './ichancy.wire';
+import { ICHANCY_TRANSPORT, type IchancyTransport } from './transport/ichancy-transport';
 
 export interface IchancyCallParams {
   readonly operation: IchancyOperation;
@@ -89,6 +92,9 @@ export class IchancyHttpClient implements IchancyAuthClient {
   constructor(
     private readonly config: AppConfigService,
     @Inject(ICHANCY_CALL_LOG) private readonly callLog: IchancyCallLogPort,
+    // HOW the bytes leave this process — Node's fetch, or a real Chromium when Cloudflare is in the
+    // way. Everything in this class is identical either way; see transport/ichancy-transport.ts.
+    @Inject(ICHANCY_TRANSPORT) private readonly transport: IchancyTransport,
   ) {}
 
   /**
@@ -98,11 +104,6 @@ export class IchancyHttpClient implements IchancyAuthClient {
    */
   async call(params: IchancyCallParams): Promise<IchancyAttempt> {
     const url = `${this.config.ichancy.baseUrl}${ICHANCY_API_PREFIX}/${params.endpoint}`;
-    const headers: Record<string, string> = {
-      'content-type': 'application/json',
-      accept: 'application/json',
-    };
-    if (params.accessToken) headers['authorization'] = `Bearer ${params.accessToken}`;
 
     const startedAt = Date.now();
     let httpStatus: number | null = null;
@@ -111,15 +112,15 @@ export class IchancyHttpClient implements IchancyAuthClient {
     let classification: IchancyClassification;
 
     try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(params.body),
-        signal: AbortSignal.timeout(this.config.ichancy.timeoutMs),
+      const response = await this.transport.post({
+        url,
+        body: params.body,
+        accessToken: params.accessToken ?? null,
+        timeoutMs: this.config.ichancy.timeoutMs,
       });
       httpStatus = response.status;
 
-      const text = await response.text();
+      const text = response.text;
       let parsed: unknown = null;
       try {
         parsed = text.length > 0 ? (JSON.parse(text) as unknown) : null;
@@ -127,8 +128,14 @@ export class IchancyHttpClient implements IchancyAuthClient {
         parsed = null;
       }
       envelope = toEnvelope(parsed);
-      responseForLog = envelope === null ? { rawBody: text } : parsed;
-      classification = classifyEnvelope(httpStatus, envelope);
+      responseForLog = envelope === null ? { rawBody: text.slice(0, 2_000) } : parsed;
+
+      // BEFORE classifyEnvelope, and the order is load-bearing: a Cloudflare challenge is an HTTP
+      // 403, 403 is in isUnauthorizedHttpStatus, so classifying it normally would read "token
+      // expired" and spend the agent's single refresh token on a problem no token can fix.
+      classification = isCloudflareChallenge(httpStatus, text, response.contentType)
+        ? cloudflareClassification(httpStatus)
+        : classifyEnvelope(httpStatus, envelope);
     } catch (error) {
       classification = classifyTransportFailure(error);
       responseForLog = {

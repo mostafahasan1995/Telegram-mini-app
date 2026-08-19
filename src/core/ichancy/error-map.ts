@@ -111,6 +111,23 @@ export const ICHANCY_ERROR_RULES: readonly ErrorRule[] = Object.freeze([
     outcome: 'rejected',
     code: IchancyRejectionCodes.VALIDATION_FAILED,
   },
+  {
+    /**
+     * "Email field contains invalid characters." — observed 2026-08-19 on the first real
+     * registerPlayer. It is a FIELD VALIDATION verdict returned before anything is written, so it is
+     * a definite `rejected`: retrying the same payload produces the same answer forever, and leaving
+     * it `ambiguous` (the safe default) had the caller report "we could not confirm your account"
+     * for a request that was never going to succeed.
+     *
+     * The matcher is deliberately field-agnostic — the same sentence shape is used for login and
+     * password — because every one of them is the same class of answer: fix the payload, not the
+     * network.
+     */
+    id: 'FIELD_INVALID_CHARACTERS',
+    test: /field contains invalid characters/,
+    outcome: 'rejected',
+    code: IchancyRejectionCodes.VALIDATION_FAILED,
+  },
 
   // ---- money --------------------------------------------------------------------------
   {
@@ -190,6 +207,64 @@ export function classifyErrorContent(content: string): IchancyErrorClassificatio
  */
 export function isUnauthorizedHttpStatus(status: number): boolean {
   return status === 401 || status === 403;
+}
+
+/** Stable code for "Cloudflare answered instead of Ichancy". Ends up on ichancy_calls.error_code. */
+export const CLOUDFLARE_CHALLENGE_CODE = 'CLOUDFLARE_CHALLENGE';
+
+/**
+ * Fingerprints of Cloudflare's interstitial. Matched against the RAW body because a challenge page
+ * is HTML — `toEnvelope` has already returned null by the time anything else looks at it.
+ */
+const CLOUDFLARE_MARKERS = [
+  'just a moment',
+  'cf-browser-verification',
+  'cf_chl_opt',
+  '__cf_chl',
+  'cf-mitigated',
+  'attention required! | cloudflare',
+  'enable javascript and cookies to continue',
+];
+
+/**
+ * Did Cloudflare answer instead of the agent API?
+ *
+ * WHY THIS MUST BE CHECKED BEFORE classifyEnvelope: a challenge comes back as HTTP 403, and 403 is
+ * in isUnauthorizedHttpStatus — so without this the adapter reads "token expired", spends the
+ * refresh token, replays the call, gets challenged again, and ends up having thrown away a live
+ * session over a bot check. The whole point of a separate code is that no amount of re-authenticating
+ * can fix it: only a fresh cookie (or an IP allowlist) can.
+ *
+ * WHY `ambiguous` AND NOT `rejected`: same rule as everything else in this file — Cloudflare blocks
+ * the REQUEST, so the money certainly did not move, but proving that from here would mean trusting
+ * that the block happened before the origin saw it. Ambiguous costs a balance re-read; rejected
+ * costs a double payment if we are ever wrong.
+ */
+export function isCloudflareChallenge(
+  httpStatus: number,
+  rawBody: string,
+  contentType: string | null,
+): boolean {
+  // A JSON answer is Ichancy's, whatever the status. Only non-JSON can be the interstitial.
+  if (contentType !== null && contentType.toLowerCase().includes('application/json')) return false;
+  if (httpStatus !== 403 && httpStatus !== 503 && httpStatus !== 429) return false;
+
+  const haystack = rawBody.slice(0, 4_000).toLowerCase();
+  return CLOUDFLARE_MARKERS.some((marker) => haystack.includes(marker));
+}
+
+/** The classification for a challenged call, with the fix spelled out for whoever reads the log. */
+export function cloudflareClassification(httpStatus: number): IchancyClassification {
+  return {
+    outcome: 'ambiguous',
+    code: CLOUDFLARE_CHALLENGE_CODE,
+    message:
+      `Cloudflare answered with a challenge (HTTP ${String(httpStatus)}) instead of the agent API. ` +
+      'ICHANCY_COOKIE is missing, expired, or was earned by a different IP/User-Agent. ' +
+      'Refresh cf_clearance from a browser on the same public IP as this server, or have the ' +
+      "server's IP allowlisted.",
+    rule: 'CLOUDFLARE_CHALLENGE',
+  };
 }
 
 function ambiguous(code: string, message: string, rule: string | null): IchancyErrorClassification {
