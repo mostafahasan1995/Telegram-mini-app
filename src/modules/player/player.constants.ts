@@ -76,6 +76,60 @@ export const PLAYER_LINK_LOCK_TTL_MS = 30_000;
 
 export const playerLinkLockKey = (playerId: string): string => `player-link:${playerId}`;
 
+// -------------------------------------------------------------------------------------------------
+// The registration backfill — see services/player-link-backfill.service.ts
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * How often the worker looks for players stranded at PENDING_ICHANCY.
+ *
+ * Five minutes rather than one: a stranded player is not waiting on this tick (they are told
+ * nothing, and DepositCreditService links lazily before any money moves), while a tighter loop over
+ * a challenged endpoint is actively harmful — every failed challenge lowers the IP's Cloudflare
+ * trust score, which is how twenty minutes of failure became hours on 2026-08-20.
+ */
+export const PLAYER_LINK_BACKFILL_INTERVAL_MS = 5 * 60_000;
+
+/** Under the interval, per the house convention, so a tick is never skipped by a stale lock. */
+export const PLAYER_LINK_BACKFILL_LOCK_TTL_MS = 4 * 60_000;
+
+/** Bounded per pass: one tick must not be able to hold a connection for minutes on a backlog. */
+export const PLAYER_LINK_BACKFILL_BATCH = 10;
+
+/** Wall-clock ceiling for one pass, independent of the batch size. */
+export const PLAYER_LINK_BACKFILL_BUDGET_MS = 120_000;
+
+/**
+ * How long a freshly created player is left alone before the cron touches them.
+ *
+ * /start makes its own attempt (player.handlers.ts ensureGamingAccount), and a cron racing that
+ * would mean two linkers for the same row. The per-player lock makes that safe rather than
+ * dangerous, but it is still two registerPlayer calls for one person and twice the ichancy_calls
+ * noise on the endpoint we most need to read.
+ */
+export const PLAYER_LINK_BACKFILL_GRACE_MS = 120_000;
+
+/** First retry lands here; each further attempt doubles it. */
+export const PLAYER_LINK_BACKOFF_BASE_MS = 5 * 60_000;
+
+/** Ceiling for the doubling. Twelve hours is "an operator will have looked by now". */
+export const PLAYER_LINK_BACKOFF_MAX_MS = 12 * 60 * 60_000;
+
+/**
+ * After this many attempts a player is PARKED and the selector stops returning them.
+ *
+ * A hard stop rather than an ever-growing delay: something that has failed twelve times needs a
+ * human, and a row that is retried forever is a row that quietly keeps adding to the ichancy_calls
+ * noise. The alert cron reports the parked count so the human knows to look.
+ */
+export const PLAYER_LINK_MAX_ATTEMPTS = 12;
+
+/**
+ * Its own correlationId, so the cron's work is attributable in `ichancy_calls` and in the
+ * `player.ichancy.linked` audit row rather than being indistinguishable from a /start.
+ */
+export const PLAYER_LINK_BACKFILL_CORRELATION = 'cron:player-link-backfill';
+
 /** Guards the read-then-write of the once-only referral binding. */
 export const REFERRAL_BIND_LOCK_TTL_MS = 5_000;
 

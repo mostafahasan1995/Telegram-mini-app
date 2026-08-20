@@ -35,6 +35,8 @@ import { PlayerController } from './controllers/player.controller';
 import { PlayerRepository } from './repositories/player.repository';
 import { PlayerAccessService } from './services/player-access.service';
 import { PlayerAuthService } from './services/player-auth.service';
+import { PlayerLinkBackfillCron } from './services/player-link-backfill.cron';
+import { PlayerLinkBackfillService } from './services/player-link-backfill.service';
 import { PlayerLinkService } from './services/player-link.service';
 import { PlayerService } from './services/player.service';
 import { ReferralService } from './services/referral.service';
@@ -51,6 +53,13 @@ import { PLAYER_LINK_PORT } from './player-link.port';
     PlayerAccessService,
     PlayerAuthService,
     PlayerLinkService,
+    // The self-healer for registrations Cloudflare (or anything else) killed mid-flight, plus its
+    // schedule. Both are plain providers, following the reconciliation variant rather than the
+    // deposit one: ScheduleModule.forRoot() exists only in worker.module.ts, and the isWorker guard
+    // inside tick() is the belt. Nothing needs adding to worker.module.ts — PlayerModule is already
+    // in that graph.
+    PlayerLinkBackfillService,
+    PlayerLinkBackfillCron,
     ReferralService,
     PlayerTelegramHandlers,
     // CLI: npm run player:register. Inert outside main.cli.ts — see TelegramModule's commands.
@@ -60,6 +69,7 @@ import { PLAYER_LINK_PORT } from './player-link.port';
   exports: [
     PLAYER_LINK_PORT,
     PlayerLinkService,
+    PlayerLinkBackfillService,
     PlayerService,
     PlayerAccessService,
     PlayerRepository,

@@ -21,6 +21,7 @@
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:int": "jest --config jest-int.config.cjs",
+    "playwright:install": "playwright install chromium",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "db:bootstrap": "ts-node -r tsconfig-paths/register scripts/db-bootstrap.ts",
@@ -103,6 +104,7 @@
     "seed": "ts-node -r tsconfig-paths/register prisma/seed.ts"
   },
   "optionalDependencies": {
+    "patchright": "^1.62.1",
     "playwright": "^1.62.1"
   }
 }

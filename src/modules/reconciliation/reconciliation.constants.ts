@@ -19,6 +19,23 @@ export const AGENT_FLOAT_SYNC_INTERVAL_MS = 5 * 60_000;
 /** Rail ageing is a report, not an alarm; hourly is enough. */
 export const RAIL_AGEING_INTERVAL_MS = 60 * 60_000;
 
+/**
+ * The Ichancy outage alarm. One minute, because it costs one Redis HGETALL per tick and posts only
+ * on a STATE CHANGE — the cadence bounds how fast a recovery is announced, not how often anyone is
+ * messaged. Detection latency is set by ICHANCY_DOWN_THRESHOLD and the ambient call rate, not here.
+ */
+export const ICHANCY_HEALTH_ALERT_INTERVAL_MS = 60_000;
+
+/** Under the interval, per the house convention. */
+export const ICHANCY_HEALTH_ALERT_LOCK_TTL_MS = 55_000;
+
+/**
+ * How long an "already announced" marker lives. A day: long enough that a multi-hour outage is
+ * never re-announced, short enough that Redis is not accumulating keys for transitions nobody will
+ * ever look at again. The key includes the transition's timestamp, so the next one is a new key.
+ */
+export const ICHANCY_HEALTH_ANNOUNCE_TTL_SECONDS = 24 * 60 * 60;
+
 /** Only one replica sweeps per tick. Slightly under the interval so a tick is never skipped. */
 export const RECON_LOCK_TTL_MS = 4 * 60_000;
 

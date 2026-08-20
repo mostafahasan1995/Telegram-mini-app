@@ -16,12 +16,14 @@
  * pay for their credits is what makes that visible before the first player arrives.
  */
 import { Inject, Logger } from '@nestjs/common';
+import { existsSync } from 'node:fs';
 import { Command, CommandRunner } from 'nest-commander';
 
 import { AppConfigService } from '@core/config/config.service';
 import { formatMinorToDecimal } from '@common/helpers/money.util';
 
 import { CLOUDFLARE_CHALLENGE_CODE } from '../error-map';
+import { BrowserIchancyTransport } from '../transport/browser.transport';
 import { IchancySessionService } from '../ichancy-session.service';
 import { ICHANCY_PORT, type IchancyPort } from '../ichancy.port';
 import { isIchancyOk, isIchancyRejected } from '../ichancy.types';
@@ -37,6 +39,9 @@ export class IchancyCheckCommand extends CommandRunner {
     private readonly config: AppConfigService,
     private readonly session: IchancySessionService,
     @Inject(ICHANCY_PORT) private readonly ichancy: IchancyPort,
+    // The concrete class, not the ICHANCY_TRANSPORT token: this command has to be able to say what
+    // the browser transport WOULD do even when the fetch one is selected.
+    private readonly browser: BrowserIchancyTransport,
   ) {
     super();
   }
@@ -59,6 +64,11 @@ export class IchancyCheckCommand extends CommandRunner {
     // integration look permanently blocked when it was one string away from working.
     this.logger.log(`user-agent  ${settings.userAgent}`);
     this.logger.log(`adapter     ${settings.fake ? 'FAKE — nothing real is contacted' : 'REAL'}`);
+    // Until 2026-08-20 this command could not tell an operator WHICH transport was in effect — the
+    // only signal was a line in the boot log, which is exactly what nobody has in front of them
+    // while an integration is down. The transport is the first thing to check now that a pasted
+    // cf_clearance is no longer the supported path.
+    await this.reportTransport();
 
     // MIRRORS the guard in WorkerBootstrapService: ICHANCY_FAKE means this process does not CONTACT
     // Ichancy, not merely that it does not move money. ensureSession() would sign in for real even
@@ -87,6 +97,58 @@ export class IchancyCheckCommand extends CommandRunner {
     }
 
     await this.reportWallet(settings.currency);
+  }
+
+  /**
+   * WHICH transport, and — in browser mode — whether the prerequisites are actually on this box.
+   * Read-only: it never launches Chromium just to answer, because a diagnostic that starts a
+   * browser is a diagnostic that changes what it is measuring.
+   */
+  private async reportTransport(): Promise<void> {
+    const settings = this.config.ichancy;
+    this.logger.log('── transport ────────────────────────────────────────────────');
+
+    if (settings.transport === 'fetch') {
+      this.logger.log('transport   fetch  (Node fetch + ICHANCY_COOKIE)');
+      this.logger.warn(
+        'fetch is the FALLBACK path. A pasted cf_clearance decays with the IP trust score — ' +
+          'measured ~17 minutes on 2026-08-19. Prefer ICHANCY_TRANSPORT=browser.',
+      );
+      return;
+    }
+
+    const described = this.browser.describeTransport();
+    this.logger.log(`transport   browser  (headless=${String(described.headless)})`);
+
+    let executable: string | null = null;
+    try {
+      const playwright = (await import('playwright')) as unknown as {
+        chromium: { executablePath(): string };
+      };
+      executable = playwright.chromium.executablePath();
+    } catch {
+      executable = null;
+    }
+    if (executable === null) {
+      this.logger.error('playwright  NOT INSTALLED — run `npm install playwright`');
+    } else if (!existsSync(executable)) {
+      this.logger.error(`chromium    MISSING at ${executable} — run \`npm run playwright:install\``);
+    } else {
+      this.logger.log(`chromium    ${executable}`);
+    }
+
+    // The RESOLVED UA, which is Chromium's own and only known once it has been launched. Printing
+    // "not launched yet" rather than the configured value is the point: in browser mode
+    // ICHANCY_USER_AGENT is ignored, and showing it here is what would send someone chasing a
+    // mismatch that no longer exists.
+    this.logger.log(
+      `chromium UA ${described.chromiumUserAgent ?? 'not launched in this process yet'}`,
+    );
+    if (!settings.userAgentIsDefault) {
+      this.logger.warn(
+        'ICHANCY_USER_AGENT is set but IGNORED in browser mode; Chromium supplies its own.',
+      );
+    }
   }
 
   /** The wallet half, shared by the real path and the fake one so both print the same shape. */

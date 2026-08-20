@@ -3,8 +3,11 @@
  * already-converted values (bigint minor units, bigint chat ids, string[] origins) so no call site
  * re-parses a limit and gets the units wrong. Groups mirror the .env.example sections.
  */
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { Inject, Injectable } from '@nestjs/common';
-import { type Env } from './env.schema';
+import { DEFAULT_ICHANCY_USER_AGENT, type Env } from './env.schema';
 
 export const ENV_TOKEN = 'ICHANCY_VALIDATED_ENV';
 
@@ -97,14 +100,28 @@ export interface IchancySettings {
   readonly cookie: string | null;
   /** Where PLAYERS sign in with the credentials we registered — never the agent panel. */
   readonly playerSiteUrl: string;
+  /** Refresh the Cloudflare clearance in a real browser every ~25 min. See ICHANCY_COOKIE_HARVEST. */
+  readonly cookieHarvest: boolean;
+  /** Persistent Chrome profile directory for that harvester. */
+  readonly cookieProfileDir: string;
   /** How requests leave this process: Node fetch, or a real Chromium. See ICHANCY_TRANSPORT. */
   readonly transport: 'fetch' | 'browser';
   /** Run the browser transport headless. Ignored by the fetch transport. */
   readonly browserHeadless: boolean;
   /** Domain of the synthetic player mailboxes. See ICHANCY_PLAYER_EMAIL_DOMAIN in env.schema.ts. */
   readonly playerEmailDomain: string;
-  /** Sent as `User-Agent`. cf_clearance is bound to it, so it is configuration, not decoration. */
+  /** Sent as `User-Agent` by the FETCH transport. cf_clearance is bound to it, so it is
+   * configuration, not decoration. Browser mode ignores it — Chromium supplies its own. */
   readonly userAgent: string;
+  /**
+   * Did the operator leave ICHANCY_USER_AGENT alone? The schema defaults a blank value, so by the
+   * time anything reads `userAgent` an explicit override is indistinguishable from the fallback —
+   * and the preflight needs to tell them apart to warn that a UA set in browser mode is ignored.
+   *
+   * Blind spot, stated rather than hidden: an operator who sets it to exactly the default string
+   * gets no warning. That is harmless, because the value they chose is the value in use.
+   */
+  readonly userAgentIsDefault: boolean;
 }
 
 export interface S3Settings {
@@ -189,10 +206,17 @@ export class AppConfigService {
       // an empty header Cloudflare would treat as a malformed request.
       cookie: env.ICHANCY_COOKIE?.trim() ? env.ICHANCY_COOKIE.trim() : null,
       userAgent: env.ICHANCY_USER_AGENT,
+      userAgentIsDefault: env.ICHANCY_USER_AGENT === DEFAULT_ICHANCY_USER_AGENT,
       // Already defaulted and shape-checked by the schema — a blank line there means "the default",
       // so this is never empty and never needs a fallback of its own.
       playerEmailDomain: env.ICHANCY_PLAYER_EMAIL_DOMAIN,
       playerSiteUrl: env.ICHANCY_PLAYER_SITE_URL,
+      cookieHarvest: env.ICHANCY_COOKIE_HARVEST ?? false,
+      cookieProfileDir:
+        env.ICHANCY_COOKIE_PROFILE_DIR !== undefined &&
+        env.ICHANCY_COOKIE_PROFILE_DIR.trim().length > 0
+          ? env.ICHANCY_COOKIE_PROFILE_DIR.trim()
+          : join(tmpdir(), 'ichancy-agent-profile'),
       transport: env.ICHANCY_TRANSPORT,
       browserHeadless: env.ICHANCY_BROWSER_HEADLESS,
     });

@@ -40,6 +40,22 @@ COPY --from=builder --chown=node:node /app/dist ./dist
 COPY --from=builder --chown=node:node /app/prisma ./prisma
 COPY --from=builder --chown=node:node /app/package.json ./package.json
 
+# ---------- Chromium for ICHANCY_TRANSPORT=browser ----------
+# REQUIRED, not optional: browser is the DEFAULT transport and IchancyTransportPreflightService
+# refuses to boot without a usable binary, so an image built without this step crash-loops. That is
+# the deliberate trade, and it is the better half of it — before 2026-08-20 the missing prerequisite
+# surfaced at the first player as an unexplained TRANSPORT_ERROR row on ichancy_calls, which reads
+# like an Ichancy problem rather than a gap in our own image.
+#
+# `npm ci --include=optional` in the builder keeps the playwright JS, but Playwright 1.62 has NO
+# postinstall hook, so the ~400 MB browser has to be fetched explicitly and separately. --with-deps
+# brings Chromium's shared libraries; the chmod is what lets the unprivileged node user read them,
+# since the browsers land under a root-owned path. Adds ~400 MB to the image.
+#
+# To skip all of this: set ICHANCY_TRANSPORT=fetch and accept the pasted-cookie countdown.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN npx playwright install --with-deps chromium && chmod -R a+rX /ms-playwright
+
 USER node
 EXPOSE 3000
 

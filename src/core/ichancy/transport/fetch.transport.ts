@@ -10,6 +10,11 @@ import { Injectable, Logger } from '@nestjs/common';
 
 import { AppConfigService } from '@core/config/config.service';
 
+import { isCloudflareChallenge } from '../error-map';
+
+import { CookieHarvesterService } from './cookie-harvester.service';
+import { IchancyCookieStore, type HarvestedCookies } from './ichancy-cookie.store';
+
 import {
   type IchancyTransport,
   type IchancyTransportRequest,
@@ -59,12 +64,37 @@ export class FetchIchancyTransport implements IchancyTransport {
   private readonly cookies = new Map<string, string>();
   private cookiesSeeded = false;
 
-  constructor(private readonly config: AppConfigService) {}
+  constructor(
+    private readonly config: AppConfigService,
+    private readonly store: IchancyCookieStore,
+    private readonly harvester: CookieHarvesterService,
+  ) {}
 
   async post(request: IchancyTransportRequest): Promise<IchancyTransportResponse> {
+    const first = await this.send(request);
+    if (!isCloudflareChallenge(first.status, first.text, first.contentType)) return first;
+
+    // CHALLENGED. When the harvester is enabled this is recoverable without a human: the clearance
+    // has simply aged out, and a browser can earn a new one in seconds.
+    //
+    // WHY REPLAYING IS SAFE HERE: a challenge is Cloudflare's EDGE answering, with its own
+    // interstitial as the body. The request never reached Ichancy, so nothing was registered and no
+    // money moved. This is the one failure in this file that may be retried — anything else is
+    // rethrown and classified as ambiguous. Compare BrowserIchancyTransport.post, which refuses to
+    // replay after a dead browser for exactly the opposite reason.
+    const harvested = await this.harvester.harvest();
+    if (harvested === null) return first;
+
+    this.logger.warn(
+      'Cloudflare challenged the call; retrying once with a freshly harvested clearance',
+    );
+    return this.send(request);
+  }
+
+  private async send(request: IchancyTransportRequest): Promise<IchancyTransportResponse> {
     const response = await fetch(request.url, {
       method: 'POST',
-      headers: this.buildHeaders(request.accessToken),
+      headers: await this.buildHeaders(request.accessToken),
       body: JSON.stringify(request.body),
       signal: AbortSignal.timeout(request.timeoutMs),
     });
@@ -86,11 +116,19 @@ export class FetchIchancyTransport implements IchancyTransport {
    * reason only: cf_clearance is issued against the UA that solved the challenge, so a mismatch
    * silently invalidates a cookie that looks perfectly valid in .env.
    */
-  private buildHeaders(accessToken: string | null): Record<string, string> {
+  private async buildHeaders(accessToken: string | null): Promise<Record<string, string>> {
+    // The HARVESTED clearance wins over ICHANCY_COOKIE, and brings its own User-Agent.
+    //
+    // WHY THE UA TRAVELS WITH THE COOKIE: Cloudflare binds a clearance to the browser that earned
+    // it, so a harvested cookie sent under the configured UA fails exactly as if no cookie had been
+    // sent. Keeping the pair together is what makes that impossible to get wrong — it was got wrong
+    // twice on 2026-08-19, once as Chrome 140 vs 150 and once as Chrome vs Firefox.
+    const harvested = await this.harvestedCookies();
+
     const headers: Record<string, string> = {
       'content-type': 'application/json',
       accept: 'application/json',
-      'user-agent': this.config.ichancy.userAgent,
+      'user-agent': harvested?.userAgent ?? this.config.ichancy.userAgent,
     };
 
     if (accessToken) headers['authorization'] = `Bearer ${accessToken}`;
@@ -101,10 +139,16 @@ export class FetchIchancyTransport implements IchancyTransport {
       headers['referer'] = `${origin}/`;
     }
 
-    const cookie = this.cookieHeader();
+    const cookie = harvested?.cookie ?? this.cookieHeader();
     if (cookie !== null) headers['cookie'] = cookie;
 
     return headers;
+  }
+
+  /** The harvester's current clearance, or null when the feature is off or nothing is stored. */
+  private async harvestedCookies(): Promise<HarvestedCookies | null> {
+    if (!this.config.ichancy.cookieHarvest) return null;
+    return this.store.read();
   }
 
   /** Everything in the jar, seeded from config on first use. Null when there is nothing to send. */

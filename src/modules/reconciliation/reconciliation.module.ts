@@ -19,6 +19,7 @@ import { TelegramModule } from '@core/telegram/telegram.module';
 import { ReconciliationController } from './controllers/reconciliation.controller';
 import { ReconProcessor } from './processors/recon.processor';
 import { AgentFloatSyncService } from './services/agent-float-sync.service';
+import { IchancyHealthAlertCron } from './services/ichancy-health.cron';
 import { InvariantCheckCron } from './services/invariant-check.cron';
 import { RailAgeingService } from './services/rail-ageing.service';
 import { ReconciliationBreakService } from './services/reconciliation-break.service';
@@ -28,6 +29,9 @@ const SHARED_PROVIDERS: Provider[] = [
   AgentFloatSyncService,
   RailAgeingService,
   InvariantCheckCron,
+  // Same treatment as InvariantCheckCron: shared so an admin surface can read it, inert in the api
+  // because ScheduleModule never scans that graph and tick() guards on isWorker anyway.
+  IchancyHealthAlertCron,
 ];
 
 const WORKER_PROVIDERS: Provider[] = [ReconProcessor];
@@ -37,6 +41,7 @@ const RECON_EXPORTS = [
   AgentFloatSyncService,
   RailAgeingService,
   InvariantCheckCron,
+  IchancyHealthAlertCron,
 ];
 
 @Module({

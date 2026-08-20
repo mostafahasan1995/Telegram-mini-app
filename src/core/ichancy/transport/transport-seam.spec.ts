@@ -5,6 +5,7 @@
  * ICHANCY_TRANSPORT safe in both directions.
  */
 import { cloudflareClassification, classifyEnvelope, isCloudflareChallenge } from '../error-map';
+import { looksChallenged } from './browser.transport';
 import { toEnvelope } from '../ichancy.wire';
 import { type IchancyTransportResponse } from './ichancy-transport';
 
@@ -64,5 +65,33 @@ describe('transport seam', () => {
 
   it('never mistakes a JSON body for a challenge, whatever the status', () => {
     expect(isCloudflareChallenge(403, AGENT_JSON.text, 'application/json')).toBe(false);
+  });
+
+  /**
+   * The browser transport has a SECOND opinion about what a challenge is, because it decides whether
+   * to re-solve and REPLAY the call. That call can be `registerPlayer`, which is not idempotent and
+   * whose duplicate cannot be deleted — the agent API has no deletePlayer. So the two predicates
+   * disagreeing is not untidiness, it is a route to an undeletable second casino account.
+   *
+   * They disagreed until 2026-08-20: the transport replayed on any non-JSON 403/503/429 without
+   * requiring a Cloudflare marker in the body, and `contentType?.includes(...) !== true` made a
+   * NULL content-type look like a challenge too.
+   */
+  it('agrees with the transport about which responses may be replayed', () => {
+    const cases: IchancyTransportResponse[] = [
+      CHALLENGE,
+      AGENT_JSON,
+      WRONG_PASSWORD,
+      { status: 403, contentType: null, text: 'Forbidden' },
+      { status: 429, contentType: 'text/plain', text: 'slow down' },
+      { status: 503, contentType: 'text/html', text: '<h1>Just a moment...</h1>' },
+    ];
+
+    for (const response of cases) {
+      const classification = classify(response);
+      const errorMapSaysChallenge =
+        classification.outcome !== 'ok' && classification.code === 'CLOUDFLARE_CHALLENGE';
+      expect(looksChallenged(response)).toBe(errorMapSaysChallenge);
+    }
   });
 });

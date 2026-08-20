@@ -24,13 +24,17 @@ import { AppConfigService } from '@core/config/config.service';
 import { FakeIchancyAdapter } from './fake-ichancy.adapter';
 import { HttpIchancyAdapter } from './http-ichancy.adapter';
 import { ICHANCY_CALL_LOG, IchancyCallLogService } from './ichancy-call-log.service';
+import { IchancyHealthService } from './ichancy-health.service';
 import { ICHANCY_AUTH_CLIENT, IchancyHttpClient } from './ichancy-http.client';
 import { IchancySessionService } from './ichancy-session.service';
 import { ICHANCY_SESSION_STORE, RedisIchancySessionStore } from './ichancy-session.store';
 import { ICHANCY_PORT, type IchancyPort } from './ichancy.port';
 import { IchancyCheckCommand } from './commands/ichancy-check.command';
 import { BrowserIchancyTransport } from './transport/browser.transport';
+import { CookieHarvesterService } from './transport/cookie-harvester.service';
 import { FetchIchancyTransport } from './transport/fetch.transport';
+import { IchancyCookieStore } from './transport/ichancy-cookie.store';
+import { IchancyTransportPreflightService } from './transport/ichancy-transport-preflight.service';
 import { ICHANCY_TRANSPORT, type IchancyTransport } from './transport/ichancy-transport';
 
 const TRUTHY = new Set(['1', 'true', 'yes', 'on']);
@@ -96,9 +100,19 @@ const transportProvider: Provider = {
   providers: [
     IchancyCallLogService,
     { provide: ICHANCY_CALL_LOG, useExisting: IchancyCallLogService },
+    IchancyHealthService,
+    IchancyCookieStore,
+    // The @Interval inside it only becomes behaviour where ScheduleModule is imported (the worker),
+    // and it guards on APP_ROLE itself — so listing it here costs an api process one construction.
+    CookieHarvesterService,
     FetchIchancyTransport,
     BrowserIchancyTransport,
     transportProvider,
+    // Registered in BOTH roles on purpose: ICHANCY_TRANSPORT=browser without a Chromium binary
+    // otherwise fails at the first player as TRANSPORT_ERROR/UNKNOWN, which reads like an Ichancy
+    // problem rather than a missing dependency. This turns it into a refused boot that names the
+    // install command.
+    IchancyTransportPreflightService,
     IchancyHttpClient,
     { provide: ICHANCY_AUTH_CLIENT, useExisting: IchancyHttpClient },
     RedisIchancySessionStore,
@@ -116,6 +130,8 @@ const transportProvider: Provider = {
     // The worker's warm-up/health checks call ensureSession()/describe(); tests script the fake.
     IchancySessionService,
     FakeIchancyAdapter,
+    // Read by the player-link backfill (as a gate) and by the alert cron (state changes only).
+    IchancyHealthService,
   ],
 })
 export class IchancyModule {}

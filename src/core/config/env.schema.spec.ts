@@ -136,3 +136,26 @@ describe('ICHANCY_USER_AGENT / ICHANCY_COOKIE', () => {
     expect(() => ichancyEnvFor({ ICHANCY_COOKIE: '' })).not.toThrow();
   });
 });
+
+describe('ICHANCY_TRANSPORT', () => {
+  /**
+   * THE DEFAULT IS THE FIX. A pasted cf_clearance was measured surviving ~17 minutes on 2026-08-19
+   * and, hours later, exactly one request, because Cloudflare's trust score for an IP decays with
+   * every challenge that IP fails. On 2026-08-20 the same curve blocked the integration for hours
+   * and stranded a player at PENDING_ICHANCY. A deployment that says nothing must get the transport
+   * that solves the challenge for itself, not the one that counts down.
+   */
+  it('defaults to the browser transport', () => {
+    expect(ichancyEnvFor({}).ICHANCY_TRANSPORT).toBe('browser');
+  });
+
+  it('still lets a deployment choose the fetch fallback explicitly', () => {
+    // An IP-allowlisted host, or ICHANCY_FAKE=true, needs no browser — and the fallback has to stay
+    // one line away, because the preflight now refuses to boot without Chromium.
+    expect(ichancyEnvFor({ ICHANCY_TRANSPORT: 'fetch' }).ICHANCY_TRANSPORT).toBe('fetch');
+  });
+
+  it('refuses a transport nobody implements', () => {
+    expect(() => ichancyEnvFor({ ICHANCY_TRANSPORT: 'curl' })).toThrow();
+  });
+});

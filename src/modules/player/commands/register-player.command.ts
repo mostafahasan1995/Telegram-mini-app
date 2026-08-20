@@ -116,6 +116,13 @@ export class RegisterPlayerCommand extends CommandRunner {
     for (const target of targets) {
       try {
         const link = await this.links.ensureLinked(target.id, 'cli:player:register');
+        // Clear the cron's backoff bookkeeping so a player rescued by hand does not keep showing a
+        // stale "attempt 12, CLOUDFLARE_CHALLENGE" to the next operator who looks. The attempt
+        // COUNT is kept: "this one took nine tries" is forensics worth having after an outage.
+        await this.prisma.player.updateMany({
+          where: { id: target.id, ichancyPlayerId: { not: null } },
+          data: { ichancyLinkNextAttemptAt: null, ichancyLinkLastError: null },
+        });
         if (link.created) {
           created += 1;
           this.logger.log(
@@ -187,8 +194,15 @@ export class RegisterPlayerCommand extends CommandRunner {
 
     // Oldest first: the people who have been waiting longest are registered first, and the ordering
     // is total so an interrupted run resumes predictably rather than reshuffling.
+    //
+    // `status: 'PENDING_ICHANCY'` is load-bearing. linkIchancyAccount force-sets `status: 'ACTIVE'`
+    // with a WHERE of only `{ id, ichancyPlayerId: null }`, so a bare `ichancyPlayerId: null`
+    // selector would mint a casino account for a SUSPENDED / SELF_EXCLUDED / CLOSED player and
+    // silently reactivate them — and there is no deletePlayer to undo it with. Naming one player
+    // explicitly (--player-id / --telegram-id) is still allowed to override that, because that is a
+    // human making a deliberate choice about a specific person.
     return this.prisma.player.findMany({
-      where: { ichancyPlayerId: null },
+      where: { status: 'PENDING_ICHANCY', ichancyPlayerId: null },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       take: options.limit ?? DEFAULT_BACKFILL_LIMIT,
       select,

@@ -360,6 +360,18 @@ model Player {
   ichancyPasswordEnc  String?   @map("ichancy_password_enc")
   ichancyRegisteredAt DateTime? @map("ichancy_registered_at") @db.Timestamptz(6)
 
+  /// Bookkeeping for the worker-only registration backfill (PlayerLinkBackfillService).
+  ///
+  /// WHY THESE ARE COLUMNS AND NOT REDIS KEYS: losing the backoff on a restart means re-hammering
+  /// rows Ichancy has permanently refused, which drives the IP's Cloudflare trust score down —
+  /// the exact mechanism that turned twenty minutes of failure into hours on 2026-08-20. An
+  /// operator also has to be able to read "attempt 7, last error CLOUDFLARE_CHALLENGE" off the row
+  /// while diagnosing. All four are nullable/defaulted, so no existing write path changes.
+  ichancyLinkAttempts      Int       @default(0) @map("ichancy_link_attempts")
+  ichancyLinkLastAttemptAt DateTime? @map("ichancy_link_last_attempt_at") @db.Timestamptz(6)
+  ichancyLinkNextAttemptAt DateTime? @map("ichancy_link_next_attempt_at") @db.Timestamptz(6)
+  ichancyLinkLastError     String?   @map("ichancy_link_last_error")
+
   lastSeenAt DateTime? @map("last_seen_at") @db.Timestamptz(6)
   createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
@@ -375,6 +387,8 @@ model Player {
 
   @@index([status])
   @@index([createdAt])
+  /// The backfill's selector: PENDING_ICHANCY rows whose next attempt is due.
+  @@index([status, ichancyLinkNextAttemptAt])
   @@map("players")
 }
 

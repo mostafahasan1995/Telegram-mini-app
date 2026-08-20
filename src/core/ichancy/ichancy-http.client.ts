@@ -23,6 +23,7 @@ import {
   type IchancyCallLogPort,
   type IchancyCallRecord,
 } from './ichancy-call-log.service';
+import { IchancyHealthService } from './ichancy-health.service';
 import { type IchancyCallContext } from './ichancy.port';
 import {
   ichancyAmbiguous,
@@ -95,6 +96,10 @@ export class IchancyHttpClient implements IchancyAuthClient {
     // HOW the bytes leave this process — Node's fetch, or a real Chromium when Cloudflare is in the
     // way. Everything in this class is identical either way; see transport/ichancy-transport.ts.
     @Inject(ICHANCY_TRANSPORT) private readonly transport: IchancyTransport,
+    // The one choke point every agent-API call passes through, in both roles — which is exactly why
+    // the outage breaker is fed from here and not from a cron that would only ever see its own
+    // endpoint failing.
+    private readonly health: IchancyHealthService,
   ) {}
 
   /**
@@ -143,6 +148,10 @@ export class IchancyHttpClient implements IchancyAuthClient {
         timeout: isTimeoutError(error),
       };
     }
+
+    // Fed before the call-log INSERT so the cluster-wide verdict is current even when the log
+    // write is slow. `record` swallows its own failures: instrumentation may never break a call.
+    await this.health.record(params.endpoint, classification);
 
     const durationMs = Date.now() - startedAt;
     await this.persist({

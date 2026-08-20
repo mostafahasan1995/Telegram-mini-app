@@ -96,7 +96,7 @@ const nonEmpty = (label: string) => z.string().trim().min(1, `${label} is requir
  */
 const DEFAULT_ICHANCY_PLAYER_EMAIL_DOMAIN = 'players.example.com';
 
-const DEFAULT_ICHANCY_USER_AGENT =
+export const DEFAULT_ICHANCY_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
   'Chrome/150.0.0.0 Safari/537.36';
 
@@ -255,26 +255,34 @@ export const envSchema = z
         'ICHANCY_PLAYER_EMAIL_DOMAIN must look like a domain, e.g. players.example.com',
       ),
     /**
-     * HOW agent-API requests physically leave this process.
-     *
-     *   fetch    (default) Node's fetch plus a cookie jar. Correct for a host with no bot
-     *            protection, and the right answer once Ichancy allowlists a server IP.
-     *   browser  a real Chromium that performs the POST from inside the page. Needed because
-     *            agents.ichancy.com serves a Cloudflare Managed Challenge to server-side clients:
-     *            a browser-copied cf_clearance was measured surviving ~17 minutes, then a single
-     *            request, as the IP's trust score fell. A browser solves and refreshes the challenge
-     *            by itself, so nothing has to be pasted.
-     *
-     * `browser` requires the OPTIONAL playwright dependency:
-     *   npm install playwright && npx playwright install chromium
-     */
-    /**
      * The PLAYER-facing site, where a player signs in with the credentials we registered for them.
      * Not the agent panel (ICHANCY_BASE_URL) — that is staff-only and a player must never be sent
      * there. Printed in the bot's account message, so it has to be the address that actually works.
      */
     ICHANCY_PLAYER_SITE_URL: httpUrl('ICHANCY_PLAYER_SITE_URL').default('https://ichancy.com'),
-    ICHANCY_TRANSPORT: z.enum(['fetch', 'browser']).default('fetch'),
+    /**
+     * HOW agent-API requests physically leave this process.
+     *
+     *   browser  (DEFAULT, and the correct answer) a real Chromium that performs the POST from
+     *            inside the page, so the call carries Chrome's TLS/JA3 and HTTP/2 fingerprints and
+     *            the browser solves — and then REFRESHES — the Cloudflare Managed Challenge by
+     *            itself. Nothing has to be pasted, and nothing expires.
+     *   fetch    FALLBACK. Node's fetch plus a cookie jar from ICHANCY_COOKIE. Correct only for a
+     *            host Ichancy has IP-allowlisted, or with ICHANCY_FAKE=true.
+     *
+     * WHY THE DEFAULT MOVED (2026-08-19/20, measured, not assumed): a cf_clearance pasted out of a
+     * browser worked for ~17 minutes, then hours later for exactly ONE request, because Cloudflare's
+     * trust score for an IP decays with every challenge that IP fails. The owner saw the same curve
+     * on 2026-08-20 — roughly twenty minutes of success followed by `AMBIGUOUS / 403 /
+     * CLOUDFLARE_CHALLENGE` on every call for hours, which stranded a player at PENDING_ICHANCY.
+     * Pasting cookies is not an integration, it is a countdown, so it is no longer the default.
+     *
+     * `browser` requires the OPTIONAL playwright dependency AND its browser binary:
+     *   npm install playwright && npm run playwright:install
+     * IchancyTransportPreflightService refuses to boot when either is missing, rather than letting
+     * the gap surface at the first player as an unexplained TRANSPORT_ERROR.
+     */
+    ICHANCY_TRANSPORT: z.enum(['fetch', 'browser']).default('browser'),
     /**
      * Run the transport's Chromium headless. Default true.
      *
@@ -282,15 +290,43 @@ export const envSchema = z
      * differently, and on a desktop it costs nothing to find out. On a server it needs a display
      * (xvfb), so headless stays the default.
      */
+    /**
+     * Refresh the Cloudflare clearance every ~25 minutes in a real Chrome, and let the fetch
+     * transport use it. See transport/cookie-harvester.service.ts for the recipe and why each part
+     * of it matters.
+     *
+     * OFF by default: it is a workaround for bot protection sitting in front of an API meant for
+     * server-to-server use. Turn it off again the day Ichancy allowlists the server's IP.
+     *
+     * Requires the OPTIONAL patchright dependency and a real Chrome; on Linux it also needs a
+     * display (xvfb-run), because the challenge does not release headless.
+     */
+    ICHANCY_COOKIE_HARVEST: optionalFlag(),
+    /**
+     * Where the harvester's Chrome profile lives. A PERSISTENT directory on purpose — a blank
+     * profile scores badly with bot protection and never accumulates any trust. Defaults to a
+     * directory under the OS temp path, which is fine for a dev box; on a server point it at
+     * something that survives restarts.
+     */
+    ICHANCY_COOKIE_PROFILE_DIR: z.string().optional(),
     ICHANCY_BROWSER_HEADLESS: z
       .enum(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off'])
       .optional()
       .transform((v) => (v === undefined ? true : ['true', '1', 'yes', 'on'].includes(v))),
     ICHANCY_COOKIE: z.string().optional(),
     /**
-     * Sent as `User-Agent`. MUST match the browser that produced ICHANCY_COOKIE, or Cloudflare
-     * invalidates the clearance. The default is a current desktop Chrome string — the common case —
-     * and is deliberately not `node`/`undici`, which bot protection scores badly on its own.
+     * Sent as `User-Agent` BY THE FETCH TRANSPORT ONLY. Ignored in browser mode, where Chromium
+     * supplies its own and overriding it would make the header, the TLS fingerprint and the JS
+     * environment disagree — which is precisely what Cloudflare fingerprints for.
+     *
+     * When it does apply it MUST match the browser that produced ICHANCY_COOKIE, or Cloudflare
+     * invalidates the clearance exactly as if no cookie had been sent, with nothing anywhere saying
+     * the two disagree. That mismatch caused half of the 2026-08-20 outage: the pasted clearance was
+     * earned in Chrome 150 (sec-ch-ua `"Google Chrome";v="150"`) while this variable claimed
+     * Firefox 153, so the clearance was dead on arrival.
+     *
+     * The default is a current desktop Chrome string — deliberately not `node`/`undici`, which bot
+     * protection scores badly on its own.
      */
     ICHANCY_USER_AGENT: z
       .string()

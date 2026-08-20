@@ -214,7 +214,28 @@ You need: **Node 22**, **Docker**, and **npm**.
 
 ```bash
 npm install
+npm run playwright:install
 ```
+
+The second line is **not optional**. `ICHANCY_TRANSPORT` defaults to `browser`, which runs the
+agent-API calls inside a real Chromium so Cloudflare's Managed Challenge is solved — and kept
+solved — by the browser itself. `npm install` brings the Playwright JS but Playwright has no
+postinstall hook, so the browser binary is a separate step, and the app now **refuses to boot**
+without it rather than failing at the first player.
+
+Why the default is `browser`: a `cf_clearance` cookie pasted out of a browser was measured
+surviving ~17 minutes on 2026-08-19 and, hours later, exactly one request — Cloudflare's trust
+score for an IP decays with every challenge that IP fails. On 2026-08-20 that curve blocked the
+integration for hours and left a player with no casino account. Pasting cookies is a countdown,
+not an integration.
+
+If this host is IP-allowlisted by Ichancy (or you are running `ICHANCY_FAKE=true`), set
+`ICHANCY_TRANSPORT=fetch` and no browser is needed.
+
+**Memory:** budget ~400 MB resident per launched Chromium. Steady state is ONE, in the **worker** —
+Telegram updates are dispatched there, so `/start` → registration runs there. The api launches one
+only when an admin opens a player's Ichancy account by hand. A 1 GB VPS needs swap, or
+`ICHANCY_TRANSPORT=fetch` on the api role.
 
 ### Step 2 — start the databases
 
@@ -375,6 +396,10 @@ That is on purpose. A cashier that starts half-configured takes money it cannot 
 | `ICHANCY_BASE_URL`                      | The agent API.                                                                       |
 | `ICHANCY_USERNAME` / `ICHANCY_PASSWORD` | Agent login. **Only the worker uses these.**                                         |
 | `ICHANCY_AGENT_ID`                      | Our `affiliateId`. Used as `parentId` when we register a player.                     |
+| `ICHANCY_TRANSPORT`                     | `browser` (default) or `fetch`. See Step 1. `browser` needs Chromium or boot fails.  |
+| `ICHANCY_BROWSER_HEADLESS`              | Default `true`. `false` on a desktop when a challenge refuses to clear headless.      |
+| `ICHANCY_COOKIE`                        | Fetch mode: the full cookie jar. Browser mode: only the panel half is seeded.         |
+| `ICHANCY_USER_AGENT`                    | **Fetch mode only.** Ignored in browser mode; leave blank there.                      |
 | `S3_*`                                  | Where the receipt photos go.                                                         |
 | `DUAL_APPROVAL_THRESHOLD_MINOR`         | At or above this, a second admin must approve. In minor units.                       |
 | `DEPOSIT_EXPIRY_MINUTES`                | Unpaid deposits are cancelled after this.                                            |
@@ -524,6 +549,50 @@ every replica at the same time, and the restarts would make the database worse.
 
 The worker has no HTTP server, so it has no health endpoint. Watch the queue depth and
 `outbox_messages.status` instead.
+
+### Is Ichancy up?
+
+There is a breaker in Redis (`ichancy:health`), fed from the one place every agent-API call passes
+through. It asks one question: **did their application answer?** A business rejection
+("Duplicate login") counts as healthy — something on the far side read the request and formed an
+opinion. Only `ambiguous` means we never got an answer, and three of those in a row flips the state
+to `DOWN`.
+
+Two things happen then, and both are automatic:
+
+- **The admin group is told, once.** `IchancyHealthAlertCron` posts one message per *state change* —
+  never one per failure — naming the kind (`CLOUDFLARE_CHALLENGE`, `TIMEOUT`, `TRANSPORT_ERROR`),
+  the endpoint, and what to check. It posts one more when the integration comes back, with the
+  outage duration and how many players are still waiting.
+- **New registrations pause.** `PlayerLinkBackfillService` issues zero requests while the state is
+  `DOWN`. That is deliberate: every failed challenge lowers the IP's Cloudflare trust score, which
+  is the mechanism that turns twenty minutes of failure into hours.
+
+Detection latency is roughly 15 minutes when nothing else is happening, because the only ambient
+traffic is the 5-minute agent float sync. It is faster under player traffic. If you want it faster
+still, raise the float-sync cadence rather than lowering the threshold — a threshold of 1 flaps.
+
+### Players who never got a casino account
+
+If a registration fails (Cloudflare, a dead session, a timeout) the player row is left at
+`PENDING_ICHANCY` with a NULL `ichancy_player_id` and **nothing is persisted** — which is correct,
+but until 2026-08-20 also meant nothing ever retried it.
+
+A worker-only cron now sweeps those rows every five minutes. It calls exactly one thing,
+`PlayerLinkService.ensureLinked`, so it inherits the per-player lock, the re-read inside that lock
+and the compare-and-set persist rather than re-implementing any of them — `registerPlayer` is not
+idempotent and the agent API has no `deletePlayer`, so a second account can never be removed.
+
+Per-player state lives on the row (`ichancy_link_attempts`, `ichancy_link_next_attempt_at`,
+`ichancy_link_last_error`), so backoff survives a restart and you can read "attempt 7,
+CLOUDFLARE_CHALLENGE" straight out of the database. Backoff doubles from 5 minutes to a 12-hour cap,
+and after 12 attempts the player is **parked** and needs a human:
+
+```bash
+npm run player:register -- --player-id <uuid>
+```
+
+The recovery message counts parked players so you know to look.
 
 ---
 
