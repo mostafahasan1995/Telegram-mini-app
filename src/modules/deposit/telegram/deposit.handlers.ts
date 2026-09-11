@@ -36,6 +36,8 @@ import { PrismaService } from '@core/prisma/prisma.service';
 import { OnCallback, OnMessage } from '@core/telegram/decorators/handlers.decorator';
 import { BotService } from '@core/telegram/services/bot.service';
 import { decodeCallbackData } from '@core/telegram/utils/callback-data.util';
+// Imported from the source file rather than the '@core/tenant' barrel, which does not re-export it.
+import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
 
 import { DEPOSIT_CALLBACK_NS } from '../deposit.constants';
 import { DepositService } from '../services/deposit.service';
@@ -79,8 +81,13 @@ export class DepositTelegramHandlers {
     // a payment proof, and attaching it to somebody's deposit would be worse than ignoring it.
     if (ctx.chat?.type !== 'private') return;
 
+    // TEMPORARY: there is one bot, and an inbound update carries nothing that identifies an
+    // operator, so every player the bot sees belongs to the bootstrap tenant. Phase 6 resolves the
+    // tenant from the webhook path token and this constant goes away.
     const player = await this.prisma.player.findUnique({
-      where: { telegramUserId: BigInt(from.id) },
+      where: {
+        tenantId_telegramUserId: { tenantId: TENANT_BOOTSTRAP_ID, telegramUserId: BigInt(from.id) },
+      },
       select: { id: true },
     });
     if (player === null) {
@@ -89,7 +96,9 @@ export class DepositTelegramHandlers {
     }
 
     const open = await this.prisma.depositRequest.findMany({
-      where: { playerId: player.id, status: { in: [...PROOFABLE] } },
+      // Spelled out rather than left to the tenant-scope extension: a bot update runs outside any
+      // request, so there is no ambient tenant for the extension to inject. Same phase-6 caveat.
+      where: { tenantId: TENANT_BOOTSTRAP_ID, playerId: player.id, status: { in: [...PROOFABLE] } },
       orderBy: { createdAt: 'desc' },
       take: 5,
       select: { id: true, shortId: true, status: true },
@@ -189,8 +198,10 @@ export class DepositTelegramHandlers {
       return;
     }
 
-    // THE authority check. Never the chat, always the tapper — see the header.
-    const admin = await this.admins.resolve(BigInt(from.id));
+    // THE authority check. Never the chat, always the tapper — see the header. The tenant is the
+    // admin's HOME, which for the single bootstrap bot is the bootstrap operator; phase 6 derives
+    // it from the webhook path token instead.
+    const admin = await this.admins.resolve(TENANT_BOOTSTRAP_ID, BigInt(from.id));
     if (admin === null) {
       await this.bot.answerCallback(query.id, 'You are not authorised to act on deposits.', true);
       this.logger.warn(

@@ -25,6 +25,7 @@ import { ADMIN_IDENTITY_TTL_SECONDS, adminIdentityKey } from '../auth.constants'
 interface CachedAdmin {
   adminUserId: string;
   telegramUserId: string;
+  tenantId: string;
   role: AdminRole;
   displayName: string;
 }
@@ -37,18 +38,30 @@ export class AdminIdentityService {
   ) {}
 
   /**
-   * Returns the active admin behind a Telegram id, or null.
+   * Returns the active admin behind a Telegram id IN A GIVEN TENANT, or null.
+   *
    * An INACTIVE admin resolves to null on purpose: `isActive: false` is how staff are offboarded,
    * and it must read exactly like "not an admin" everywhere, with no second check to forget.
+   *
+   * `tenantId` is the caller's HOME tenant and comes from the signed `tid` claim — never from a
+   * header. Resolving identity in a tenant the client chose would let anyone claim authority in
+   * any operator by sending one.
    */
-  async resolve(telegramUserId: bigint): Promise<AuthenticatedAdmin | null> {
+  async resolve(tenantId: string, telegramUserId: bigint): Promise<AuthenticatedAdmin | null> {
     const cached = await this.cache.getOrSet<CachedAdmin | null>(
-      adminIdentityKey(telegramUserId),
+      adminIdentityKey(tenantId, telegramUserId),
       ADMIN_IDENTITY_TTL_SECONDS,
       async () => {
         const admin = await this.prisma.adminUser.findUnique({
-          where: { telegramUserId },
-          select: { id: true, telegramUserId: true, role: true, displayName: true, isActive: true },
+          where: { tenantId_telegramUserId: { tenantId, telegramUserId } },
+          select: {
+            id: true,
+            telegramUserId: true,
+            tenantId: true,
+            role: true,
+            displayName: true,
+            isActive: true,
+          },
         });
 
         if (!admin || !admin.isActive) return null;
@@ -56,6 +69,7 @@ export class AdminIdentityService {
         return {
           adminUserId: admin.id,
           telegramUserId: admin.telegramUserId.toString(),
+          tenantId: admin.tenantId,
           role: admin.role,
           displayName: admin.displayName,
         };
@@ -68,14 +82,15 @@ export class AdminIdentityService {
     return {
       adminUserId: cached.adminUserId,
       telegramUserId: BigInt(cached.telegramUserId),
+      tenantId: cached.tenantId,
       role: cached.role,
       displayName: cached.displayName,
     };
   }
 
   /** Same, but raises the 403 the guards and bot handlers would otherwise all have to write. */
-  async resolveOrThrow(telegramUserId: bigint): Promise<AuthenticatedAdmin> {
-    const admin = await this.resolve(telegramUserId);
+  async resolveOrThrow(tenantId: string, telegramUserId: bigint): Promise<AuthenticatedAdmin> {
+    const admin = await this.resolve(tenantId, telegramUserId);
     if (!admin) {
       throw new ForbiddenError(
         CommonErrorCodes.ADMIN_INACTIVE,
@@ -85,15 +100,15 @@ export class AdminIdentityService {
     return admin;
   }
 
-  async isAdmin(telegramUserId: bigint): Promise<boolean> {
-    return (await this.resolve(telegramUserId)) !== null;
+  async isAdmin(tenantId: string, telegramUserId: bigint): Promise<boolean> {
+    return (await this.resolve(tenantId, telegramUserId)) !== null;
   }
 
   /**
    * Drop the cached entry. MUST be called by whatever changes an AdminUser's role or isActive flag,
    * otherwise a revoked admin keeps their powers for up to a minute.
    */
-  async invalidate(telegramUserId: bigint): Promise<void> {
-    await this.cache.del(adminIdentityKey(telegramUserId));
+  async invalidate(tenantId: string, telegramUserId: bigint): Promise<void> {
+    await this.cache.del(adminIdentityKey(tenantId, telegramUserId));
   }
 }

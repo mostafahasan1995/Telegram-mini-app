@@ -42,8 +42,18 @@ export class AdminUserRepository extends BaseRepository<
     return this._findUnique({ id }, tx);
   }
 
-  findByTelegramUserId(telegramUserId: bigint, tx?: Tx): Promise<AdminUser | null> {
-    return this._findUnique({ telegramUserId }, tx);
+  /**
+   * WHY THE TENANT IS A PARAMETER and not a read of the ambient context: this lookup is reached
+   * from an HTTP request AND from the bot, and the bot has no request context to read. A Telegram
+   * id is only unique within an operator now — `@@unique([tenantId, telegramUserId])` — so the
+   * caller has to say which one it means, and the compiler makes sure it does.
+   */
+  findByTelegramUserId(
+    tenantId: string,
+    telegramUserId: bigint,
+    tx?: Tx,
+  ): Promise<AdminUser | null> {
+    return this._findUnique({ tenantId_telegramUserId: { tenantId, telegramUserId } }, tx);
   }
 
   create(data: Prisma.AdminUserCreateInput, tx?: Tx): Promise<AdminUser> {

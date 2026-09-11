@@ -15,6 +15,7 @@ import { Injectable } from '@nestjs/common';
 import { DepositStatus, Prisma, type DepositProof, type DepositRequest } from '@prisma/client';
 
 import type { Tx } from '@core/prisma/tx.type';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 import { OPEN_STATUSES } from '../deposit-state.machine';
 import {
@@ -73,8 +74,16 @@ export class DepositRepository {
     return tx.depositRequest.findUnique({ where: { id }, include: REVIEW_INCLUDE });
   }
 
+  /**
+   * A shortId is only unique WITHIN an operator, so the lookup carries the effective tenant. This is
+   * also the whole safety property: two operators may legitimately mint the same Crockford string,
+   * and a tenant-less lookup would hand one of them the other's deposit.
+   */
   findByShortId(tx: Tx, shortId: string): Promise<DepositWithReviewContext | null> {
-    return tx.depositRequest.findUnique({ where: { shortId }, include: REVIEW_INCLUDE });
+    return tx.depositRequest.findUnique({
+      where: { tenantId_shortId: { tenantId: requireEffectiveTenantId(), shortId } },
+      include: REVIEW_INCLUDE,
+    });
   }
 
   /**
@@ -90,8 +99,17 @@ export class DepositRepository {
     return tx.depositRequest.findFirst({ where: { shortId, playerId }, include: REVIEW_INCLUDE });
   }
 
+  /**
+   * Idempotency keys are client-chosen, so they are only unique per operator — two operators' apps
+   * can and will pick the same uuid. Scoping the replay lookup to the effective tenant is what stops
+   * one operator's retry from being answered with another operator's deposit.
+   */
   findByIdempotencyKey(tx: Tx, key: string): Promise<DepositRequest | null> {
-    return tx.depositRequest.findUnique({ where: { idempotencyKey: key } });
+    return tx.depositRequest.findUnique({
+      where: {
+        tenantId_idempotencyKey: { tenantId: requireEffectiveTenantId(), idempotencyKey: key },
+      },
+    });
   }
 
   create(tx: Tx, data: Prisma.DepositRequestUncheckedCreateInput): Promise<DepositRequest> {

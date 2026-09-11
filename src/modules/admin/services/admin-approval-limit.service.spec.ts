@@ -8,6 +8,12 @@ import type { AdminUserRepository } from '../repositories/admin-user.repository'
 /** 1000.00 NSP in minor units. */
 const GLOBAL_THRESHOLD = 100_000n;
 
+/**
+ * These tests never cross a tenant boundary — `evaluate` is handed its rows directly — so the id
+ * only has to be a well-formed uuid that every fixture agrees on.
+ */
+const FIXTURE_TENANT_ID = '11111111-1111-1111-1111-111111111111';
+
 const FINANCE: ApprovingAdmin = { adminUserId: 'admin-1', role: 'FINANCE_ADMIN' };
 const SUPPORT: ApprovingAdmin = { adminUserId: 'admin-2', role: 'SUPPORT' };
 const VIEWER: ApprovingAdmin = { adminUserId: 'admin-3', role: 'VIEWER' };
@@ -16,6 +22,7 @@ const SUPER: ApprovingAdmin = { adminUserId: 'admin-4', role: 'SUPER_ADMIN' };
 function limitRow(overrides: Partial<AdminApprovalLimit> = {}): AdminApprovalLimit {
   return {
     id: 'limit-1',
+    tenantId: FIXTURE_TENANT_ID,
     adminUserId: 'admin-1',
     currencyCode: 'NSP',
     maxSingleApprovalMinor: 500_000n,

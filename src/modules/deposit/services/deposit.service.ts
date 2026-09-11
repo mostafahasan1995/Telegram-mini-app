@@ -55,6 +55,7 @@ import { OutboxService } from '@core/outbox/outbox.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { isUniqueConstraintError, mapPrismaError } from '@core/prisma/prisma-errors';
 import type { Tx } from '@core/prisma/tx.type';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 import { DEPOSIT_AGGREGATE, DEPOSIT_TOPICS, MAX_PROOFS_PER_DEPOSIT } from '../deposit.constants';
 import {
@@ -186,7 +187,10 @@ function blankToUndefined(value: string | null | undefined): string | undefined 
  * PROOF_REQUIRED, REFERENCE_MALFORMED, SENDER_ACCOUNT_MALFORMED and DESTINATION_MISSING all still
  * throw at SUBMIT, exactly as before.
  */
-const CONFIG_DRIFT_CODES: ReadonlySet<string> = new Set(['AMOUNT_BELOW_MINIMUM', 'AMOUNT_ABOVE_MAXIMUM']);
+const CONFIG_DRIFT_CODES: ReadonlySet<string> = new Set([
+  'AMOUNT_BELOW_MINIMUM',
+  'AMOUNT_ABOVE_MAXIMUM',
+]);
 
 @Injectable()
 export class DepositService {
@@ -413,6 +417,7 @@ export class DepositService {
 
       const proof = await this.insertProof(tx, {
         depositRequestId: deposit.id,
+        tenantId: deposit.tenantId,
         bucket: stored.bucket,
         storageKey: stored.key,
         mimeType: normalized.mimeType,
@@ -512,6 +517,7 @@ export class DepositService {
     return this.prisma.runInTransaction(async (tx) => {
       const proof = await this.insertProof(tx, {
         depositRequestId: deposit.id,
+        tenantId: deposit.tenantId,
         bucket: input.bucket,
         storageKey: input.storageKey,
         mimeType: input.mimeType,
@@ -670,6 +676,11 @@ export class DepositService {
     },
   ): Promise<{ deposit: DepositRequest; replayed: boolean }> {
     const data: Prisma.DepositRequestUncheckedCreateInput = {
+      // EFFECTIVE, not home: when platform staff open a deposit while looking at operator X, the
+      // money is X's and so is the row. Nothing earlier in this path holds a tenant of its own —
+      // the payment method and destination arrive through PAYMENT_METHOD_PORT as plain values — so
+      // the request context is the authority here.
+      tenantId: requireEffectiveTenantId(),
       shortId: generateShortId(),
       playerId: args.input.playerId,
       paymentMethodId: args.method.id,
@@ -729,6 +740,12 @@ export class DepositService {
     tx: Tx,
     args: {
       depositRequestId: string;
+      /**
+       * Taken off the deposit this proof is being attached to, never off the ambient context: the
+       * evidence for a payment has to live in the same operator as the payment, or a reviewer of
+       * that operator opens a card with no receipt on it.
+       */
+      tenantId: string;
       bucket: string;
       storageKey: string;
       mimeType: string;
@@ -743,6 +760,7 @@ export class DepositService {
   ) {
     try {
       return await this.deposits.createProof(tx, {
+        tenantId: args.tenantId,
         depositRequestId: args.depositRequestId,
         source: args.source,
         bucket: args.bucket,

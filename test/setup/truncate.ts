@@ -21,8 +21,22 @@ import { Client } from 'pg';
 /** Tables whose append-only triggers must be lifted for the duration of the TRUNCATE. */
 const APPEND_ONLY_TABLES = ['ledger_entries', 'ledger_transactions', 'audit_logs'] as const;
 
-/** Never truncated: Prisma's own bookkeeping and the frozen currency definition. */
-const DEFAULT_PRESERVED = ['_prisma_migrations', 'currencies'] as const;
+/**
+ * Never truncated: Prisma's own bookkeeping, the frozen currency definition, and the tenancy
+ * baseline.
+ *
+ * `tenants` and `platform_defaults` are here because the multi-tenant migration INSERTS their rows
+ * — tenant zero, the bootstrap operator and the settings singleton are schema, not fixtures.
+ * Truncating them would leave every tenant-scoped insert in the suite failing a foreign key on the
+ * first reset, with an error that points at the row being inserted rather than at the reset that
+ * removed its parent.
+ */
+const DEFAULT_PRESERVED = [
+  '_prisma_migrations',
+  'currencies',
+  'tenants',
+  'platform_defaults',
+] as const;
 
 export interface TruncateOptions {
   /** Extra tables to leave alone, e.g. ['payment_methods'] to keep a seeded rail between tests. */

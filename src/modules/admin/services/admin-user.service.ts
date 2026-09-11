@@ -23,6 +23,7 @@ import { AuditService } from '@core/audit/audit.service';
 import { AdminIdentityService } from '@core/auth/services/admin-identity.service';
 import { isUniqueConstraintError } from '@core/prisma/prisma-errors';
 import type { Tx } from '@core/prisma/tx.type';
+import { requireEffectiveTenantId } from '@core/tenant';
 import { adminActor } from '@common/types/actor.type';
 import { BusinessRuleError, ConflictError, NotFoundError } from '@common/exceptions/app.exception';
 import { paginate, type PaginatedResult } from '@common/dtos/paginated.dto';
@@ -79,10 +80,16 @@ export class AdminUserService {
   async create(actorAdminId: string, dto: CreateAdminUserDto): Promise<AdminUserView> {
     const telegramUserId = BigInt(dto.telegramUserId);
 
+    // EFFECTIVE, not home: a PLATFORM_ADMIN adding staff while working inside operator X is adding
+    // X's staff, not another platform login. Getting this backwards would quietly mint tenant-zero
+    // logins — accounts with platform reach — from an ordinary operator screen.
+    const tenantId = requireEffectiveTenantId();
+
     const created = await this.prisma
       .runInTransaction(async (tx) => {
         const admin = await this.admins.create(
           {
+            tenant: { connect: { id: tenantId } },
             telegramUserId,
             displayName: dto.displayName,
             role: dto.role,
@@ -107,8 +114,9 @@ export class AdminUserService {
         return admin;
       })
       .catch((error: unknown) => {
-        // The unique columns are telegram_user_id and username. Either way the operator's mistake
-        // is the same shape: "this person is already in the directory".
+        // The unique keys are (tenant_id, telegram_user_id) and (tenant_id, username) — both are
+        // per-operator now. Either way the operator's mistake is the same shape: "this person is
+        // already in the directory".
         if (isUniqueConstraintError(error)) {
           throw new ConflictError(
             AdminErrorCodes.ADMIN_ALREADY_EXISTS,
@@ -118,8 +126,10 @@ export class AdminUserService {
         throw error;
       });
 
-    // A newly created admin may have been cached as a NEGATIVE lookup moments ago.
-    await this.identities.invalidate(telegramUserId);
+    // A newly created admin may have been cached as a NEGATIVE lookup moments ago. The cache key is
+    // (tenant, telegram id), so the tenant comes off the row that was just written — the same one
+    // AdminIdentityService will resolve them in.
+    await this.identities.invalidate(created.tenantId, telegramUserId);
     return toAdminUserView(created);
   }
 
@@ -197,7 +207,10 @@ export class AdminUserService {
         throw error;
       });
 
-    await this.identities.invalidate(updated.telegramUserId);
+    // The row's own tenant, not the ambient one: a platform admin editing operator X's staff must
+    // evict X's cache entry, otherwise the demotion they just made stays invisible for 60 seconds
+    // in the only tenant where it matters.
+    await this.identities.invalidate(updated.tenantId, updated.telegramUserId);
     return toAdminUserView(updated);
   }
 

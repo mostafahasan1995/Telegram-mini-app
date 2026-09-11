@@ -154,8 +154,14 @@ export class ReferralService {
    *   3. lock, then RE-CHECK inside it. The re-check is the whole point: without it two concurrent
    *      /start updates both pass step 2 and both write a binding. With a UNIQUE column this would
    *      be the database's job; until those columns exist, it is this lock's.
+   *
+   * `tenantId` is the REFERRED PLAYER'S tenant, and it is what the referrer is looked up in. A
+   * deep link is a Telegram id typed into a URL by anyone, so without it `ref_<id>` would resolve
+   * against every operator's players at once and attribute one operator's sign-up to another
+   * operator's player — a referrer only exists inside the operator the player themselves is in.
    */
   async bindFromStartPayload(
+    tenantId: string,
     playerId: string,
     playerTelegramUserId: bigint,
     rawPayload: string | null | undefined,
@@ -171,7 +177,9 @@ export class ReferralService {
     if (existing !== null) return { outcome: 'ALREADY_BOUND', binding: existing };
 
     const referrer = await this.prisma.player.findUnique({
-      where: { telegramUserId: referrerTelegramUserId },
+      where: {
+        tenantId_telegramUserId: { tenantId, telegramUserId: referrerTelegramUserId },
+      },
       select: { id: true },
     });
     if (referrer === null) return { outcome: 'IGNORED_UNKNOWN_REFERRER' };

@@ -36,8 +36,16 @@ export const initDataNonceKey = (hash: string): string => `auth:initdata:${hash}
  */
 export const sessionRevocationKey = (sessionId: string): string => `auth:revoked:${sessionId}`;
 
-/** Cached AdminUser lookup by Telegram id (positive AND negative). */
-export const adminIdentityKey = (telegramUserId: bigint): string => `admin:tg:${telegramUserId}`;
+/**
+ * Cached AdminUser lookup (positive AND negative).
+ *
+ * KEYED ON THE TENANT AS WELL AS THE TELEGRAM ID, and it must stay that way: an agent principal
+ * uses the reserved telegram id 0, so every operator has one. A key of `admin:tg:0` would make the
+ * first operator's agent principal answer for all of them — one cached row silently granting
+ * another operator's authority.
+ */
+export const adminIdentityKey = (tenantId: string, telegramUserId: bigint): string =>
+  `admin:tg:${tenantId}:${telegramUserId}`;
 
 export const ADMIN_IDENTITY_TTL_SECONDS = 60;
 

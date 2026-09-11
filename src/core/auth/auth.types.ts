@@ -23,6 +23,16 @@ export interface AccessTokenClaims {
   role: TokenRole;
   /** PlayerSession.id for players; a random per-token id for admins (they have no session table). */
   sid: string;
+  /**
+   * The caller's HOME tenant — the operator whose `admin_users` (or `players`) row this principal
+   * is. It is AUTHORITY, which is why it is signed here rather than sent by the client: identity is
+   * resolved in this tenant, and no header can move it. TenantContextMiddleware reads it off the
+   * verified token and runs the whole request inside `runWithTenant(tid)`, before any guard.
+   *
+   * Whose data a request READS is a separate question — see X-Tenant-Id and
+   * TenantOverrideInterceptor. Home and effective are never the same field.
+   */
+  tid: string;
   iat: number;
   exp: number;
 }

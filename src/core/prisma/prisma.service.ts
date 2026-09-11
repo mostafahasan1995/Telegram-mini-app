@@ -25,6 +25,7 @@ import { AppConfigService } from '@core/config/config.service';
 
 import { actorStampExtension } from './actor-stamp.extension';
 import { buildPoolConfig } from './pool-config.util';
+import { tenantScopeExtension } from './tenant-scope.extension';
 import { withSerializationRetry, type SerializationRetryOptions } from './retry.util';
 import type { Tx } from './tx.type';
 
@@ -89,7 +90,14 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
     this.poolMax = parsed.pool.max ?? config.db.poolMax;
 
     // See the header: this is what makes actor stamping unavoidable rather than optional.
-    return this.$extends(actorStampExtension) as unknown as PrismaService;
+    //
+    // tenantScopeExtension is applied AFTER the stamp so that the tenant filter it injects is
+    // present on the args the stamp extension has already seen — the two are independent, but the
+    // order is fixed so a future reader does not have to wonder. It only touches list/aggregate
+    // operations; single-row access is already tenant-safe through the composite unique keys.
+    return this.$extends(actorStampExtension).$extends(
+      tenantScopeExtension,
+    ) as unknown as PrismaService;
   }
 
   async onModuleInit(): Promise<void> {

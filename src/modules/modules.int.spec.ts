@@ -50,6 +50,8 @@ import { CacheModule } from '@core/cache/cache.module';
 import { RedisService } from '@core/cache/redis.service';
 import { AuditModule } from '@core/audit/audit.module';
 import { FakeIchancyAdapter } from '@core/ichancy/fake-ichancy.adapter';
+import { runWithTenant } from '@core/tenant';
+import { TENANT_BOOTSTRAP_ID } from '@core/tenant';
 import { GlobalExceptionFilter } from '@common/filters/global-exception.filter';
 import { TransformInterceptor } from '@common/interceptors/transform.interceptor';
 
@@ -83,6 +85,31 @@ const TG_BASE = 900_000_000_000n + BigInt(Date.now() % 1_000_000);
  * rows a PREVIOUS run left behind.
  */
 const RESERVED_TG_FLOOR = 900_000_000_000n;
+
+/**
+ * Opens a tenant context around a test body.
+ *
+ * WHY anything that touches a service needs one: these services are request-path code and read
+ * their operator from TenantContextStorage, which TenantContextMiddleware opens on a real request.
+ * A test that reaches into the graph with `moduleRef.get(...)` has no middleware in front of it, so
+ * the first `requireEffectiveTenantId()` would throw. This is the harness doing what the middleware
+ * does, and it is the same move a worker makes with `runWithTenant()`.
+ *
+ * The bootstrap operator specifically: every row this suite writes and every seeded row it reads
+ * belongs to it, and until phase 6 gives each operator its own bot it is the only one taking
+ * deposits. `purgeLeftovers` deliberately runs OUTSIDE any context — it sweeps a SHARED database
+ * for rows an interrupted run abandoned, whatever operator they landed in, and a tenant filter
+ * there would leave them behind.
+ *
+ * The HTTP block is not wrapped: those requests go through the real pipeline and every one of them
+ * is rejected by a guard or the validation pipe before a tenant-scoped service is reached.
+ */
+const inTenant = (body: () => Promise<void>) => (): Promise<void> =>
+  runWithTenant(TENANT_BOOTSTRAP_ID, body);
+
+const itInTenant = (name: string, body: () => Promise<void>): void => {
+  it(name, inTenant(body));
+};
 
 /**
  * WHY a suite that cleans up in `afterAll` still has to clean up in `beforeAll`: this runs against a
@@ -253,7 +280,7 @@ describe('feature modules (integration)', () => {
   describe('payment methods against a real database', () => {
     const ADMIN_ID = '00000000-0000-4000-8000-0000000000aa';
 
-    it('creates a method and rejects an incoherent one', async () => {
+    itInTenant('creates a method and rejects an incoherent one', async () => {
       const methods = moduleRef.get(PaymentMethodService);
 
       const created = await methods.create(ADMIN_ID, {
@@ -288,7 +315,7 @@ describe('feature modules (integration)', () => {
       ).rejects.toThrow(/maxAmount/i);
     });
 
-    it('refuses a duplicate code with a conflict, not a raw Prisma error', async () => {
+    itInTenant('refuses a duplicate code with a conflict, not a raw Prisma error', async () => {
       const methods = moduleRef.get(PaymentMethodService);
       await expect(
         methods.create(ADMIN_ID, {
@@ -303,7 +330,7 @@ describe('feature modules (integration)', () => {
       ).rejects.toMatchObject({ httpStatus: 409 });
     });
 
-    it('rotates destinations proportionally and stays sticky per player', async () => {
+    itInTenant('rotates destinations proportionally and stays sticky per player', async () => {
       const destinations = moduleRef.get(PaymentDestinationService);
       const picker = moduleRef.get(DestinationPickerService);
       expect(methodId).not.toBeNull();
@@ -337,7 +364,7 @@ describe('feature modules (integration)', () => {
       expect(await picker.peekSticky(methodId as string, stickyPlayer)).toBeNull();
     });
 
-    it('renders rail instructions through the port', async () => {
+    itInTenant('renders rail instructions through the port', async () => {
       const payments = moduleRef.get<PaymentMethodPort>(PAYMENT_METHOD_PORT);
       const destinationId = destinationIds[0];
       expect(destinationId).toBeDefined();
@@ -353,7 +380,7 @@ describe('feature modules (integration)', () => {
       expect(text).toContain('K7Q2ZP9V3M');
     });
 
-    it('reports rail validation issues through the port', async () => {
+    itInTenant('reports rail validation issues through the port', async () => {
       const payments = moduleRef.get<PaymentMethodPort>(PAYMENT_METHOD_PORT);
       const result = await payments.checkSubmission({
         paymentMethodId: methodId as string,
@@ -384,7 +411,7 @@ describe('feature modules (integration)', () => {
   describe('admin approval limits against a real database', () => {
     let adminId: string;
 
-    it('creates an admin and evaluates real ceilings inside a transaction', async () => {
+    itInTenant('creates an admin and evaluates real ceilings inside a transaction', async () => {
       const admins = moduleRef.get(AdminUserService);
       const limits = moduleRef.get(AdminApprovalLimitService);
 
@@ -419,7 +446,7 @@ describe('feature modules (integration)', () => {
       expect(aboveCeiling).toBe('DENIED');
     });
 
-    it('supersedes a limit rather than mutating it, leaving no gap', async () => {
+    itInTenant('supersedes a limit rather than mutating it, leaving no gap', async () => {
       const limits = moduleRef.get(AdminApprovalLimitService);
 
       await limits.setLimit('00000000-0000-4000-8000-0000000000aa', adminId, {
@@ -435,7 +462,7 @@ describe('feature modules (integration)', () => {
       expect(history[0]?.maxSingleApproval).toBe('9000.00');
     });
 
-    it('refuses to deactivate the last active SUPER_ADMIN', async () => {
+    itInTenant('refuses to deactivate the last active SUPER_ADMIN', async () => {
       const admins = moduleRef.get(AdminUserService);
 
       const superAdmin = await admins.create('00000000-0000-4000-8000-0000000000aa', {
@@ -461,7 +488,7 @@ describe('feature modules (integration)', () => {
       }
     });
 
-    it('refuses self-demotion', async () => {
+    itInTenant('refuses self-demotion', async () => {
       const admins = moduleRef.get(AdminUserService);
       await expect(admins.update(adminId, adminId, { role: 'VIEWER' })).rejects.toMatchObject({
         errorCode: 'ADMIN_SELF_MODIFICATION',
@@ -474,20 +501,23 @@ describe('feature modules (integration)', () => {
   describe('player linking against the fake Ichancy adapter', () => {
     let playerId: string;
 
-    beforeAll(async () => {
-      const players = moduleRef.get(PlayerService);
-      const { playerId: created } = await prisma.runInTransaction((tx) =>
-        players.upsertFromTelegram(
-          tx,
-          { telegramUserId: TG_BASE + 10n, firstName: 'Int', telegramUsername: `int_${SUFFIX}` },
-          'NSP',
-        ),
-      );
-      playerId = created;
-      createdPlayerIds.push(playerId);
-    });
+    beforeAll(
+      inTenant(async () => {
+        const players = moduleRef.get(PlayerService);
+        const { playerId: created } = await prisma.runInTransaction((tx) =>
+          players.upsertFromTelegram(
+            tx,
+            TENANT_BOOTSTRAP_ID,
+            { telegramUserId: TG_BASE + 10n, firstName: 'Int', telegramUsername: `int_${SUFFIX}` },
+            'NSP',
+          ),
+        );
+        playerId = created;
+        createdPlayerIds.push(playerId);
+      }),
+    );
 
-    it('is idempotent: linking twice makes exactly one registration', async () => {
+    itInTenant('is idempotent: linking twice makes exactly one registration', async () => {
       const link = moduleRef.get<PlayerLinkPort>(PLAYER_LINK_PORT);
 
       const first = await link.ensureLinked(playerId);
@@ -501,7 +531,7 @@ describe('feature modules (integration)', () => {
       expect(fakeIchancy.callsFor('ensurePlayer')).toHaveLength(1);
     });
 
-    it('persists the link and encrypts the password at rest', async () => {
+    itInTenant('persists the link and encrypts the password at rest', async () => {
       const row = await prisma.player.findUniqueOrThrow({ where: { id: playerId } });
 
       expect(row.ichancyPlayerId).toBeTruthy();
@@ -516,31 +546,48 @@ describe('feature modules (integration)', () => {
       expect(credentials.login).toBe(row.ichancyLogin);
     });
 
-    it('surfaces an ambiguous registration as a retryable 503, persisting nothing', async () => {
-      const players = moduleRef.get(PlayerService);
-      const link = moduleRef.get<PlayerLinkPort>(PLAYER_LINK_PORT);
+    itInTenant(
+      'surfaces an ambiguous registration as a retryable 503, persisting nothing',
+      async () => {
+        const players = moduleRef.get(PlayerService);
+        const link = moduleRef.get<PlayerLinkPort>(PLAYER_LINK_PORT);
 
-      const { playerId: other } = await prisma.runInTransaction((tx) =>
-        players.upsertFromTelegram(tx, { telegramUserId: TG_BASE + 11n, firstName: 'Amb' }, 'NSP'),
-      );
-      createdPlayerIds.push(other);
+        const { playerId: other } = await prisma.runInTransaction((tx) =>
+          players.upsertFromTelegram(
+            tx,
+            TENANT_BOOTSTRAP_ID,
+            { telegramUserId: TG_BASE + 11n, firstName: 'Amb' },
+            'NSP',
+          ),
+        );
+        createdPlayerIds.push(other);
 
-      fakeIchancy.setMode('ambiguous');
-      await expect(link.ensureLinked(other)).rejects.toMatchObject({ httpStatus: 503 });
-      fakeIchancy.setMode('ok');
+        fakeIchancy.setMode('ambiguous');
+        await expect(link.ensureLinked(other)).rejects.toMatchObject({ httpStatus: 503 });
+        fakeIchancy.setMode('ok');
 
-      // Nothing half-written: an unknown outcome must leave the row untouched.
-      const row = await prisma.player.findUniqueOrThrow({ where: { id: other } });
-      expect(row.ichancyPlayerId).toBeNull();
-      expect(row.ichancyPasswordEnc).toBeNull();
-    });
+        // Nothing half-written: an unknown outcome must leave the row untouched.
+        const row = await prisma.player.findUniqueOrThrow({ where: { id: other } });
+        expect(row.ichancyPlayerId).toBeNull();
+        expect(row.ichancyPasswordEnc).toBeNull();
+      },
+    );
 
-    it('reports eligibility from status AND self-exclusion', async () => {
+    itInTenant('reports eligibility from status AND self-exclusion', async () => {
       const players = moduleRef.get(PlayerService);
       await expect(players.checkEligibility(playerId)).resolves.toMatchObject({ eligible: true });
 
+      // The exclusion belongs to the same operator as the player it excludes; taking the tenant off
+      // the row rather than naming a constant keeps the fixture honest if the sign-in tenant moves.
+      const { tenantId } = await prisma.player.findUniqueOrThrow({ where: { id: playerId } });
       const exclusion = await prisma.selfExclusion.create({
-        data: { playerId, requestedByType: 'PLAYER', requestedById: playerId, endsAt: null },
+        data: {
+          tenantId,
+          playerId,
+          requestedByType: 'PLAYER',
+          requestedById: playerId,
+          endsAt: null,
+        },
       });
 
       // A PERMANENT exclusion has endsAt = null. Reading that as "no end date, so not active" is

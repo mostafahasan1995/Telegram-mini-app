@@ -42,8 +42,13 @@ export class PaymentMethodRepository extends BaseRepository<
     return this._findUnique({ id }, tx);
   }
 
-  findByCode(code: string, tx?: Tx): Promise<PaymentMethod | null> {
-    return this._findUnique({ code }, tx);
+  /**
+   * `code` is unique only WITHIN an operator now, so the tenant is part of the key rather than a
+   * filter applied after the fact: two operators are each free to call their method SYRIATEL_CASH,
+   * and the runtime tenant filter does not reach findUnique.
+   */
+  findByCode(tenantId: string, code: string, tx?: Tx): Promise<PaymentMethod | null> {
+    return this._findUnique({ tenantId_code: { tenantId, code } }, tx);
   }
 
   /** Ordered exactly as the mini app should render them. */

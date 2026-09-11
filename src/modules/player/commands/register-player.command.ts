@@ -25,6 +25,9 @@ import { Logger } from '@nestjs/common';
 import { Command, CommandRunner, Option } from 'nest-commander';
 
 import { PrismaService } from '@core/prisma/prisma.service';
+import { runWithTenant } from '@core/tenant';
+// Not the '@core/tenant' barrel: it re-exports TENANT_ZERO_ID but not TENANT_BOOTSTRAP_ID.
+import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
 import { isAppException } from '@common/exceptions/app.exception';
 
 import { PlayerLinkService } from '../services/player-link.service';
@@ -39,6 +42,17 @@ interface RegisterPlayerOptions {
 
 /** Default ceiling on a backfill run. High enough to be useful, low enough to be interruptible. */
 const DEFAULT_BACKFILL_LIMIT = 100;
+
+/**
+ * Whose players this command registers. TEMPORARY — phase 6 turns it into a `--tenant-id` flag,
+ * once there is more than one operator to choose between.
+ *
+ * A CLI run has no request, so nothing established a tenant context for it. That matters twice
+ * over: the `--all-pending` selector is a findMany, which the tenant-scope extension leaves
+ * UNFILTERED when there is no context (see the comment in tenant-scope.extension.ts), so a backfill
+ * without this would open Ichancy accounts for every operator's pending players in one run.
+ */
+const CLI_TENANT_ID = TENANT_BOOTSTRAP_ID;
 
 const describeError = (error: unknown): string =>
   isAppException(error)
@@ -96,7 +110,16 @@ export class RegisterPlayerCommand extends CommandRunner {
     return true;
   }
 
+  /**
+   * The tenant context is opened HERE rather than around each query so that everything one run
+   * touches sits in one operator — including PlayerLinkService's own reads and writes, which are
+   * several calls deep and have no idea they are being driven from a terminal.
+   */
   async run(_args: string[], options: RegisterPlayerOptions = {}): Promise<void> {
+    await runWithTenant(CLI_TENANT_ID, () => this.execute(options));
+  }
+
+  private async execute(options: RegisterPlayerOptions): Promise<void> {
     const targets = await this.resolveTargets(options);
     if (targets.length === 0) {
       this.logger.log('Nothing to do: no player matched.');
@@ -182,7 +205,10 @@ export class RegisterPlayerCommand extends CommandRunner {
       } catch {
         throw new Error(`--telegram-id must be a whole number, got "${options.telegramId}"`);
       }
-      const player = await this.prisma.player.findUnique({ where: { telegramUserId }, select });
+      const player = await this.prisma.player.findUnique({
+        where: { tenantId_telegramUserId: { tenantId: CLI_TENANT_ID, telegramUserId } },
+        select,
+      });
       if (player === null) {
         throw new Error(
           `No player with Telegram id ${options.telegramId}. They have to press /start once ` +

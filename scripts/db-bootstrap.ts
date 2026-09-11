@@ -2,7 +2,7 @@
  * One-time (idempotent) database bootstrap: create the restricted application role, then apply the
  * hand-written guarantees in prisma/sql/ that Prisma Migrate will never run for us.
  *
- * WHY this exists: prisma/sql/README.md documents applying those five files with `psql`. A Windows
+ * WHY this exists: prisma/sql/README.md documents applying those six files with `psql`. A Windows
  * dev box has no psql, and every one of those files is load-bearing — without them the ledger has
  * no balance trigger, the append-only tables are freely UPDATE-able, and the partial unique index
  * that stops a bank reference being credited twice is simply absent. A setup path that silently
@@ -30,6 +30,8 @@ const SQL_FILES = [
   '003_app_role_grants.sql',
   '004_partial_indexes.sql',
   '005_four_eyes_check.sql',
+  // Requires 20260911090000_multi_tenant_core: it builds foreign keys against tenant_id.
+  '006_tenant_isolation.sql',
 ] as const;
 
 interface AppRole {
@@ -121,7 +123,7 @@ async function main(): Promise<void> {
     }
 
     // ── 2. the guarantees ─────────────────────────────────────────────────────────────────────
-    // Order matters: 001 → 002 → 003 → 004 → 005. Each file runs in its own transaction so a
+    // Order matters: 001 → 002 → 003 → 004 → 005 → 006. Each file runs in its own transaction so a
     // failure names the file that failed instead of rolling back the whole batch invisibly.
     for (const file of SQL_FILES) {
       const sql = await readFile(path.join(SQL_DIR, file), 'utf8');

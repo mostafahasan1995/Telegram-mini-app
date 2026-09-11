@@ -96,7 +96,11 @@ export class AuthGuard implements CanActivate {
     } else {
       // Note what is NOT trusted here: `claims.role`. It only tells us to look the caller up as an
       // admin; the authoritative role comes from the database (60s cache).
-      const admin = await this.admins.resolve(BigInt(claims.tgid));
+      //
+      // The lookup is scoped to `claims.tid` — the caller's HOME tenant, signed into the token.
+      // Never to the X-Tenant-Id header: resolving identity in a tenant the client named would let
+      // anyone claim whatever role they hold in one operator inside every other operator.
+      const admin = await this.admins.resolve(claims.tid, BigInt(claims.tgid));
       if (!admin) {
         throw new ForbiddenError(
           CommonErrorCodes.ADMIN_INACTIVE,

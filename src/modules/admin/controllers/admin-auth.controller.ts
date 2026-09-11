@@ -27,6 +27,7 @@ import { Public } from '@common/decorators/auth.decorator';
 import { UnauthorizedError } from '@common/exceptions/app.exception';
 import { AdminIdentityService } from '@core/auth/services/admin-identity.service';
 import { SessionService } from '@core/auth/services/session.service';
+import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
 
 import { BotCodeDto, type AdminSessionView } from '../dtos/admin-auth.dto';
 import { AdminErrorCodes } from '../enums/admin-error-code.enum';
@@ -53,8 +54,12 @@ export class AdminAuthController {
       );
     }
 
+    // WHY THE BOOTSTRAP TENANT: this route is @Public(), so there is no token and therefore no
+    // tenant context to read — and the only thing the code proves is a Telegram id, which is the
+    // bot's namespace. The bot that minted the code is the single bootstrap-tenant bot. TEMPORARY:
+    // phase 6 gives each operator its own bot and the code will carry the tenant it was minted in.
     // Throws ForbiddenError(ADMIN_INACTIVE) if they are no longer staff.
-    const admin = await this.admins.resolveOrThrow(telegramUserId);
+    const admin = await this.admins.resolveOrThrow(TENANT_BOOTSTRAP_ID, telegramUserId);
     const { accessToken, accessTokenExpiresAt } = await this.sessions.issueAdminAccessToken(admin);
 
     return {

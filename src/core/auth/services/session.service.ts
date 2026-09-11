@@ -104,8 +104,14 @@ export class SessionService {
     }
   }
 
-  /** Mints a fresh session for an already-resolved player. */
+  /**
+   * Mints a fresh session for an already-resolved player.
+   *
+   * `tenantId` is the player's own operator. It is written onto the session row and signed into
+   * the access token as `tid`, which is what every later request resolves its data in.
+   */
   async issueForPlayer(
+    tenantId: string,
     playerId: string,
     telegramUserId: bigint,
     context: SessionContext = {},
@@ -115,6 +121,7 @@ export class SessionService {
 
     const session = await this.prisma.playerSession.create({
       data: {
+        tenantId,
         playerId,
         refreshTokenHash: sha256Hex(refreshToken),
         expiresAt: refreshTokenExpiresAt,
@@ -127,6 +134,7 @@ export class SessionService {
 
     return this.buildIssuedSession(
       session.id,
+      tenantId,
       playerId,
       telegramUserId,
       PLAYER_ROLE,
@@ -151,6 +159,7 @@ export class SessionService {
       where: { refreshTokenHash: presentedHash },
       select: {
         id: true,
+        tenantId: true,
         playerId: true,
         expiresAt: true,
         revokedAt: true,
@@ -195,6 +204,9 @@ export class SessionService {
     const created = await this.prisma.$transaction(async (tx) => {
       const next = await tx.playerSession.create({
         data: {
+          // Carried from the rotated session, never re-derived: a refresh must not be able to
+          // move a player into another operator.
+          tenantId: existing.tenantId,
           playerId: existing.playerId,
           refreshTokenHash: sha256Hex(refreshToken),
           expiresAt: refreshTokenExpiresAt,
@@ -229,6 +241,7 @@ export class SessionService {
 
     return this.buildIssuedSession(
       created.id,
+      existing.tenantId,
       existing.playerId,
       existing.player.telegramUserId,
       PLAYER_ROLE,
@@ -310,11 +323,16 @@ export class SessionService {
     }
 
     // A token can be perfectly signed and still be the wrong shape (an old format after a deploy).
+    // `tid` is required: a token minted before the tenant claim existed carries no operator, and
+    // serving it would mean resolving identity with no tenant at all. Those tokens are rejected
+    // rather than defaulted — their holders sign in again and get a well-formed one.
     if (
       typeof claims?.sub !== 'string' ||
       typeof claims.tgid !== 'string' ||
       typeof claims.sid !== 'string' ||
-      typeof claims.role !== 'string'
+      typeof claims.role !== 'string' ||
+      typeof claims.tid !== 'string' ||
+      claims.tid.length === 0
     ) {
       throw new UnauthorizedError(CommonErrorCodes.INVALID_TOKEN, 'The access token is not valid.');
     }
@@ -334,6 +352,7 @@ export class SessionService {
   }> {
     const accessToken = await this.signAccessToken(
       admin.adminUserId,
+      admin.tenantId,
       admin.telegramUserId,
       admin.role,
       randomUUID(),
@@ -346,13 +365,20 @@ export class SessionService {
 
   private async buildIssuedSession(
     sessionId: string,
+    tenantId: string,
     subjectId: string,
     telegramUserId: bigint,
     role: TokenRole,
     refreshToken: string,
     refreshTokenExpiresAt: Date,
   ): Promise<IssuedSession> {
-    const accessToken = await this.signAccessToken(subjectId, telegramUserId, role, sessionId);
+    const accessToken = await this.signAccessToken(
+      subjectId,
+      tenantId,
+      telegramUserId,
+      role,
+      sessionId,
+    );
     return {
       accessToken,
       refreshToken,
@@ -364,17 +390,22 @@ export class SessionService {
 
   private signAccessToken(
     subjectId: string,
+    tenantId: string,
     telegramUserId: bigint,
     role: TokenRole,
     sessionId: string,
   ): Promise<string> {
     // tgid is stringified here and nowhere else: a bigint would throw in JSON.stringify without the
     // global toJSON patch, and a number would round a 64-bit Telegram id.
+    //
+    // `tid` is SIGNED rather than sent by the client because it is authority: it decides which
+    // tenant this principal's identity — and therefore their role — is resolved in.
     return this.jwt.signAsync({
       sub: subjectId,
       tgid: telegramUserId.toString(),
       role,
       sid: sessionId,
+      tid: tenantId,
     });
   }
 

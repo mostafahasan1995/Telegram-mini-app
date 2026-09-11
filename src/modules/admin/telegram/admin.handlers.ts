@@ -46,6 +46,7 @@ import { AppConfigService } from '@core/config/config.service';
 import { ICHANCY_PORT, type IchancyPort, isIchancyOk } from '@core/ichancy';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { OnCommand } from '@core/telegram/decorators/handlers.decorator';
+import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
 
 import {
   AdminLoginCodeService,
@@ -249,8 +250,13 @@ export class AdminTelegramHandlers {
       return;
     }
 
+    // A Telegram id identifies a player only WITHIN an operator now, and an inbound update carries
+    // no tenant. TEMPORARY: phase 6 resolves the tenant from the webhook path token; until then
+    // there is exactly one bot and every player it has ever seen is the bootstrap operator's.
     const player = await this.prisma.player.findUnique({
-      where: { telegramUserId: BigInt(raw) },
+      where: {
+        tenantId_telegramUserId: { tenantId: TENANT_BOOTSTRAP_ID, telegramUserId: BigInt(raw) },
+      },
       select: { id: true, ichancyPlayerId: true },
     });
     if (player === null) {
@@ -571,7 +577,11 @@ export class AdminTelegramHandlers {
     if (from === undefined || from.is_bot) return null;
 
     try {
-      return await this.admins.resolve(BigInt(from.id));
+      // Authority is measured in a tenant, and an inbound update has none to measure it in. The one
+      // bot in service belongs to the bootstrap operator, so that is the only tenant in which a
+      // Telegram id here can mean staff. TEMPORARY: phase 6 resolves it from the webhook path
+      // token, and this becomes the tenant that actually received the update.
+      return await this.admins.resolve(TENANT_BOOTSTRAP_ID, BigInt(from.id));
     } catch (error: unknown) {
       // Failing CLOSED: a database or cache hiccup must not hand out the float, so an unreadable
       // identity is treated as "not an admin" rather than surfaced to the caller.

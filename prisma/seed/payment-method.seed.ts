@@ -10,12 +10,18 @@
  * `POST /v1/admin/payment-methods/:id/destinations` before taking real deposits; the seed prints a
  * warning saying exactly that, and re-running it never overwrites a destination you have edited.
  *
- * Idempotency: `code` and `(paymentMethodId, accountIdentifier)` are unique, so every write here is
- * an upsert keyed on something stable. Amount limits and instructions ARE refreshed on re-run
- * (they are configuration); `isActive` and `priority` are NOT, because an operator who deactivated
- * a destination did it for a reason and a redeploy must not undo that.
+ * WHOSE RAILS THESE ARE: the bootstrap operator's. A payment method is an operator's own bank
+ * account, not the platform's — nobody pays into tenant zero — so these belong to the tenant that
+ * was already taking deposits, never to the tenant that holds the platform logins.
+ *
+ * Idempotency: `(tenantId, code)` and `(paymentMethodId, accountIdentifier)` are unique, so every
+ * write here is an upsert keyed on something stable. Amount limits and instructions ARE refreshed
+ * on re-run (they are configuration); `isActive` and `priority` are NOT, because an operator who
+ * deactivated a destination did it for a reason and a redeploy must not undo that.
  */
 import { PaymentRail, VerificationMode, type PrismaClient } from '@prisma/client';
+
+import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
 
 export const BANK_TRANSFER_CODE = 'BANK_TRANSFER_MAIN';
 export const EWALLET_CODE = 'EWALLET_MAIN';
@@ -94,8 +100,9 @@ export async function seedPaymentMethods(
 
   for (const spec of METHODS) {
     const method = await prisma.paymentMethod.upsert({
-      where: { code: spec.code },
+      where: { tenantId_code: { tenantId: TENANT_BOOTSTRAP_ID, code: spec.code } },
       create: {
+        tenantId: TENANT_BOOTSTRAP_ID,
         code: spec.code,
         displayName: spec.displayName,
         rail: spec.rail,
@@ -135,6 +142,9 @@ export async function seedPaymentMethods(
         },
       },
       create: {
+        // The method's tenant, not the ambient one: a destination that drifted onto a different
+        // operator than the rail it belongs to would take a player's money to the wrong bank.
+        tenantId: TENANT_BOOTSTRAP_ID,
         paymentMethodId: method.id,
         label: spec.destination.label,
         accountIdentifier: spec.destination.accountIdentifier,

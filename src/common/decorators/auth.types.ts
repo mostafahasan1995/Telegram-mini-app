@@ -25,6 +25,12 @@ export interface AuthenticatedPlayer {
 export interface AuthenticatedAdmin {
   adminUserId: string;
   telegramUserId: bigint;
+  /**
+   * The operator this admin's row lives in — their HOME tenant, never the one an X-Tenant-Id
+   * header asked for. Carried on the principal because authority is measured here: a
+   * PLATFORM_ADMIN is only platform staff if this is tenant zero.
+   */
+  tenantId: string;
   /** Re-read from the database on every request (60s cache), never trusted from the token. */
   role: AdminRole;
   displayName: string;

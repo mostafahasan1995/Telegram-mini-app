@@ -254,6 +254,10 @@ export class AdminApprovalLimitService {
 
         const created = await this.limits.create(
           {
+            // The limit belongs wherever the admin it constrains lives — read off the row loaded
+            // above rather than from the ambient context, so a ceiling can never end up filed under
+            // an operator that cannot see the admin it applies to.
+            tenantId: admin.tenantId,
             adminUserId,
             currencyCode: dto.currencyCode,
             maxSingleApprovalMinor,

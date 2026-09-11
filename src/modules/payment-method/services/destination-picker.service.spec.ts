@@ -8,6 +8,9 @@ import type { PaymentDestinationRepository } from '../repositories/payment-desti
 
 const METHOD = 'method-1';
 
+/** Self-contained: the picker never reads the tenant, it only has to be present on the row. */
+const TENANT = '3f1c9a5e-4d2b-4f7a-9c81-0b6d2e5a7c40';
+
 function destination(
   id: string,
   priority: number,
@@ -15,6 +18,7 @@ function destination(
 ): PaymentDestination {
   return {
     id,
+    tenantId: TENANT,
     paymentMethodId: METHOD,
     label: `Destination ${id}`,
     accountIdentifier: `acct-${id}`,

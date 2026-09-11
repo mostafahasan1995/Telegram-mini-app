@@ -18,6 +18,8 @@ import { applyTestEnv } from './setup/test-env';
 import { THROTTLE_RULES, findUnmatchedRules } from '@core/throttler/throttle-routes';
 import { TELEGRAM_BOT } from '@core/telegram/telegram.constants';
 import { OUTBOX_HANDLERS, type OutboxTopicHandler } from '@core/outbox/outbox.types';
+// Not the '@core/tenant' barrel: it re-exports TENANT_ZERO_ID but not TENANT_BOOTSTRAP_ID.
+import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
 
 jest.setTimeout(180_000);
 
@@ -218,8 +220,12 @@ describe('api composition', () => {
       const { PrismaService } = await import('@core/prisma/prisma.service');
       const prisma = ctx.app.get(PrismaService);
 
+      // Any surviving tenant would do — what is under test is that the append-only table can be
+      // cleared and re-armed — so the probe is written as the bootstrap operator, the one the
+      // migration guarantees exists.
       await prisma.auditLog.create({
         data: {
+          tenantId: TENANT_BOOTSTRAP_ID,
           actorType: 'SYSTEM',
           action: 'test.harness.probe',
           entityType: 'Test',
@@ -236,6 +242,7 @@ describe('api composition', () => {
       // ledger and the append-only guarantee would be tested by nothing.
       const rearmed = await prisma.auditLog.create({
         data: {
+          tenantId: TENANT_BOOTSTRAP_ID,
           actorType: 'SYSTEM',
           action: 'test.harness.probe2',
           entityType: 'Test',

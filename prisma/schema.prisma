@@ -44,6 +44,10 @@ enum PlayerStatus {
 }
 
 enum AdminRole {
+  /// Platform staff. Lives ONLY in tenant zero (enforced by a CHECK constraint) and is the
+  /// only role whose X-Tenant-Id header is honoured. Not a superset of SUPER_ADMIN: it runs
+  /// the platform, it does not approve an operator's deposits.
+  PLATFORM_ADMIN
   SUPER_ADMIN
   FINANCE_ADMIN
   REVIEWER
@@ -244,6 +248,144 @@ enum CreditVerifiedBy {
   @@map("credit_verified_by")
 }
 
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  /// Closed operators keep their rows. Money history is never deleted, only stopped.
+  CLOSED
+
+  @@map("tenant_status")
+}
+
+/// How an operator's bot answers a submitted deposit. MANUAL is the safe default everywhere: a
+/// missing setting must never auto-credit money.
+enum DepositMode {
+  AUTO
+  MANUAL
+
+  @@map("deposit_mode")
+}
+
+/// How an operator's bot answers a cash-out. Same defaulting rule as DepositMode.
+enum WithdrawalMode {
+  AUTO
+  MANUAL
+
+  @@map("withdrawal_mode")
+}
+
+// =============================================================================
+// TENANCY
+// =============================================================================
+
+/// An operator. Every row in a tenant-scoped table belongs to exactly one of these.
+///
+/// TENANT ZERO is the platform's own operator (see TENANT_ZERO_ID in src/core/tenant). It exists
+/// so that PLATFORM_ADMIN rows have somewhere to live that is not an operator: a platform login
+/// sitting inside a customer's tenant is a tenant login holding platform authority, which is why
+/// prisma/sql/006 refuses to write one.
+///
+/// SECRETS: botToken, the webhook secret, the Ichancy password and the Sham Cash key are sealed
+/// with the AES secret box and are never returned by any endpoint. The webhook path token is
+/// reported only as `hasWebhookPath`.
+model Tenant {
+  id          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// URL-safe identity, slugify(displayName) de-duplicated with -2, -3 … on collision.
+  /// Immutable after creation: it is how operators are named in logs and support tickets.
+  slug        String       @unique
+  displayName String       @map("display_name")
+  /// A new operator lands SUSPENDED on purpose. Nothing can verify from a form that the agent id
+  /// is the right one, so activating is a second, deliberate act that does a real Ichancy signin.
+  status      TenantStatus @default(SUSPENDED)
+
+  // ---- Telegram ----------------------------------------------------------------------------
+  botTokenEnc      String  @map("bot_token_enc")
+  /// Filled from getMe when the token is accepted; null until the bot has answered once.
+  botUsername      String? @map("bot_username")
+  /// CSPRNG path segment the webhook is registered under. Unique across operators because it is
+  /// what routes an inbound update to THIS tenant before any other identity exists.
+  webhookPathToken String? @unique @map("webhook_path_token")
+  /// Telegram's X-Telegram-Bot-Api-Secret-Token for this operator, sealed.
+  webhookSecretEnc String? @map("webhook_secret_enc")
+  /// Where this operator's staff are notified. Defaults to the creating PLATFORM_ADMIN's chat.
+  adminChatId      BigInt  @map("admin_chat_id")
+  feedChatId       BigInt? @map("feed_chat_id")
+
+  // ---- Ichancy -----------------------------------------------------------------------------
+  ichancyBaseUrl     String @map("ichancy_base_url")
+  ichancyUsername    String @map("ichancy_username")
+  ichancyPasswordEnc String @map("ichancy_password_enc")
+  /// Never derivable: Ichancy signin() returns only a token pair. Supplied -> PlatformDefaults ->
+  /// tenant zero's -> 400. Two operators MAY share one agent id; that is how a second is tested.
+  ichancyAgentId     String @map("ichancy_agent_id")
+
+  // ---- Money settings, copied from PlatformDefaults at creation and owned by the row after ----
+  currencyCode                String         @map("currency_code") @db.VarChar(3)
+  dualApprovalThresholdMinor  BigInt         @map("dual_approval_threshold_minor")
+  agentFloatLowWatermarkMinor BigInt         @map("agent_float_low_watermark_minor")
+  depositExpiryMinutes        Int            @map("deposit_expiry_minutes")
+  depositMode                 DepositMode    @default(MANUAL) @map("deposit_mode")
+  withdrawalMode              WithdrawalMode @default(MANUAL) @map("withdrawal_mode")
+  /// The https URL the bot's "open the app" button opens. Null is "not set yet".
+  miniAppUrl                  String?        @map("mini_app_url")
+
+  // ---- Sham Cash (columns land here in phase 1 so the rail has somewhere to go) --------------
+  shamcashWalletId  String? @map("shamcash_wallet_id")
+  shamcashApiKeyEnc String? @map("shamcash_api_key_enc")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  currency Currency @relation(fields: [currencyCode], references: [code], onDelete: Restrict)
+
+  paymentMethods       PaymentMethod[]
+  paymentDestinations  PaymentDestination[]
+  players              Player[]
+  playerSessions       PlayerSession[]
+  adminUsers           AdminUser[]
+  adminApprovalLimits  AdminApprovalLimit[]
+  depositRequests      DepositRequest[]
+  depositProofs        DepositProof[]
+  depositTransitions   DepositTransition[]
+  ledgerAccounts       LedgerAccount[]
+  ledgerTransactions   LedgerTransaction[]
+  ledgerEntries        LedgerEntry[]
+  outboxMessages       OutboxMessage[]
+  idempotencyKeys      IdempotencyKey[]
+  telegramUpdates      TelegramUpdate[]
+  ichancyCalls         IchancyCall[]
+  auditLogs            AuditLog[]
+  reconciliationBreaks ReconciliationBreak[]
+  playerLimits         PlayerLimit[]
+  selfExclusions       SelfExclusion[]
+
+  @@index([status])
+  @@map("tenants")
+}
+
+/// The single settings row a NEW operator inherits from. Editing it changes what the next operator
+/// gets and does NOT reach back into existing ones — their values were copied onto their own rows.
+///
+/// Singleton: `id` is pinned to 1 by a CHECK constraint (prisma/sql/006), so there is exactly one
+/// row to read and no "which defaults were in force" ambiguity.
+model PlatformDefaults {
+  id Int @id @default(1)
+
+  ichancyBaseUrl String  @map("ichancy_base_url")
+  /// The house agent. Nullable because a platform that has not named one genuinely has none, and
+  /// an agent id can never be derived from credentials.
+  ichancyAgentId String? @map("ichancy_agent_id")
+
+  currencyCode                String @map("currency_code") @db.VarChar(3)
+  dualApprovalThresholdMinor  BigInt @map("dual_approval_threshold_minor")
+  agentFloatLowWatermarkMinor BigInt @map("agent_float_low_watermark_minor")
+  depositExpiryMinutes        Int    @map("deposit_expiry_minutes")
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("platform_defaults")
+}
+
 // =============================================================================
 // REFERENCE DATA
 // =============================================================================
@@ -259,6 +401,7 @@ model Currency {
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
+  tenants              Tenant[]
   players              Player[]
   paymentMethods       PaymentMethod[]
   depositRequests      DepositRequest[]
@@ -274,8 +417,9 @@ model Currency {
 
 model PaymentMethod {
   id               String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId         String           @map("tenant_id") @db.Uuid
   /// Stable machine code used by the mini-app and by seeds, e.g. SYRIATEL_CASH.
-  code             String           @unique
+  code             String
   displayName      String           @map("display_name")
   rail             PaymentRail
   currencyCode     String           @map("currency_code") @db.VarChar(3)
@@ -304,13 +448,18 @@ model PaymentMethod {
   depositRequests DepositRequest[]
   ledgerAccounts  LedgerAccount[]
 
-  @@index([isActive, sortOrder])
-  @@index([currencyCode])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, code])
+  @@index([tenantId, isActive, sortOrder])
+  @@index([tenantId, currencyCode])
+  @@index([tenantId])
   @@map("payment_methods")
 }
 
 model PaymentDestination {
   id                String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId          String  @map("tenant_id") @db.Uuid
   paymentMethodId   String  @map("payment_method_id") @db.Uuid
   label             String
   /// The account/number/address the player actually pays into.
@@ -329,8 +478,11 @@ model PaymentDestination {
   paymentMethod   PaymentMethod    @relation(fields: [paymentMethodId], references: [id], onDelete: Restrict)
   depositRequests DepositRequest[]
 
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
   @@unique([paymentMethodId, accountIdentifier])
-  @@index([paymentMethodId, isActive, priority])
+  @@index([tenantId, paymentMethodId, isActive, priority])
+  @@index([tenantId])
   @@map("payment_destinations")
 }
 
@@ -340,8 +492,9 @@ model PaymentDestination {
 
 model Player {
   id               String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId         String       @map("tenant_id") @db.Uuid
   /// Telegram ids are 64-bit; storing them as BigInt avoids the 2^53 trap.
-  telegramUserId   BigInt       @unique @map("telegram_user_id")
+  telegramUserId   BigInt       @map("telegram_user_id")
   telegramUsername String?      @map("telegram_username")
   firstName        String?      @map("first_name")
   lastName         String?      @map("last_name")
@@ -352,10 +505,10 @@ model Player {
 
   /// registerPlayer returns the number 1, NOT an id — this is resolved afterwards through
   /// getPlayersForCurrentAgent(userName=...). Null means the mirror does not exist yet.
-  ichancyPlayerId     String?   @unique @map("ichancy_player_id")
+  ichancyPlayerId     String?   @map("ichancy_player_id")
   /// Credentials we generate at registration time and keep, because the player never sees them.
-  ichancyLogin        String?   @unique @map("ichancy_login")
-  ichancyEmail        String?   @unique @map("ichancy_email")
+  ichancyLogin        String?   @map("ichancy_login")
+  ichancyEmail        String?   @map("ichancy_email")
   /// Encrypted at rest; never leaves the backend and is never returned by any API.
   ichancyPasswordEnc  String?   @map("ichancy_password_enc")
   ichancyRegisteredAt DateTime? @map("ichancy_registered_at") @db.Timestamptz(6)
@@ -385,15 +538,23 @@ model Player {
   ichancyCalls         IchancyCall[]
   reconciliationBreaks ReconciliationBreak[]
 
-  @@index([status])
-  @@index([createdAt])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, telegramUserId])
+  @@unique([tenantId, ichancyPlayerId])
+  @@unique([tenantId, ichancyLogin])
+  @@unique([tenantId, ichancyEmail])
+  @@index([tenantId, status])
+  @@index([tenantId, createdAt])
   /// The backfill's selector: PENDING_ICHANCY rows whose next attempt is due.
-  @@index([status, ichancyLinkNextAttemptAt])
+  @@index([tenantId, status, ichancyLinkNextAttemptAt])
+  @@index([tenantId])
   @@map("players")
 }
 
 model PlayerSession {
   id               String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId         String @map("tenant_id") @db.Uuid
   playerId         String @map("player_id") @db.Uuid
   /// Only the hash is stored, so a database dump cannot be replayed as a session.
   refreshTokenHash String @unique @map("refresh_token_hash")
@@ -413,14 +574,18 @@ model PlayerSession {
   replacedBySession PlayerSession? @relation("SessionRotation", fields: [replacedBySessionId], references: [id], onDelete: SetNull)
   replacesSession   PlayerSession? @relation("SessionRotation")
 
-  @@index([playerId, expiresAt])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, playerId, expiresAt])
+  @@index([tenantId])
   @@map("player_sessions")
 }
 
 model AdminUser {
   id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  telegramUserId BigInt    @unique @map("telegram_user_id")
-  username       String?   @unique
+  tenantId       String    @map("tenant_id") @db.Uuid
+  telegramUserId BigInt    @map("telegram_user_id")
+  username       String?
   displayName    String    @map("display_name")
   role           AdminRole
   isActive       Boolean   @default(true) @map("is_active")
@@ -439,12 +604,18 @@ model AdminUser {
   resolvedBreaks         ReconciliationBreak[] @relation("BreakResolver")
   revokedSelfExclusions  SelfExclusion[]       @relation("SelfExclusionRevoker")
 
-  @@index([role, isActive])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, telegramUserId])
+  @@unique([tenantId, username])
+  @@index([tenantId, role, isActive])
+  @@index([tenantId])
   @@map("admin_users")
 }
 
 model AdminApprovalLimit {
   id           String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId     String @map("tenant_id") @db.Uuid
   adminUserId  String @map("admin_user_id") @db.Uuid
   currencyCode String @map("currency_code") @db.VarChar(3)
 
@@ -461,8 +632,11 @@ model AdminApprovalLimit {
   adminUser AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Restrict)
   currency  Currency  @relation(fields: [currencyCode], references: [code], onDelete: Restrict)
 
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
   @@unique([adminUserId, currencyCode, effectiveFrom])
-  @@index([adminUserId, effectiveTo])
+  @@index([tenantId, adminUserId, effectiveTo])
+  @@index([tenantId])
   @@map("admin_approval_limits")
 }
 
@@ -471,10 +645,11 @@ model AdminApprovalLimit {
 // =============================================================================
 
 model DepositRequest {
-  id      String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
   /// Human-facing reference (Crockford base32, 10 chars). Shown to the player, printed on the admin
   /// card, and sent as the Ichancy `comment` — the only breadcrumb visible in their panel.
-  shortId String @unique @map("short_id")
+  shortId  String @map("short_id")
 
   playerId             String  @map("player_id") @db.Uuid
   paymentMethodId      String  @map("payment_method_id") @db.Uuid
@@ -514,7 +689,7 @@ model DepositRequest {
 
   /// Client-supplied idempotency key for the CREATE call, so a retried mini-app POST does not
   /// open a second deposit.
-  idempotencyKey String? @unique @map("idempotency_key")
+  idempotencyKey String? @map("idempotency_key")
   /// Bumped every time an admin deliberately re-runs the credit. It is part of the BullMQ job id
   /// and of the per-player Redis mutex key, so a stale worker cannot resurrect an old attempt.
   creditKeyEpoch Int     @default(0) @map("credit_key_epoch")
@@ -558,15 +733,20 @@ model DepositRequest {
   ledgerTransactions   LedgerTransaction[]   @relation("LedgerTxDeposit")
   reconciliationBreaks ReconciliationBreak[]
 
-  @@index([playerId, createdAt])
-  @@index([status, createdAt])
-  @@index([paymentMethodId, status])
-  @@index([shortId])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, shortId])
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, playerId, createdAt])
+  @@index([tenantId, status, createdAt])
+  @@index([tenantId, paymentMethodId, status])
+  @@index([tenantId])
   @@map("deposit_requests")
 }
 
 model DepositProof {
   id               String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId         String      @map("tenant_id") @db.Uuid
   depositRequestId String      @map("deposit_request_id") @db.Uuid
   source           ProofSource
 
@@ -594,13 +774,17 @@ model DepositProof {
 
   depositRequest DepositRequest @relation(fields: [depositRequestId], references: [id], onDelete: Restrict)
 
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
   @@unique([depositRequestId, sha256])
-  @@index([sha256])
+  @@index([tenantId, sha256])
+  @@index([tenantId])
   @@map("deposit_proofs")
 }
 
 model DepositTransition {
   id               String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId         String         @map("tenant_id") @db.Uuid
   depositRequestId String         @map("deposit_request_id") @db.Uuid
   /// Null only for the very first transition into DRAFT.
   fromStatus       DepositStatus? @map("from_status")
@@ -616,8 +800,11 @@ model DepositTransition {
 
   depositRequest DepositRequest @relation(fields: [depositRequestId], references: [id], onDelete: Restrict)
 
-  @@index([depositRequestId, createdAt])
-  @@index([toStatus, createdAt])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, depositRequestId, createdAt])
+  @@index([tenantId, toStatus, createdAt])
+  @@index([tenantId])
   @@map("deposit_transitions")
 }
 
@@ -626,12 +813,13 @@ model DepositTransition {
 // =============================================================================
 
 model LedgerAccount {
-  id   String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  id       String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String            @map("tenant_id") @db.Uuid
   /// Deterministic, human-readable identity, e.g. "PLAYER_LIABILITY:<playerId>" or
   /// "RAIL_CLEARING:SYRIATEL_CASH". Unique, so account lookup never needs a composite key.
-  code String            @unique
-  kind LedgerAccountKind
-  name String
+  code     String
+  kind     LedgerAccountKind
+  name     String
 
   currencyCode    String  @map("currency_code") @db.VarChar(3)
   /// Set for the per-player accounts (PLAYER_LIABILITY, CASINO_MIRROR).
@@ -657,13 +845,18 @@ model LedgerAccount {
   entries              LedgerEntry[]
   reconciliationBreaks ReconciliationBreak[]
 
-  @@index([kind, currencyCode])
-  @@index([playerId, kind])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, code])
+  @@index([tenantId, kind, currencyCode])
+  @@index([tenantId, playerId, kind])
+  @@index([tenantId])
   @@map("ledger_accounts")
 }
 
 model LedgerTransaction {
   id           String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId     String       @map("tenant_id") @db.Uuid
   kind         LedgerTxKind
   currencyCode String       @map("currency_code") @db.VarChar(3)
 
@@ -693,14 +886,18 @@ model LedgerTransaction {
   entries          LedgerEntry[]
   resolvedBreaks   ReconciliationBreak[] @relation("BreakResolutionTx")
 
-  @@index([kind, postedAt])
-  @@index([depositRequestId])
-  @@index([postedAt])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, kind, postedAt])
+  @@index([tenantId, depositRequestId])
+  @@index([tenantId, postedAt])
+  @@index([tenantId])
   @@map("ledger_transactions")
 }
 
 model LedgerEntry {
   id                  String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId            String @map("tenant_id") @db.Uuid
   ledgerTransactionId String @map("ledger_transaction_id") @db.Uuid
   ledgerAccountId     String @map("ledger_account_id") @db.Uuid
   /// Denormalized from the account so the balance trigger can group without a join.
@@ -719,9 +916,12 @@ model LedgerEntry {
   account     LedgerAccount     @relation(fields: [ledgerAccountId], references: [id], onDelete: Restrict)
   currency    Currency          @relation(fields: [currencyCode], references: [code], onDelete: Restrict)
 
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
   @@unique([ledgerTransactionId, sequence])
-  @@index([ledgerAccountId, createdAt])
-  @@index([ledgerTransactionId])
+  @@index([tenantId, ledgerAccountId, createdAt])
+  @@index([tenantId, ledgerTransactionId])
+  @@index([tenantId])
   @@map("ledger_entries")
 }
 
@@ -731,6 +931,7 @@ model LedgerEntry {
 
 model OutboxMessage {
   id            String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId      String       @map("tenant_id") @db.Uuid
   aggregateType String       @map("aggregate_type")
   aggregateId   String       @map("aggregate_id")
   /// Routing key, e.g. "deposit.credit.requested" or "telegram.notify.player".
@@ -746,17 +947,22 @@ model OutboxMessage {
   sentAt      DateTime? @map("sent_at") @db.Timestamptz(6)
   lastError   String?   @map("last_error")
   /// Optional natural key so the same event cannot be enqueued twice from a retried transaction.
-  dedupeKey   String?   @unique @map("dedupe_key")
+  dedupeKey   String?   @map("dedupe_key")
 
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  @@index([status, availableAt])
-  @@index([aggregateType, aggregateId])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, dedupeKey])
+  @@index([tenantId, status, availableAt])
+  @@index([tenantId, aggregateType, aggregateId])
+  @@index([tenantId])
   @@map("outbox_messages")
 }
 
 model IdempotencyKey {
   id          String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId    String @map("tenant_id") @db.Uuid
   /// Namespace, e.g. "deposit.create" — the same client key may exist in different scopes.
   scope       String
   key         String
@@ -776,16 +982,20 @@ model IdempotencyKey {
   expiresAt   DateTime  @map("expires_at") @db.Timestamptz(6)
   createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  @@unique([scope, key])
-  @@index([expiresAt])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, scope, key])
+  @@index([tenantId, expiresAt])
+  @@index([tenantId])
   @@map("idempotency_keys")
 }
 
 model TelegramUpdate {
   id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
   /// Telegram's own update_id. UNIQUE is the entire point: webhooks are re-delivered and a replayed
   /// "approve" callback must never approve twice.
-  updateId BigInt @unique @map("update_id")
+  updateId BigInt @map("update_id")
 
   kind       String? @db.VarChar(32)
   chatId     BigInt? @map("chat_id")
@@ -797,13 +1007,18 @@ model TelegramUpdate {
   handler         String?
   processingError String?   @map("processing_error")
 
-  @@index([receivedAt])
-  @@index([processedAt])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, updateId])
+  @@index([tenantId, receivedAt])
+  @@index([tenantId, processedAt])
+  @@index([tenantId])
   @@map("telegram_updates")
 }
 
 model IchancyCall {
   id        String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId  String           @map("tenant_id") @db.Uuid
   operation IchancyOperation
   /// 1-based attempt counter within one logical operation (refresh+retry produces attempt 2).
   attempt   Int              @default(1)
@@ -830,15 +1045,19 @@ model IchancyCall {
   player               Player?               @relation(fields: [playerId], references: [id], onDelete: Restrict)
   reconciliationBreaks ReconciliationBreak[]
 
-  @@index([operation, createdAt])
-  @@index([depositRequestId, createdAt])
-  @@index([outcome, createdAt])
-  @@index([correlationId])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, operation, createdAt])
+  @@index([tenantId, depositRequestId, createdAt])
+  @@index([tenantId, outcome, createdAt])
+  @@index([tenantId, correlationId])
+  @@index([tenantId])
   @@map("ichancy_calls")
 }
 
 model AuditLog {
   id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId  String    @map("tenant_id") @db.Uuid
   actorType ActorType @map("actor_type")
   /// Null for SYSTEM. Not a foreign key: the actor may be a player, an admin, or nobody.
   actorId   String?   @map("actor_id") @db.Uuid
@@ -858,14 +1077,18 @@ model AuditLog {
 
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  @@index([entityType, entityId, createdAt])
-  @@index([actorType, actorId, createdAt])
-  @@index([action, createdAt])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, entityType, entityId, createdAt])
+  @@index([tenantId, actorType, actorId, createdAt])
+  @@index([tenantId, action, createdAt])
+  @@index([tenantId])
   @@map("audit_logs")
 }
 
 model ReconciliationBreak {
   id       String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String        @map("tenant_id") @db.Uuid
   category BreakCategory
   status   BreakStatus   @default(OPEN)
   /// 1 = informational, 5 = money is missing right now.
@@ -883,7 +1106,7 @@ model ReconciliationBreak {
 
   detail    Json?
   /// Stable natural key of the finding so a cron re-run updates instead of duplicating.
-  dedupeKey String? @unique @map("dedupe_key")
+  dedupeKey String? @map("dedupe_key")
 
   detectedAt        DateTime  @default(now()) @map("detected_at") @db.Timestamptz(6)
   assignedToAdminId String?   @map("assigned_to_admin_id") @db.Uuid
@@ -905,9 +1128,13 @@ model ReconciliationBreak {
   resolvedByAdmin AdminUser?         @relation("BreakResolver", fields: [resolvedByAdminId], references: [id], onDelete: Restrict)
   resolutionTx    LedgerTransaction? @relation("BreakResolutionTx", fields: [resolutionTxId], references: [id], onDelete: Restrict)
 
-  @@index([status, detectedAt])
-  @@index([category, status])
-  @@index([depositRequestId])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, dedupeKey])
+  @@index([tenantId, status, detectedAt])
+  @@index([tenantId, category, status])
+  @@index([tenantId, depositRequestId])
+  @@index([tenantId])
   @@map("reconciliation_breaks")
 }
 
@@ -917,6 +1144,7 @@ model ReconciliationBreak {
 
 model PlayerLimit {
   id           String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId     String @map("tenant_id") @db.Uuid
   playerId     String @map("player_id") @db.Uuid
   currencyCode String @map("currency_code") @db.VarChar(3)
 
@@ -938,13 +1166,17 @@ model PlayerLimit {
   player   Player   @relation(fields: [playerId], references: [id], onDelete: Restrict)
   currency Currency @relation(fields: [currencyCode], references: [code], onDelete: Restrict)
 
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
   @@unique([playerId, currencyCode, effectiveFrom])
-  @@index([playerId, effectiveTo])
+  @@index([tenantId, playerId, effectiveTo])
+  @@index([tenantId])
   @@map("player_limits")
 }
 
 model SelfExclusion {
   id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
   playerId String @map("player_id") @db.Uuid
 
   startsAt DateTime  @default(now()) @map("starts_at") @db.Timestamptz(6)
@@ -964,7 +1196,10 @@ model SelfExclusion {
   player         Player     @relation(fields: [playerId], references: [id], onDelete: Restrict)
   revokedByAdmin AdminUser? @relation("SelfExclusionRevoker", fields: [revokedByAdminId], references: [id], onDelete: Restrict)
 
-  @@index([playerId, startsAt])
-  @@index([endsAt])
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, playerId, startsAt])
+  @@index([tenantId, endsAt])
+  @@index([tenantId])
   @@map("self_exclusions")
 }

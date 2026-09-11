@@ -18,12 +18,36 @@
  * the environment". Pinning a per-admin override in a seed would quietly outrank the deployment's
  * own four-eyes threshold, which is the one number an operator expects to control from .env.
  *
- * Idempotency: the AdminUser is keyed on `telegramUserId` (unique). The limit is versioned rather
- * than mutated — `@@unique([adminUserId, currencyCode, effectiveFrom])` with `effectiveFrom`
- * defaulting to now() means a blind upsert would append a new row on every run — so an OPEN limit
- * (effectiveTo IS NULL) is treated as "already seeded" and left exactly as the operator left it.
+ * WHICH TENANT THESE ADMINS LIVE IN — and why there are TWO rows for one human:
+ *
+ * Home tenant is identity, so "the person bootstrapping this deployment" genuinely has two of
+ * them, and one row cannot be both:
+ *
+ *   SUPER_ADMIN    in the BOOTSTRAP OPERATOR. This is the row that runs the business — it reviews
+ *                  the deposit queue and approves money. Its approval limit is tenant-scoped, and
+ *                  `AdminApprovalLimitService.evaluate()` fails closed, so a limit filed in any
+ *                  other tenant authorises nothing and the owner would be unable to approve with
+ *                  no error saying why. The limit must sit in the same tenant as the deposits.
+ *
+ *   PLATFORM_ADMIN in TENANT ZERO. This is the row that runs the platform — the only one whose
+ *                  X-Tenant-Id header is honoured, and therefore the only way to reach
+ *                  /v1/admin/tenants at all. `prisma/sql/006_tenant_isolation.sql` refuses to
+ *                  write a PLATFORM_ADMIN anywhere else, so tenant zero is not a preference here.
+ *                  It gets NO approval limit: the platform does not approve an operator's money.
+ *
+ * Seeding only the first would leave nobody able to create a second operator; seeding only the
+ * second would leave nobody able to approve a deposit. Both, or the deployment is stuck.
+ *
+ * Idempotency: the AdminUser is keyed on `(tenantId, telegramUserId)` — unique per tenant now, so
+ * the same human can hold a login in two operators without either one shadowing the other. The
+ * limit is versioned rather than mutated — `@@unique([adminUserId, currencyCode, effectiveFrom])`
+ * with `effectiveFrom` defaulting to now() means a blind upsert would append a new row on every
+ * run — so an OPEN limit (effectiveTo IS NULL) is treated as "already seeded" and left exactly as
+ * the operator left it.
  */
 import { AdminRole, type PrismaClient } from '@prisma/client';
+
+import { TENANT_BOOTSTRAP_ID, TENANT_ZERO_ID } from '@core/tenant/tenant.constants';
 
 /** 5,000,000.00 NSP per deposit. */
 const DEFAULT_SINGLE_LIMIT_MINOR = 500_000_000n;
@@ -37,6 +61,9 @@ export interface SeededAdmin {
   telegramUserId?: bigint;
   created?: boolean;
   limitCreated?: boolean;
+  /** The tenant-zero PLATFORM_ADMIN counterpart — see the header on why there are two rows. */
+  platformAdminUserId?: string;
+  platformAdminCreated?: boolean;
 }
 
 function readBigint(raw: string | undefined, fallback: bigint, label: string): bigint {
@@ -70,14 +97,19 @@ export async function seedAdmin(
   const displayName = env.SEED_ADMIN_DISPLAY_NAME?.trim() || 'Owner';
   const username = env.SEED_ADMIN_USERNAME?.trim().replace(/^@/, '') || null;
 
+  // The operator's owner. See the header: this row approves money, so it lives where the deposits
+  // and its own approval limit do.
+  const identity = { tenantId: TENANT_BOOTSTRAP_ID, telegramUserId };
+
   const existing = await prisma.adminUser.findUnique({
-    where: { telegramUserId },
+    where: { tenantId_telegramUserId: identity },
     select: { id: true },
   });
 
   const admin = await prisma.adminUser.upsert({
-    where: { telegramUserId },
+    where: { tenantId_telegramUserId: identity },
     create: {
+      tenantId: TENANT_BOOTSTRAP_ID,
       telegramUserId,
       username,
       displayName,
@@ -95,7 +127,12 @@ export async function seedAdmin(
   });
 
   const openLimit = await prisma.adminApprovalLimit.findFirst({
-    where: { adminUserId: admin.id, currencyCode, effectiveTo: null },
+    where: {
+      tenantId: TENANT_BOOTSTRAP_ID,
+      adminUserId: admin.id,
+      currencyCode,
+      effectiveTo: null,
+    },
     select: { id: true },
   });
 
@@ -103,6 +140,10 @@ export async function seedAdmin(
   if (openLimit === null) {
     await prisma.adminApprovalLimit.create({
       data: {
+        // The admin's own tenant, never an ambient one: a limit filed against a different operator
+        // than the admin it belongs to would silently authorise nothing, and fail-closed means the
+        // owner would simply be unable to approve with no error saying why.
+        tenantId: TENANT_BOOTSTRAP_ID,
         adminUserId: admin.id,
         currencyCode,
         maxSingleApprovalMinor: readBigint(
@@ -122,11 +163,47 @@ export async function seedAdmin(
     limitCreated = true;
   }
 
+  // ---- the platform counterpart -------------------------------------------------------------
+  // A separate row, in tenant zero, for the same human. Without it nobody can reach
+  // /v1/admin/tenants and the deployment can never create its second operator.
+  //
+  // No approval limit is written for it, and that is deliberate rather than an omission: the
+  // platform does not approve an operator's deposits, and evaluate() failing closed is the
+  // correct answer if it ever tries.
+  const platformIdentity = { tenantId: TENANT_ZERO_ID, telegramUserId };
+
+  const existingPlatform = await prisma.adminUser.findUnique({
+    where: { tenantId_telegramUserId: platformIdentity },
+    select: { id: true },
+  });
+
+  const platformAdmin = await prisma.adminUser.upsert({
+    where: { tenantId_telegramUserId: platformIdentity },
+    create: {
+      tenantId: TENANT_ZERO_ID,
+      telegramUserId,
+      // `username` is @@unique per tenant, and the operator row above already holds it. Leaving
+      // this null keeps the two rows distinguishable by tenant alone, which is what they are.
+      username: null,
+      displayName: `${displayName} (platform)`,
+      role: AdminRole.PLATFORM_ADMIN,
+      isActive: true,
+    },
+    update: {
+      // Same re-arming escape hatch as the operator row above.
+      role: AdminRole.PLATFORM_ADMIN,
+      isActive: true,
+    },
+    select: { id: true },
+  });
+
   return {
     skipped: false,
     adminUserId: admin.id,
     telegramUserId,
     created: existing === null,
     limitCreated,
+    platformAdminUserId: platformAdmin.id,
+    platformAdminCreated: existingPlatform === null,
   };
 }

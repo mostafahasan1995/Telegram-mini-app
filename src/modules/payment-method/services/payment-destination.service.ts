@@ -11,7 +11,7 @@
  * re-target historical payments. Retire the row and add a new one.
  */
 import { Injectable } from '@nestjs/common';
-import type { PaymentDestination } from '@prisma/client';
+import type { PaymentDestination, PaymentMethod } from '@prisma/client';
 
 import { PrismaService } from '@core/prisma/prisma.service';
 import { AuditService } from '@core/audit/audit.service';
@@ -69,7 +69,7 @@ export class PaymentDestinationService {
     paymentMethodId: string,
     includeInactive: boolean,
   ): Promise<AdminPaymentDestinationView[]> {
-    await this.assertMethodExists(paymentMethodId);
+    await this.loadMethodOrThrow(paymentMethodId);
     const rows = await this.destinations.listForMethod(paymentMethodId, !includeInactive);
     return rows.map(toAdminDestinationView);
   }
@@ -79,13 +79,17 @@ export class PaymentDestinationService {
     paymentMethodId: string,
     dto: CreatePaymentDestinationDto,
   ): Promise<AdminPaymentDestinationView> {
-    await this.assertMethodExists(paymentMethodId);
+    const method = await this.loadMethodOrThrow(paymentMethodId);
     const dailyCapMinor = toMinorOrNull(dto.dailyCap, 'dailyCap');
 
     const created = await this.prisma
       .runInTransaction(async (tx) => {
         const destination = await this.destinations.create(
           {
+            // Taken from the method rather than from the ambient context: the destination is the
+            // account money for THAT method lands in, so the two rows must never end up on
+            // different operators even if the request context somehow disagrees.
+            tenantId: method.tenantId,
             paymentMethodId,
             label: dto.label,
             accountIdentifier: dto.accountIdentifier,
@@ -180,7 +184,8 @@ export class PaymentDestinationService {
     return destination;
   }
 
-  private async assertMethodExists(paymentMethodId: string): Promise<void> {
+  /** Existence check and, for `create`, the row whose tenant the destination inherits. */
+  private async loadMethodOrThrow(paymentMethodId: string): Promise<PaymentMethod> {
     const method = await this.methods.findById(paymentMethodId);
     if (method === null) {
       throw new NotFoundError(
@@ -188,6 +193,7 @@ export class PaymentDestinationService {
         'That payment method does not exist.',
       );
     }
+    return method;
   }
 
   private snapshot(destination: PaymentDestination): Record<string, unknown> {

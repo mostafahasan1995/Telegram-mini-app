@@ -16,6 +16,7 @@ import { Prisma, type PaymentMethod } from '@prisma/client';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { AuditService } from '@core/audit/audit.service';
 import { isForeignKeyConstraintError, isUniqueConstraintError } from '@core/prisma/prisma-errors';
+import { requireEffectiveTenantId } from '@core/tenant';
 import { formatMinorToDecimal } from '@common/helpers/money.util';
 import { adminActor } from '@common/types/actor.type';
 import {
@@ -67,7 +68,9 @@ export class PaymentMethodService {
   }
 
   async getActiveByCode(code: string): Promise<PaymentMethod> {
-    const method = await this.methods.findByCode(code);
+    // Effective, not home: a platform admin inspecting operator X must resolve X's SYRIATEL_CASH,
+    // not the identically coded method belonging to whoever they are homed in.
+    const method = await this.methods.findByCode(requireEffectiveTenantId(), code);
     if (method === null) {
       throw new NotFoundError(
         PaymentMethodErrorCodes.PAYMENT_METHOD_NOT_FOUND,
@@ -131,6 +134,9 @@ export class PaymentMethodService {
       .runInTransaction(async (tx) => {
         const method = await this.methods.create(
           {
+            // The method belongs to the operator being administered, which for a platform admin
+            // acting on behalf of one is the effective tenant rather than their own tenant zero.
+            tenantId: requireEffectiveTenantId(),
             code: dto.code,
             displayName: dto.displayName,
             rail: dto.rail,

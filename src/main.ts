@@ -20,6 +20,7 @@ import {
 import { TransformInterceptor } from '@common/interceptors/transform.interceptor';
 import { AppConfigService } from '@core/config/config.service';
 import { IDEMPOTENCY_HEADER } from '@core/idempotency/idempotency.constants';
+import { TENANT_HEADER, TenantContextMiddleware } from '@core/tenant';
 import { findUnmatchedRules } from '@core/throttler/throttle-routes';
 
 import { AppModule } from './app.module';
@@ -136,6 +137,17 @@ export function configureApiApp(app: NestExpressApplication, config: AppConfigSe
   // turns AuthGuard's principal into the Actor the audit stamping reads. See the file header.
   app.use(requestContextMiddleware);
 
+  // SECOND, and still before any guard: reads the signed `tid` claim off the access token and runs
+  // the rest of the request inside that tenant's AsyncLocalStorage context. AuthGuard resolves the
+  // admin identity by (tenantId, telegramUserId), so the tenant has to be established before it —
+  // which is why this is pre-router middleware and not an interceptor.
+  //
+  // Resolved from the container rather than imported as a function because it needs JwtService:
+  // nothing has authenticated yet here, so it verifies the token itself. A token it cannot verify
+  // simply yields no tenant context; AuthGuard then produces the canonical 401 envelope.
+  const tenantContext = app.get(TenantContextMiddleware);
+  app.use(tenantContext.use.bind(tenantContext));
+
   // This api owns its body parsing (see API_APP_OPTIONS.bodyParser === false): one route needs
   // megabytes, nothing else may have them, and a malformed body must not be reported as a 500.
   // The error handler goes immediately after the parsers — Express walks the stack FORWARD from
@@ -178,7 +190,16 @@ export function configureApiApp(app: NestExpressApplication, config: AppConfigSe
     },
     credentials: true,
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['authorization', 'content-type', IDEMPOTENCY_HEADER, CORRELATION_ID_HEADER],
+    // TENANT_HEADER is listed because without it the browser strips X-Tenant-Id at preflight and
+    // the console's operator switcher silently reads the platform admin's own tenant instead —
+    // a wrong answer that looks exactly like a right one.
+    allowedHeaders: [
+      'authorization',
+      'content-type',
+      IDEMPOTENCY_HEADER,
+      CORRELATION_ID_HEADER,
+      TENANT_HEADER,
+    ],
     // Without these the mini-app cannot read them: the correlation id it should show in an error
     // toast, and the rate-limit headers it should back off on.
     exposedHeaders: [

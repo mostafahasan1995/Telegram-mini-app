@@ -69,7 +69,10 @@ export class ProofIngestService {
 
     const deposit = await this.prisma.depositRequest.findUniqueOrThrow({
       where: { id: proof.depositRequestId },
-      select: { id: true, playerId: true, shortId: true },
+      // `tenantId` rides along because every row this job writes hangs off THIS deposit. The media
+      // queue has no request and therefore no ambient tenant; the parent row is the only honest
+      // answer to "whose operator is this?".
+      select: { id: true, tenantId: true, playerId: true, shortId: true },
     });
 
     if (isNormalizedKey(proof.storageKey)) {
@@ -130,6 +133,7 @@ export class ProofIngestService {
       // does not change the deposit's STATUS, so this row records the finding without a state move.
       await tx.depositTransition.create({
         data: {
+          tenantId: deposit.tenantId,
           depositRequestId: deposit.id,
           fromStatus: null,
           toStatus: (
@@ -259,7 +263,7 @@ export class ProofIngestService {
 
   private async markUnreadable(
     proof: DepositProof,
-    deposit: { id: string; playerId: string; shortId: string },
+    deposit: { id: string; tenantId: string; playerId: string; shortId: string },
     cause: unknown,
   ): Promise<IngestOutcome> {
     const reason = isFileStorageError(cause)
@@ -277,6 +281,7 @@ export class ProofIngestService {
       });
       await tx.depositTransition.create({
         data: {
+          tenantId: deposit.tenantId,
           depositRequestId: deposit.id,
           fromStatus: null,
           toStatus: current.status,

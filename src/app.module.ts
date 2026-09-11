@@ -38,6 +38,7 @@ import { OutboxModule } from '@core/outbox/outbox.module';
 import { PrismaModule } from '@core/prisma/prisma.module';
 import { QueueModule } from '@core/queue/queue.module';
 import { TelegramModule } from '@core/telegram/telegram.module';
+import { TenantModule } from '@core/tenant/tenant.module';
 import { AppThrottlerModule } from '@core/throttler/throttler.module';
 
 import { AdminModule } from '@modules/admin/admin.module';
@@ -59,6 +60,10 @@ import { FeaturePortsModule } from './feature-ports.module';
 
     // ---- infrastructure (all @Global; listed to document the dependency, not to scope it) --
     ActorContextModule,
+    // Must precede AuthModule: TenantContextMiddleware establishes the HOME tenant that
+    // AdminIdentityService resolves identity in, and TenantOverrideInterceptor is the APP_INTERCEPTOR
+    // that decides X-Tenant-Id. The middleware itself is installed in main.ts, before the router.
+    TenantModule,
     PrismaModule,
     CacheModule,
     QueueModule,

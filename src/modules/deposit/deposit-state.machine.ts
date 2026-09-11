@@ -263,6 +263,11 @@ export class DepositStateMachine {
 
     await tx.depositTransition.create({
       data: {
+        // The history row belongs to the deposit's OWN operator, taken off the row we just locked —
+        // never from the ambient request context. A platform admin acting on operator X's deposit
+        // would otherwise file the explanation of that move under tenant zero, and the audit trail
+        // for X would show a status change nobody can account for.
+        tenantId: deposit.tenantId,
         depositRequestId: input.depositRequestId,
         fromStatus: from,
         toStatus: input.to,

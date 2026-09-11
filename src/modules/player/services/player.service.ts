@@ -83,14 +83,29 @@ export class PlayerService {
   /**
    * First sight or returning visit. Takes `tx` so the caller can commit the player row and the
    * login audit together — a session that exists without the row it belongs to is unexplainable.
+   *
+   * `tenantId` is explicit rather than read from the ambient context because the two callers are
+   * both sign-in paths: @Public() routes that arrive with no token, and therefore with no tenant
+   * context to read. Signing in is what ESTABLISHES the tenant, so it cannot also depend on it.
+   *
+   * It is returned alongside `playerId` for the same reason the session needs it: an existing
+   * player's row already names an operator, and the session must be stamped with THAT one rather
+   * than with whatever the caller assumed. PlayerView deliberately does not carry it — that type
+   * is a client-facing allow-list.
    */
   async upsertFromTelegram(
     tx: Tx,
+    tenantId: string,
     profile: TelegramProfile,
     currencyCode: string,
-  ): Promise<{ player: PlayerView; playerId: string; isNew: boolean }> {
-    const before = await this.players.findByTelegramUserId(profile.telegramUserId, tx);
-    const player = await this.players.upsertFromTelegram(profile, currencyCode, tx);
+  ): Promise<{
+    player: PlayerView;
+    playerId: string;
+    tenantId: string;
+    isNew: boolean;
+  }> {
+    const before = await this.players.findByTelegramUserId(tenantId, profile.telegramUserId, tx);
+    const player = await this.players.upsertFromTelegram(tenantId, profile, currencyCode, tx);
     const isNew = before === null;
 
     if (isNew) {
@@ -107,7 +122,14 @@ export class PlayerService {
       });
     }
 
-    return { player: toPlayerView(player), playerId: player.id, isNew };
+    return {
+      player: toPlayerView(player),
+      playerId: player.id,
+      // The ROW's tenant, not the argument: a returning player keeps the operator they registered
+      // with even if the caller guessed a different one.
+      tenantId: player.tenantId,
+      isNew,
+    };
   }
 
   /**

@@ -15,6 +15,8 @@ import { DepositErrorCodes } from '../enums/deposit-error-code.enum';
 import type { PlayerLinkPort } from '../ports';
 import { CreditRetryLaterError, DepositCreditService } from './deposit-credit.service';
 
+/** Self-contained: these cases never cross an operator boundary, they only need a tenant to exist. */
+const TENANT_ID = '99999999-8888-4777-8666-555555555555';
 const DEPOSIT_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const PLAYER_ID = '11111111-2222-4333-8444-555555555555';
 const ICHANCY_PLAYER_ID = 'ich-123';
@@ -23,6 +25,7 @@ const AMOUNT = 150_000n; // 1500.00 NSP
 function makeDeposit(overrides: Partial<DepositRequest> = {}): DepositRequest {
   return {
     id: DEPOSIT_ID,
+    tenantId: TENANT_ID,
     shortId: 'K7Q2ZP9V3M',
     playerId: PLAYER_ID,
     paymentMethodId: '22222222-3333-4444-8555-666666666666',

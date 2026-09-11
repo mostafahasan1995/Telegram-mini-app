@@ -3,9 +3,11 @@
  *
  * ORDER IS A DEPENDENCY, not a preference:
  *   1. currency        — every other table has a currency_code foreign key
- *   2. payment methods — each rail's UUID is the scope of three ledger accounts
- *   3. ledger accounts — codes are built from those UUIDs
- *   4. admin           — needs the currency for its approval limit
+ *   2. tenants         — every tenant-scoped table has a tenant_id foreign key, so nothing below
+ *                        this line can be inserted until the two baseline operators exist
+ *   3. payment methods — each rail's UUID is the scope of three ledger accounts
+ *   4. ledger accounts — codes are built from those UUIDs
+ *   5. admin           — needs the currency for its approval limit, and both tenants to exist
  *
  * WHY THIS REFUSES TO RUN IN PRODUCTION BY DEFAULT: seeding creates payment destinations holding
  * PLACEHOLDER account numbers and re-activates the owner account. Both are exactly right on a
@@ -34,6 +36,7 @@ import { seedAdmin } from './seed/admin.seed';
 import { seedCurrency } from './seed/currency.seed';
 import { seedLedgerAccounts } from './seed/ledger-account.seed';
 import { seedPaymentMethods } from './seed/payment-method.seed';
+import { seedTenancy } from './seed/tenant.seed';
 
 function assertNotProduction(env: NodeJS.ProcessEnv): void {
   if (env.NODE_ENV !== 'production') return;
@@ -59,6 +62,16 @@ async function main(): Promise<void> {
         `(${currency.created ? 'created' : 'already present'})`,
     );
 
+    // Before everything below it: a tenant_id foreign key has to point at a row that exists.
+    const tenancy = await seedTenancy(prisma, currency.code);
+    console.warn(
+      `[seed] tenant ${tenancy.platform.slug} ` +
+        `(${tenancy.platform.created ? 'created' : 'already present'}), ` +
+        `tenant ${tenancy.bootstrap.slug} ` +
+        `(${tenancy.bootstrap.created ? 'created' : 'already present'}), ` +
+        `platform defaults ${tenancy.defaultsCreated ? 'created' : 'already present'}`,
+    );
+
     const methods = await seedPaymentMethods(prisma, currency.code);
     for (const method of methods) console.warn(`[seed] payment method ${method.code}`);
 
@@ -82,6 +95,11 @@ async function main(): Promise<void> {
           `(${admin.created ? 'created' : 'already present'}), ` +
           `approval limit ${admin.limitCreated ? 'created' : 'already present'}`,
       );
+      console.warn(
+        `[seed] platform admin in tenant zero ` +
+          `(${admin.platformAdminCreated ? 'created' : 'already present'}) — ` +
+          'the only role that may reach /v1/admin/tenants',
+      );
     }
 
     // The single most consequential thing an operator can forget. Printed last so it is the line
@@ -93,6 +111,21 @@ async function main(): Promise<void> {
       console.warn('[seed] # A player paying into them sends money NOWHERE.           #');
       console.warn('[seed] # Replace them before accepting real deposits:             #');
       console.warn('[seed] #   POST /v1/admin/payment-methods/:id/destinations        #');
+      console.warn('[seed] ############################################################');
+    }
+
+    // The other thing an operator cannot discover on their own: a tenant whose sealed columns hold
+    // placeholders looks completely normal until the bot fails to answer.
+    if (tenancy.secretsArePlaceholders) {
+      console.warn('');
+      console.warn('[seed] ############################################################');
+      console.warn('[seed] # THE BOOTSTRAP OPERATOR HOLDS PLACEHOLDER SECRETS.        #');
+      console.warn('[seed] # Its bot cannot answer and Ichancy cannot be signed into. #');
+      console.warn('[seed] # Set TELEGRAM_BOT_TOKEN / ICHANCY_PASSWORD / JWT_SECRET   #');
+      console.warn('[seed] # and replace them through the platform console —          #');
+      console.warn('[seed] # RE-RUNNING THIS SEED WILL NOT REPAIR THEM. Every tenant  #');
+      console.warn('[seed] # upsert has an empty update clause on purpose, so that a  #');
+      console.warn('[seed] # redeploy cannot revert an audited operator decision.     #');
       console.warn('[seed] ############################################################');
     }
 

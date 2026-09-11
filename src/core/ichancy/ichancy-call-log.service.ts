@@ -12,6 +12,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import type { IchancyOperation, IchancyOutcome, Prisma } from '@prisma/client';
 // ASSUMPTION: the prisma agent exposes `PrismaService` (extending PrismaClient) at this path.
 import { PrismaService } from '@core/prisma/prisma.service';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 export const ICHANCY_CALL_LOG = 'ICHANCY_CALL_LOG';
 
@@ -95,8 +96,14 @@ export class IchancyCallLogService implements IchancyCallLogPort {
         : (redactSecrets(entry.responseBody) as Prisma.InputJsonValue);
 
     try {
+      // Resolved inside the try on purpose: this row belongs to the operator whose deposit provoked
+      // the call, and if that context is missing (a worker that never entered runWithTenant) the
+      // throw must be swallowed with everything else here rather than fail a settled money call.
+      const tenantId = requireEffectiveTenantId();
+
       await this.prisma.ichancyCall.create({
         data: {
+          tenantId,
           operation: entry.operation,
           attempt: entry.attempt,
           httpStatus: entry.httpStatus,
