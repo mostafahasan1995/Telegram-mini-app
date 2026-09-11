@@ -115,6 +115,20 @@ rather than schedulable, and are folded into the phases above:
 
 ### Phase 1 — Multi-tenant core — everything else depends on it
 
+> ## ✅ DONE — 2026-09-11 (`feat/phase-1-multi-tenant-core`)
+>
+> The **structural spine** of this phase is built and verified: the `Tenant` root, `PlatformDefaults`,
+> `PLATFORM_ADMIN`, `tenant_id` on all 20 operational models with composite unique keys, the
+> HOME/EFFECTIVE split, `TenantContextMiddleware`, `TenantOverrideInterceptor`, the runtime scoping
+> extension, the data migration, `prisma/sql/006`, and tenant contexts for every worker and cron.
+>
+> `tsc` 0 · eslint 0 · 897/898 unit tests. See `docs/STATUS.md` for the evidence table.
+>
+> **Still open in this phase — the 16 `/v1/admin/tenants` HTTP endpoints below.** The spine they need
+> now exists, so they are ordinary CRUD plus the provisioning pipeline; none of them is a blocker for
+> Phase 2, which only needs `tid` and `PLATFORM_ADMIN`. The two rows those endpoints would create are
+> seeded today by `prisma/seed/tenant.seed.ts`.
+
 *Domains: `tenants` — 26 gaps (14 blockers)*
 
 **Schema work first:**
