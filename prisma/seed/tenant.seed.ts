@@ -256,23 +256,75 @@ export async function seedTenancy(
   // next week, and the second seed run must not undo the first.
   const repair: Prisma.TenantUpdateInput = {};
   if (existingBootstrap !== null) {
-    if (isMigrationSentinel(existingBootstrap.botTokenEnc) && !botToken.isPlaceholder) {
-      repair.botTokenEnc = botToken.value;
-    }
-    if (isMigrationSentinel(existingBootstrap.ichancyPasswordEnc) && !ichancyPassword.isPlaceholder) {
-      repair.ichancyPasswordEnc = ichancyPassword.value;
-    }
-    if (isMigrationSentinel(existingBootstrap.ichancyUsername)) {
-      const username = readOptionalText(env.ICHANCY_USERNAME);
-      if (username !== null) repair.ichancyUsername = username;
-    }
-    if (isMigrationSentinel(existingBootstrap.ichancyAgentId)) {
-      const agentId = readOptionalText(env.ICHANCY_AGENT_ID);
-      if (agentId !== null) repair.ichancyAgentId = agentId;
-    }
+    // Each field resolves to what the row WILL hold after this run: the repaired value when we are
+    // replacing a sentinel, otherwise whatever is already there. Deciding anything from `repair`
+    // itself is awkward — Prisma's update inputs are `string | StringFieldUpdateOperationsInput` —
+    // and the point of these four is to be plainly readable.
+    const nextBotToken =
+      isMigrationSentinel(existingBootstrap.botTokenEnc) && !botToken.isPlaceholder
+        ? botToken.value
+        : existingBootstrap.botTokenEnc;
+
+    const nextIchancyPassword =
+      isMigrationSentinel(existingBootstrap.ichancyPasswordEnc) && !ichancyPassword.isPlaceholder
+        ? ichancyPassword.value
+        : existingBootstrap.ichancyPasswordEnc;
+
+    const nextIchancyUsername = isMigrationSentinel(existingBootstrap.ichancyUsername)
+      ? (readOptionalText(env.ICHANCY_USERNAME) ?? existingBootstrap.ichancyUsername)
+      : existingBootstrap.ichancyUsername;
+
+    const nextIchancyAgentId = isMigrationSentinel(existingBootstrap.ichancyAgentId)
+      ? (readOptionalText(env.ICHANCY_AGENT_ID) ?? existingBootstrap.ichancyAgentId)
+      : existingBootstrap.ichancyAgentId;
+
     // 0 is the migration's "not configured": Telegram never issues chat id 0.
-    if (existingBootstrap.adminChatId === 0n && adminChatId !== null) {
-      repair.adminChatId = adminChatId;
+    const nextAdminChatId =
+      existingBootstrap.adminChatId === 0n && adminChatId !== null
+        ? adminChatId
+        : existingBootstrap.adminChatId;
+
+    if (nextBotToken !== existingBootstrap.botTokenEnc) repair.botTokenEnc = nextBotToken;
+    if (nextIchancyPassword !== existingBootstrap.ichancyPasswordEnc) {
+      repair.ichancyPasswordEnc = nextIchancyPassword;
+    }
+    if (nextIchancyUsername !== existingBootstrap.ichancyUsername) {
+      repair.ichancyUsername = nextIchancyUsername;
+    }
+    if (nextIchancyAgentId !== existingBootstrap.ichancyAgentId) {
+      repair.ichancyAgentId = nextIchancyAgentId;
+    }
+    if (nextAdminChatId !== existingBootstrap.adminChatId) repair.adminChatId = nextAdminChatId;
+
+    /**
+     * Finish the job the migration could not.
+     *
+     * It writes the row SUSPENDED precisely BECAUSE the credentials were sentinels: an operator
+     * able to serve with them would fail against Telegram and Ichancy on its first real request
+     * rather than at the moment somebody looks at it. Once this run has replaced them that reason
+     * is gone — and leaving it SUSPENDED means a fresh install comes up with real credentials and
+     * an operator that is switched off, with nothing anywhere saying why.
+     *
+     * Narrow on purpose, so a human's suspension is never reverted:
+     *   - only FROM SUSPENDED, the value the migration wrote;
+     *   - only when this run actually repaired something;
+     *   - only when nothing is left unconfigured.
+     * On a row whose credentials a human already set, no repair happens, so this cannot fire.
+     */
+    const fullyConfigured =
+      !isMigrationSentinel(nextBotToken) &&
+      !nextBotToken.startsWith(PLACEHOLDER_PREFIX) &&
+      !isMigrationSentinel(nextIchancyPassword) &&
+      !nextIchancyPassword.startsWith(PLACEHOLDER_PREFIX) &&
+      !isMigrationSentinel(nextIchancyUsername) &&
+      nextAdminChatId !== 0n;
+
+    if (
+      Object.keys(repair).length > 0 &&
+      fullyConfigured &&
+      existingBootstrap.status === TenantStatus.SUSPENDED
+    ) {
+      repair.status = TenantStatus.ACTIVE;
     }
   }
 
