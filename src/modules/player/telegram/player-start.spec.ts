@@ -20,6 +20,8 @@
  */
 import type { Context } from 'grammy';
 
+import { TENANT_BOOTSTRAP_ID } from '@core/tenant';
+
 import { PlayerTelegramHandlers } from './player.handlers';
 
 const TELEGRAM_USER_ID = 912911246;
@@ -46,9 +48,12 @@ function harness(options: { isNew?: boolean; alreadyLinked?: boolean } = {}): Ha
   const replies: string[] = [];
   const adminMessages: { chatId: string; text: string }[] = [];
 
+  // Shaped like the real return, tenant included: PlayerService reports the tenant of the ROW it
+  // found, which is the one a returning player keeps even when the caller asks for another.
   const upsertFromTelegram = jest.fn().mockResolvedValue({
     player: {},
     playerId: PLAYER_ID,
+    tenantId: TENANT_BOOTSTRAP_ID,
     isNew,
   });
 
@@ -123,10 +128,28 @@ describe('/start registers the player under our agent', () => {
     await h.handlers.onStart(ctxOf(h.handlers));
 
     expect(h.upsertFromTelegram).toHaveBeenCalledTimes(1);
-    const profile = h.upsertFromTelegram.mock.calls[0]?.[1] as { telegramUserId: bigint };
-    expect(profile.telegramUserId).toBe(BigInt(TELEGRAM_USER_ID));
+    // (tx, tenantId, profile, currencyCode): the tenant sits between the transaction and the
+    // profile, so everything after it is read one position later than it used to be.
+    const call = h.upsertFromTelegram.mock.calls[0] as [
+      unknown,
+      string,
+      { telegramUserId: bigint },
+      string,
+    ];
+    expect(call[2].telegramUserId).toBe(BigInt(TELEGRAM_USER_ID));
     // The currency the agent actually operates in, not a per-player choice.
-    expect(h.upsertFromTelegram.mock.calls[0]?.[2]).toBe('NSP');
+    expect(call[3]).toBe('NSP');
+  });
+
+  it('files the player under the bot operator, not whatever tenant is ambient', async () => {
+    // A Telegram update carries no tenant of its own — no request, no header — so the handler names
+    // one itself: BOT_TENANT_ID in player.handlers.ts, which is TENANT_BOOTSTRAP_ID for as long as
+    // there is a single bot. Asserting the value is what stops a future second operator's players
+    // from being filed under whichever tenant happened to be ambient when the update landed.
+    const h = harness();
+    await h.handlers.onStart(ctxOf(h.handlers));
+
+    expect(h.upsertFromTelegram.mock.calls[0]?.[1]).toBe(TENANT_BOOTSTRAP_ID);
   });
 
   it('registers the Ichancy account ON /start, not at the first credit', async () => {

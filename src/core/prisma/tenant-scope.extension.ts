@@ -79,7 +79,27 @@ const FILTERED_OPERATIONS: ReadonlySet<string> = new Set([
  * exact call site it applies to, and so that grepping for it lists every cross-tenant read in the
  * codebase. Reviewers should treat each one as a security-relevant line.
  */
-export const ALL_TENANTS = Symbol.for('prisma.allTenants');
+export const ALL_TENANTS = Symbol.for('prisma.allTenants')
+
+/**
+ * The way to spell that marker at a call site:
+ *
+ *   prisma.outboxMessage.findMany({ where: acrossTenants({ status: 'PENDING' }) })
+ *
+ * WHY A HELPER AND NOT THE SYMBOL INLINE: Prisma's generated `*WhereInput` types are closed, so
+ * `{ status, [ALL_TENANTS]: true }` fails the excess-property check and every call site would have
+ * to annotate its way around it — which is how three different idioms for one idea appear in one
+ * codebase. The cast lives here, once, with this comment next to it.
+ *
+ * The return type is the caller's own `T`, so nothing downstream loses type safety; the extension
+ * strips the marker before Prisma ever sees the object.
+ *
+ * Grepping `acrossTenants` lists every deliberately cross-operator read in the codebase. Treat each
+ * one as a security-relevant line in review.
+ */
+export function acrossTenants<T extends object>(where?: T): T {
+  return { ...(where ?? ({} as T)), [ALL_TENANTS]: true };
+}
 
 interface MaybeScopedWhere {
   tenantId?: unknown;
@@ -118,7 +138,7 @@ export const tenantScopeExtension = Prisma.defineExtension({
           return query(args);
         }
 
-        return query({ ...typed, where: { ...where, tenantId } } as typeof args);
+        return query({ ...typed, where: { ...where, tenantId } });
       },
     },
   },

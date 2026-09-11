@@ -18,10 +18,22 @@
  * HOUSE_ROUNDING is the only account with an ANY sign policy — every other account would refuse one
  * of the two directions. The posting is labelled AGENT_FLOAT_SYNC and carries the operator's note, so
  * it is never mistaken for a real movement.
+ *
+ * ══ ONE FLOAT PER OPERATOR ══════════════════════════════════════════════════════════════════
+ * The float is not a platform number: every operator funds its own credits out of its own agent
+ * wallet, against its own ICHANCY_AGENT_FLOAT_<ccy> account, in its own currency. So `sync()` is a
+ * SINGLE-OPERATOR operation that demands a tenant context, and the tick — which has no request and
+ * therefore no context — reads the operator list and runs the whole comparison once per operator
+ * inside `runWithTenant()`. That is the "iterate operators" sweep shape: the unit of work is a
+ * per-operator report, not a row to be claimed, so there is nothing to scan across tenants.
+ *
+ * One operator's failure must not end the sweep, so each pass is caught on its own. `runAsPlatform`
+ * would be exactly wrong here: a float drift is the OPERATOR's money problem and a break filed
+ * against the platform is a break nobody who can fix it will ever see.
  */
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
-import { BreakCategory, LedgerTxKind } from '@prisma/client';
+import { BreakCategory, LedgerTxKind, TenantStatus } from '@prisma/client';
 
 import type { AuthenticatedAdmin } from '@common/decorators/auth.types';
 import { BusinessRuleError } from '@common/exceptions/app.exception';
@@ -41,6 +53,7 @@ import {
 } from '@core/ledger';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { BotService } from '@core/telegram/services/bot.service';
+import { requireEffectiveTenantId, runWithTenant } from '@core/tenant';
 
 import { ReconciliationErrorCodes } from '../enums/reconciliation-error-code.enum';
 import {
@@ -113,7 +126,22 @@ export class AgentFloatSyncService {
     if (handle === null) return;
 
     try {
-      await this.sync(this.config.ichancy.currency);
+      for (const tenant of await this.operators()) {
+        try {
+          // The OPERATOR's currency, not the platform's Ichancy setting: the float account is
+          // denominated in whatever that operator sells in, and reading a currency it does not
+          // trade in would compare an empty ledger account against a live wallet and manufacture a
+          // drift the size of the whole float.
+          await runWithTenant(tenant.id, () => this.sync(tenant.currencyCode));
+        } catch (cause) {
+          // Per operator: an Ichancy outage or a missing account for one must not stop the sweep
+          // reaching the rest, which is the whole reason a sweep exists.
+          this.logger.error(
+            `agent float sync failed for tenant ${tenant.id}: ` +
+              `${cause instanceof Error ? cause.message : String(cause)}`,
+          );
+        }
+      }
     } catch (cause) {
       this.logger.error(
         `agent float sync failed: ${cause instanceof Error ? cause.message : String(cause)}`,
@@ -123,8 +151,33 @@ export class AgentFloatSyncService {
     }
   }
 
-  /** Read both sides, compare, and record. Safe to call from an admin endpoint. */
+  /**
+   * The operators to sweep. ACTIVE only: a SUSPENDED or CLOSED operator takes no money, so its
+   * float cannot drift, and comparing it would open breaks against a book nobody is keeping.
+   *
+   * No ALL_TENANTS marker: `tenants` is the registry itself and carries no `tenant_id`, so the
+   * tenant-scope extension leaves it alone by construction. It is still a cross-operator read, and
+   * a deliberate one — this list IS the sweep.
+   */
+  private async operators(): Promise<{ id: string; currencyCode: string }[]> {
+    return this.prisma.tenant.findMany({
+      where: { status: TenantStatus.ACTIVE },
+      select: { id: true, currencyCode: true },
+      orderBy: { slug: 'asc' },
+    });
+  }
+
+  /**
+   * Read both sides, compare, and record — for ONE operator. Safe to call from an admin endpoint,
+   * where the middleware has already opened the context.
+   *
+   * The tenant is read once, up front, rather than at the break: this reads an operator's ledger
+   * account and its agent wallet, and doing that with no idea whose books they are is not a sync
+   * with a missing label, it is an answer about an arbitrary operator. Better to fail here than to
+   * report a stranger's float as yours.
+   */
   async sync(currencyCode: string): Promise<FloatSyncResult> {
+    const tenantId = requireEffectiveTenantId();
     const ledgerMinor = await this.ledgerFloat(currencyCode);
 
     const wallet = await this.ichancy.getAgentWallet({ correlationId: 'agent-float-sync' });
@@ -150,7 +203,7 @@ export class AgentFloatSyncService {
     const belowWatermark = ichancyMinor < this.config.limits.agentFloatLowWatermarkMinor;
 
     if (belowWatermark) {
-      await this.warnLowFloat(currencyCode, ichancyMinor);
+      await this.warnLowFloat(tenantId, currencyCode, ichancyMinor);
     }
 
     if (absolute(deltaMinor) <= AGENT_FLOAT_TOLERANCE_MINOR) {
@@ -165,6 +218,9 @@ export class AgentFloatSyncService {
       ichancyAgentFloatCode(currencyCode),
     );
     const opened = await this.breaks.observeStandalone({
+      // Named explicitly even though the ambient context says the same thing: a break is the one
+      // row here that outlives the tick, and it must be unambiguous whose book it is about.
+      tenantId,
       category: BreakCategory.AGENT_FLOAT_MISMATCH,
       severity: SEVERITY_FLOAT_DRIFT,
       currencyCode,
@@ -210,8 +266,13 @@ export class AgentFloatSyncService {
     admin: AuthenticatedAdmin;
     note: string;
   }): Promise<{ ledgerTransactionId: string; deltaMinor: bigint }> {
+    // EFFECTIVE, not the admin's home tenant, and written out by hand because `findUnique` is
+    // deliberately NOT rewritten by the tenant-scope extension — see ReconciliationBreakService
+    // .resolve, which guards the same way. Without it a break id belonging to another operator
+    // would be corrected here, and a correction POSTS MONEY.
+    const tenantId = requireEffectiveTenantId();
     const record = await this.prisma.reconciliationBreak.findUnique({
-      where: { id: input.breakId },
+      where: { id: input.breakId, tenantId },
     });
     if (record === null || record.category !== BreakCategory.AGENT_FLOAT_MISMATCH) {
       throw new BusinessRuleError(
@@ -286,10 +347,18 @@ export class AgentFloatSyncService {
    * until a human tops it up — un-throttled, that is 72 identical warnings a day, and the 73rd is
    * the one nobody reads. One warning per window keeps the signal; /float always shows the live
    * number on demand.
+   *
+   * WHY the key names the tenant: two operators trading in the same currency would otherwise share
+   * one throttle, and the first one to run empty would silence the warning for the second — whose
+   * credits then start failing with nobody told.
    */
-  private async warnLowFloat(currencyCode: string, availableMinor: bigint): Promise<void> {
+  private async warnLowFloat(
+    tenantId: string,
+    currencyCode: string,
+    availableMinor: bigint,
+  ): Promise<void> {
     const first = await this.redis.set(
-      `recon:float-low-warned:${currencyCode}`,
+      `recon:float-low-warned:${tenantId}:${currencyCode}`,
       new Date().toISOString(),
       'EX',
       LOW_FLOAT_WARN_WINDOW_SECONDS,

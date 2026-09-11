@@ -27,6 +27,19 @@
  *
  * So: this service is present in both roles and owns the work; the cron is a thin, worker-only
  * wrapper that owns only the schedule and the leader lock.
+ *
+ * WHY THE PASS IS NOT WRAPPED IN ONE TENANT:
+ *
+ * A sweep is a repair for EVERY operator, so pinning the tick to a single tenant would quietly stop
+ * repairing all the others — worse than the leak it would be fixing. Instead the scan is an explicit
+ * cross-operator read (see `scanScope`) that selects `tenantId`, and each candidate is then
+ * transitioned inside its OWN tenant, so the transition, the audit row and the outbox message all
+ * name the operator whose deposit it is.
+ *
+ * The scans are written here rather than in DepositRepository because they are the only reads in
+ * the module that deliberately cross operators: they need the ALL_TENANTS marker and the tenant_id
+ * column, and burying that in a shared repository method would make every other caller of it a
+ * cross-tenant read by accident.
  */
 import { Injectable, Logger } from '@nestjs/common';
 import { DepositStatus } from '@prisma/client';
@@ -36,6 +49,8 @@ import { AuditService } from '@core/audit/audit.service';
 import { AppConfigService } from '@core/config/config.service';
 import { OutboxService } from '@core/outbox/outbox.service';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { ALL_TENANTS } from '@core/prisma/tenant-scope.extension';
+import { getEffectiveTenantId, runWithTenant } from '@core/tenant';
 
 import {
   CREDITING_STUCK_MINUTES,
@@ -44,7 +59,6 @@ import {
   REVIEW_CLAIM_MINUTES,
 } from '../deposit.constants';
 import { DepositStateMachine } from '../deposit-state.machine';
-import { DepositRepository } from '../repositories/deposit.repository';
 
 /** Bounded per pass so one sweep cannot hold connections for minutes on a backlog. */
 const BATCH_SIZE = 100;
@@ -62,7 +76,6 @@ export class DepositSweepService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly deposits: DepositRepository,
     private readonly stateMachine: DepositStateMachine,
     private readonly outbox: OutboxService,
     private readonly audit: AuditService,
@@ -80,44 +93,75 @@ export class DepositSweepService {
 
   // ---------------------------------------------------------------------------------------------
 
+  /**
+   * Which operators a scan may see. The sweep runs from two places and they must NOT see the same
+   * rows:
+   *
+   *  - THE CRON has no request and therefore no ambient tenant. It must cover every operator, so the
+   *    scan is marked as a deliberate cross-operator read. Note that WITHOUT the marker the query
+   *    would span every operator anyway — the extension injects nothing when there is no context —
+   *    so the marker changes no behaviour here. It changes who can see the decision: a reviewer
+   *    grepping ALL_TENANTS finds this line, and nobody later "fixes" it by adding a tenant.
+   *
+   *  - THE ADMIN PANEL's "run the sweep now" button arrives on a request, which HAS a tenant. There
+   *    the marker is withheld so the extension scopes the scan to the caller's own operator: an
+   *    operator's admin pressing a button must not expire, release or reap another operator's
+   *    deposits. (A platform admin using X-Tenant-Id sweeps the operator they pointed at, which is
+   *    the same rule.)
+   */
+  private scanScope(): { [ALL_TENANTS]?: true } {
+    return getEffectiveTenantId() === undefined ? { [ALL_TENANTS]: true } : {};
+  }
+
   private async expireUnpaid(now: Date): Promise<number> {
-    const candidates = await this.deposits.findExpiredOpenIds(this.prisma, now, BATCH_SIZE);
+    const candidates = await this.prisma.depositRequest.findMany({
+      where: {
+        ...this.scanScope(),
+        status: { in: [DepositStatus.DRAFT, DepositStatus.AWAITING_PROOF] },
+        expiresAt: { lt: now },
+      },
+      orderBy: { expiresAt: 'asc' },
+      take: BATCH_SIZE,
+      select: { id: true, tenantId: true },
+    });
     let expired = 0;
 
     for (const candidate of candidates) {
-      const done = await this.prisma.runInTransaction(async (tx) => {
-        const outcome = await this.stateMachine.transition(tx, {
-          depositRequestId: candidate.id,
-          from: [DepositStatus.DRAFT, DepositStatus.AWAITING_PROOF],
-          to: DepositStatus.EXPIRED,
-          actor: SYSTEM_ACTOR,
-          reason: `No proof within ${this.config.limits.depositExpiryMinutes} minutes`,
-        });
-        if (outcome.kind === 'alreadyHandled') return false;
-
-        await this.audit.write(tx, {
-          action: 'deposit.expire',
-          actor: SYSTEM_ACTOR,
-          subjectType: DEPOSIT_AGGREGATE,
-          subjectId: candidate.id,
-          after: { status: DepositStatus.EXPIRED },
-        });
-
-        await this.outbox.enqueue(tx, {
-          aggregateType: DEPOSIT_AGGREGATE,
-          aggregateId: candidate.id,
-          topic: DEPOSIT_TOPICS.NOTIFY_PLAYER,
-          payload: {
+      const done = await runWithTenant(candidate.tenantId, () =>
+        this.prisma.runInTransaction(async (tx) => {
+          const outcome = await this.stateMachine.transition(tx, {
             depositRequestId: candidate.id,
-            playerId: outcome.deposit.playerId,
-            template: 'deposit.expired',
-            params: { shortId: outcome.deposit.shortId },
-          },
-          dedupeKey: `${DEPOSIT_TOPICS.NOTIFY_PLAYER}:${candidate.id}:expired`,
-        });
+            from: [DepositStatus.DRAFT, DepositStatus.AWAITING_PROOF],
+            to: DepositStatus.EXPIRED,
+            actor: SYSTEM_ACTOR,
+            reason: `No proof within ${this.config.limits.depositExpiryMinutes} minutes`,
+          });
+          if (outcome.kind === 'alreadyHandled') return false;
 
-        return true;
-      });
+          await this.audit.write(tx, {
+            action: 'deposit.expire',
+            actor: SYSTEM_ACTOR,
+            subjectType: DEPOSIT_AGGREGATE,
+            subjectId: candidate.id,
+            after: { status: DepositStatus.EXPIRED },
+          });
+
+          await this.outbox.enqueue(tx, {
+            aggregateType: DEPOSIT_AGGREGATE,
+            aggregateId: candidate.id,
+            topic: DEPOSIT_TOPICS.NOTIFY_PLAYER,
+            payload: {
+              depositRequestId: candidate.id,
+              playerId: outcome.deposit.playerId,
+              template: 'deposit.expired',
+              params: { shortId: outcome.deposit.shortId },
+            },
+            dedupeKey: `${DEPOSIT_TOPICS.NOTIFY_PLAYER}:${candidate.id}:expired`,
+          });
+
+          return true;
+        }),
+      );
       if (done) expired += 1;
     }
 
@@ -126,32 +170,43 @@ export class DepositSweepService {
 
   private async releaseStaleClaims(now: Date): Promise<number> {
     const staleBefore = new Date(now.getTime() - REVIEW_CLAIM_MINUTES * MINUTE_MS);
-    const candidates = await this.deposits.findStaleClaimIds(this.prisma, staleBefore, BATCH_SIZE);
+    const candidates = await this.prisma.depositRequest.findMany({
+      where: {
+        ...this.scanScope(),
+        status: DepositStatus.UNDER_REVIEW,
+        reviewStartedAt: { lt: staleBefore },
+      },
+      orderBy: { reviewStartedAt: 'asc' },
+      take: BATCH_SIZE,
+      select: { id: true, tenantId: true },
+    });
     let released = 0;
 
     for (const candidate of candidates) {
-      const done = await this.prisma.runInTransaction(async (tx) => {
-        const outcome = await this.stateMachine.transition(tx, {
-          depositRequestId: candidate.id,
-          from: DepositStatus.UNDER_REVIEW,
-          to: DepositStatus.SUBMITTED,
-          actor: SYSTEM_ACTOR,
-          reason: `Review claim went stale after ${REVIEW_CLAIM_MINUTES} minutes`,
-          patch: { reviewStartedAt: null, decidedByAdminId: null },
-          // Re-check staleness inside the CAS: the reviewer may have come back in the meantime.
-          guard: { reviewStartedAt: { lt: staleBefore } },
-        });
-        if (outcome.kind === 'alreadyHandled') return false;
+      const done = await runWithTenant(candidate.tenantId, () =>
+        this.prisma.runInTransaction(async (tx) => {
+          const outcome = await this.stateMachine.transition(tx, {
+            depositRequestId: candidate.id,
+            from: DepositStatus.UNDER_REVIEW,
+            to: DepositStatus.SUBMITTED,
+            actor: SYSTEM_ACTOR,
+            reason: `Review claim went stale after ${REVIEW_CLAIM_MINUTES} minutes`,
+            patch: { reviewStartedAt: null, decidedByAdminId: null },
+            // Re-check staleness inside the CAS: the reviewer may have come back in the meantime.
+            guard: { reviewStartedAt: { lt: staleBefore } },
+          });
+          if (outcome.kind === 'alreadyHandled') return false;
 
-        await this.outbox.enqueue(tx, {
-          aggregateType: DEPOSIT_AGGREGATE,
-          aggregateId: candidate.id,
-          topic: DEPOSIT_TOPICS.CARD_UPDATE,
-          payload: { depositRequestId: candidate.id, reason: 'claim-released' },
-          dedupeKey: `${DEPOSIT_TOPICS.CARD_UPDATE}:${candidate.id}:released:${staleBefore.getTime()}`,
-        });
-        return true;
-      });
+          await this.outbox.enqueue(tx, {
+            aggregateType: DEPOSIT_AGGREGATE,
+            aggregateId: candidate.id,
+            topic: DEPOSIT_TOPICS.CARD_UPDATE,
+            payload: { depositRequestId: candidate.id, reason: 'claim-released' },
+            dedupeKey: `${DEPOSIT_TOPICS.CARD_UPDATE}:${candidate.id}:released:${staleBefore.getTime()}`,
+          });
+          return true;
+        }),
+      );
       if (done) released += 1;
     }
 
@@ -165,56 +220,63 @@ export class DepositSweepService {
    */
   private async reapStuckCredits(now: Date): Promise<number> {
     const staleBefore = new Date(now.getTime() - CREDITING_STUCK_MINUTES * MINUTE_MS);
-    const candidates = await this.deposits.findStuckCreditingIds(
-      this.prisma,
-      staleBefore,
-      BATCH_SIZE,
-    );
+    const candidates = await this.prisma.depositRequest.findMany({
+      where: {
+        ...this.scanScope(),
+        status: DepositStatus.CREDITING,
+        updatedAt: { lt: staleBefore },
+      },
+      orderBy: { updatedAt: 'asc' },
+      take: BATCH_SIZE,
+      select: { id: true, tenantId: true, creditKeyEpoch: true },
+    });
     let reaped = 0;
 
     for (const candidate of candidates) {
-      const done = await this.prisma.runInTransaction(async (tx) => {
-        const outcome = await this.stateMachine.transition(tx, {
-          depositRequestId: candidate.id,
-          from: DepositStatus.CREDITING,
-          to: DepositStatus.APPROVED,
-          actor: SYSTEM_ACTOR,
-          reason: `Credit worker went silent for ${CREDITING_STUCK_MINUTES} minutes`,
-          metadata: { reapedAt: now.toISOString(), creditKeyEpoch: candidate.creditKeyEpoch },
-          guard: { updatedAt: { lt: staleBefore } },
-        });
-        if (outcome.kind === 'alreadyHandled') return false;
-
-        const deposit = outcome.deposit;
-        await this.audit.write(tx, {
-          action: 'deposit.credit.reaped',
-          actor: SYSTEM_ACTOR,
-          subjectType: DEPOSIT_AGGREGATE,
-          subjectId: candidate.id,
-          before: { status: DepositStatus.CREDITING },
-          after: { status: DepositStatus.APPROVED },
-          metadata: { stuckSinceBefore: staleBefore.toISOString() },
-        });
-
-        await this.outbox.enqueue(tx, {
-          aggregateType: DEPOSIT_AGGREGATE,
-          aggregateId: candidate.id,
-          topic: DEPOSIT_TOPICS.CREDIT_REQUESTED,
-          payload: {
+      const done = await runWithTenant(candidate.tenantId, () =>
+        this.prisma.runInTransaction(async (tx) => {
+          const outcome = await this.stateMachine.transition(tx, {
             depositRequestId: candidate.id,
-            shortId: deposit.shortId,
-            playerId: deposit.playerId,
-            creditKeyEpoch: deposit.creditKeyEpoch,
-            amountMinor: (deposit.creditedAmountMinor ?? deposit.claimedAmountMinor).toString(),
-          },
-          // Distinct from the approval's key so the reap is not swallowed as a duplicate of it.
-          dedupeKey:
-            `${DEPOSIT_TOPICS.CREDIT_REQUESTED}:${candidate.id}:${deposit.creditKeyEpoch}:` +
-            `reap:${staleBefore.getTime()}`,
-        });
+            from: DepositStatus.CREDITING,
+            to: DepositStatus.APPROVED,
+            actor: SYSTEM_ACTOR,
+            reason: `Credit worker went silent for ${CREDITING_STUCK_MINUTES} minutes`,
+            metadata: { reapedAt: now.toISOString(), creditKeyEpoch: candidate.creditKeyEpoch },
+            guard: { updatedAt: { lt: staleBefore } },
+          });
+          if (outcome.kind === 'alreadyHandled') return false;
 
-        return true;
-      });
+          const deposit = outcome.deposit;
+          await this.audit.write(tx, {
+            action: 'deposit.credit.reaped',
+            actor: SYSTEM_ACTOR,
+            subjectType: DEPOSIT_AGGREGATE,
+            subjectId: candidate.id,
+            before: { status: DepositStatus.CREDITING },
+            after: { status: DepositStatus.APPROVED },
+            metadata: { stuckSinceBefore: staleBefore.toISOString() },
+          });
+
+          await this.outbox.enqueue(tx, {
+            aggregateType: DEPOSIT_AGGREGATE,
+            aggregateId: candidate.id,
+            topic: DEPOSIT_TOPICS.CREDIT_REQUESTED,
+            payload: {
+              depositRequestId: candidate.id,
+              shortId: deposit.shortId,
+              playerId: deposit.playerId,
+              creditKeyEpoch: deposit.creditKeyEpoch,
+              amountMinor: (deposit.creditedAmountMinor ?? deposit.claimedAmountMinor).toString(),
+            },
+            // Distinct from the approval's key so the reap is not swallowed as a duplicate of it.
+            dedupeKey:
+              `${DEPOSIT_TOPICS.CREDIT_REQUESTED}:${candidate.id}:${deposit.creditKeyEpoch}:` +
+              `reap:${staleBefore.getTime()}`,
+          });
+
+          return true;
+        }),
+      );
       if (done) reaped += 1;
     }
 

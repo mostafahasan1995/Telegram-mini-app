@@ -24,11 +24,11 @@
  * did it deliberately and through an audited path; a redeploy running the seed again must not
  * silently revert any of it. Same rule, and the same reason, as the payment destinations.
  */
-import { TenantStatus, type PrismaClient } from '@prisma/client';
+import { TenantStatus, type Prisma, type PrismaClient } from '@prisma/client';
 
 // Imported from the constants FILE, not from the '@core/tenant' barrel: the barrel also exports the
 // Nest module, middleware and interceptor, which would drag the whole DI graph into a script that
-// only wants two uuids — and it deliberately does not re-export the bootstrap constants at all.
+// only wants two uuids. (The barrel does export these constants; this is about not importing Nest.)
 import {
   TENANT_BOOTSTRAP_ID,
   TENANT_BOOTSTRAP_SLUG,
@@ -55,6 +55,24 @@ const ROOT_SECRET_VAR = 'JWT_SECRET';
 
 /** Same prefix the payment-method seed uses, so one grep finds everything a fresh install must fix. */
 const PLACEHOLDER_PREFIX = 'SEED-PLACEHOLDER';
+
+/**
+ * What `20260911090000_multi_tenant_core` writes into the bootstrap operator's NOT NULL credential
+ * columns. A migration cannot read the deployment's environment, so it writes these and the seed —
+ * which can — repairs them.
+ *
+ * WHY THE REPAIR IS NEEDED AT ALL: every tenant upsert below has `update: {}`, so that re-running
+ * the seed can never revert an audited operator decision. On a FRESH install, though, the migration
+ * has already inserted the row by the time the seed runs, so without this the sentinels would win
+ * permanently and the real credentials in .env would silently never land.
+ *
+ * The repair is therefore deliberately narrow: a column is overwritten ONLY while it still holds the
+ * sentinel. Anything a human has since set is left exactly as they left it.
+ */
+const MIGRATION_SENTINEL_PREFIX = 'REPLACE-ME';
+
+const isMigrationSentinel = (value: string | null): boolean =>
+  value !== null && value.startsWith(MIGRATION_SENTINEL_PREFIX);
 
 /** Matches the .env.example defaults; see the BUSINESS LIMITS block there for what each one gates. */
 const DEFAULT_DUAL_APPROVAL_THRESHOLD_MINOR = 100_000_000n;
@@ -222,8 +240,42 @@ export async function seedTenancy(
 
   const existingBootstrap = await prisma.tenant.findUnique({
     where: { id: TENANT_BOOTSTRAP_ID },
-    select: { id: true },
+    select: {
+      id: true,
+      status: true,
+      botTokenEnc: true,
+      ichancyUsername: true,
+      ichancyPasswordEnc: true,
+      ichancyAgentId: true,
+      adminChatId: true,
+    },
   });
+
+  // See MIGRATION_SENTINEL_PREFIX. Each field is repaired independently, because a half-configured
+  // deployment is the normal case: somebody sets TELEGRAM_BOT_TOKEN today and the Ichancy password
+  // next week, and the second seed run must not undo the first.
+  const repair: Prisma.TenantUpdateInput = {};
+  if (existingBootstrap !== null) {
+    if (isMigrationSentinel(existingBootstrap.botTokenEnc) && !botToken.isPlaceholder) {
+      repair.botTokenEnc = botToken.value;
+    }
+    if (isMigrationSentinel(existingBootstrap.ichancyPasswordEnc) && !ichancyPassword.isPlaceholder) {
+      repair.ichancyPasswordEnc = ichancyPassword.value;
+    }
+    if (isMigrationSentinel(existingBootstrap.ichancyUsername)) {
+      const username = readOptionalText(env.ICHANCY_USERNAME);
+      if (username !== null) repair.ichancyUsername = username;
+    }
+    if (isMigrationSentinel(existingBootstrap.ichancyAgentId)) {
+      const agentId = readOptionalText(env.ICHANCY_AGENT_ID);
+      if (agentId !== null) repair.ichancyAgentId = agentId;
+    }
+    // 0 is the migration's "not configured": Telegram never issues chat id 0.
+    if (existingBootstrap.adminChatId === 0n && adminChatId !== null) {
+      repair.adminChatId = adminChatId;
+    }
+  }
+
 
   await prisma.tenant.upsert({
     where: { id: TENANT_BOOTSTRAP_ID },
@@ -253,7 +305,8 @@ export async function seedTenancy(
       // depositMode / withdrawalMode keep the schema's MANUAL default. A seed must never be the
       // reason money starts moving without a human.
     },
-    update: {},
+    // Empty except for a sentinel repair — see MIGRATION_SENTINEL_PREFIX. Never a blanket overwrite.
+    update: repair,
     select: { id: true },
   });
 
@@ -294,7 +347,33 @@ export async function seedTenancy(
       created: existingBootstrap === null,
     },
     defaultsCreated: existingDefaults === null,
-    secretsArePlaceholders:
-      botToken.isPlaceholder || ichancyPassword.isPlaceholder || webhookSecret.isPlaceholder,
+    // Read back rather than inferred from what we intended to write. Three paths reach this line —
+    // the row was created here, it was repaired, or it was left alone — and the only answer that is
+    // true on all three is the one the database actually holds.
+    secretsArePlaceholders: await bootstrapHoldsPlaceholders(prisma),
   };
+}
+
+/**
+ * Whether the bootstrap operator's credential columns still hold something nobody can open: either
+ * the migration's `REPLACE-ME…` sentinel or this seed's own `SEED-PLACEHOLDER-…`.
+ *
+ * The warning this drives is the only signal an operator gets. A row with placeholders looks
+ * completely normal until the bot fails to answer, so a false negative here is a silent outage.
+ */
+async function bootstrapHoldsPlaceholders(prisma: PrismaClient): Promise<boolean> {
+  const row = await prisma.tenant.findUnique({
+    where: { id: TENANT_BOOTSTRAP_ID },
+    select: { botTokenEnc: true, ichancyPasswordEnc: true, ichancyUsername: true },
+  });
+  if (row === null) return false;
+
+  const unopenable = (value: string): boolean =>
+    value.startsWith(MIGRATION_SENTINEL_PREFIX) || value.startsWith(PLACEHOLDER_PREFIX);
+
+  return (
+    unopenable(row.botTokenEnc) ||
+    unopenable(row.ichancyPasswordEnc) ||
+    unopenable(row.ichancyUsername)
+  );
 }

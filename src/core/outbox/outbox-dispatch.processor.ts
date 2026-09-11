@@ -10,6 +10,11 @@
  *
  * Handlers MUST be idempotent: delivery is at-least-once, a BullMQ retry re-runs every handler for
  * that message, and the relay itself may re-publish a row whose owner died before marking it SENT.
+ *
+ * This is also where a message stops being cross-operator. The relay claims every tenant's rows in
+ * one query on purpose; here each message is handled alone, inside the context of the operator
+ * whose commit produced it, so a handler's reads and writes land in that operator's book and
+ * nowhere else.
  */
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
@@ -19,6 +24,7 @@ import { ActorContextService } from '@core/actor-context/actor-context.service';
 import { QUEUE_NAMES } from '@core/queue/queue.constants';
 import { isJsonObject } from '@core/queue/json.util';
 import type { OutboxDispatchTask } from '@core/queue/queue.types';
+import { runWithTenant } from '@core/tenant';
 import { OUTBOX_HANDLERS, type OutboxMessageView, type OutboxTopicHandler } from './outbox.types';
 
 export class NoOutboxHandlerError extends Error {
@@ -27,6 +33,25 @@ export class NoOutboxHandlerError extends Error {
   constructor(readonly topic: string) {
     super(`No outbox handler is registered for topic "${topic}"`);
     this.name = 'NoOutboxHandlerError';
+  }
+}
+
+/**
+ * A message that cannot name its operator. The only realistic source is a job published by a
+ * pre-multi-tenant relay and still sitting in Redis across the deploy — after that the payload
+ * always carries a tenant, because the claim query selects it.
+ *
+ * It fails rather than defaulting for the same reason the whole file fails on an unknown topic:
+ * guessing here would file a real money side effect against the wrong operator's book, which is
+ * strictly worse than a visible job in the failed set. The relay's reaper will return the row to
+ * PENDING and the next claim republishes it, this time with a tenant.
+ */
+export class MissingOutboxTenantError extends Error {
+  readonly code = 'OUTBOX_NO_TENANT';
+
+  constructor(readonly outboxId: string) {
+    super(`Outbox message "${outboxId}" carries no tenantId; refusing to guess an operator`);
+    this.name = 'MissingOutboxTenantError';
   }
 }
 
@@ -63,14 +88,28 @@ export class OutboxDispatchProcessor extends WorkerHost {
     const matched = this.resolve(message.topic);
     if (matched.length === 0) throw new NoOutboxHandlerError(message.topic);
 
+    // The tenant is read off the payload, never from an ambient context: this worker has none, and
+    // the relay that published the job was deliberately draining every operator at once. The claim
+    // query carried the row's tenant_id here precisely so this line does not need a second read.
+    const { tenantId } = job.data;
+    if (typeof tenantId !== 'string' || tenantId.length === 0) {
+      throw new MissingOutboxTenantError(message.outboxId);
+    }
+
+    // Two contexts, two different questions. Tenant answers "whose data may this touch" and must be
+    // outermost, because everything below it — including the audit rows the actor context stamps —
+    // belongs to that operator.
+    //
     // A job has no request to inherit an actor from, and a handler that writes an audit row outside
     // a context produces one with a null correlationId — i.e. an effect nobody can trace back to the
     // request that caused it. Reusing the producer's correlationId (when it put one in the payload)
     // stitches the whole causal chain together; the outbox row id is the fallback, and is at least
     // stable across every retry of this message.
-    await this.actorContext.runAsSystem(
-      () => this.dispatch(matched, message),
-      this.correlationIdFor(message),
+    await runWithTenant(tenantId, () =>
+      this.actorContext.runAsSystem(
+        () => this.dispatch(matched, message),
+        this.correlationIdFor(message),
+      ),
     );
   }
 

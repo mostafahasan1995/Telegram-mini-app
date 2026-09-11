@@ -9,6 +9,10 @@
  *
  * Concurrency 2: sharp releases the event loop but not the CPU, and this process also has to answer
  * a credit worker.
+ *
+ * WHY THE TENANT IS NOT ESTABLISHED HERE: the job carries a proof id and nothing else, and the only
+ * honest answer to "whose operator is this?" is the parent deposit. ProofIngestService reads it
+ * before anything else and opens the tenant context there; see its header.
  */
 import { Injectable, Logger } from '@nestjs/common';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';

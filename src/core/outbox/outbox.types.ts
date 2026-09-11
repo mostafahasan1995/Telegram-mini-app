@@ -32,6 +32,11 @@ export interface OutboxEnqueueResult {
 /** Exactly the columns the claim query returns, in camelCase because the SQL aliases them. */
 export interface ClaimedOutboxRow {
   id: string;
+  /**
+   * The operator this side effect belongs to. Carried out of the cross-tenant claim because it is
+   * the only place the answer exists; nothing downstream may guess it.
+   */
+  tenantId: string;
   aggregateType: string;
   aggregateId: string;
   topic: string;

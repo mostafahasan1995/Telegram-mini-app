@@ -30,8 +30,10 @@ interface TenantClaims {
 }
 
 function extractBearerToken(request: Request): string | null {
-  const raw = request.headers.authorization;
-  const header = Array.isArray(raw) ? raw[0] : raw;
+  // No Array.isArray branch, unlike AuthGuard's copy of this: that one reads from a loosely-typed
+  // header bag, whereas express types `authorization` as `string | undefined` — and narrowing a
+  // non-array with Array.isArray yields `any[]`, which is worse than the case it was guarding.
+  const header = request.headers.authorization;
   if (typeof header !== 'string') return null;
 
   // Split on whitespace rather than slicing at index 7 — matches AuthGuard, which accepts

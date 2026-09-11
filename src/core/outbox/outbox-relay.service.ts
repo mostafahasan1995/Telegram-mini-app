@@ -10,6 +10,13 @@
  * jobId `outbox-<row id>` and BullMQ refuses a duplicate for as long as the job exists. The failure
  * window is therefore "the row was published and the process died before marking it SENT", which
  * the reaper resolves by re-publishing into the same jobId — a no-op.
+ *
+ * WHY the relay is cross-operator and must stay that way: one worker drains every tenant's outbox.
+ * A per-tenant relay would need a per-tenant schedule, and whichever operator was not currently
+ * ticking would watch its side effects age. What must never be cross-operator is the WORK a message
+ * causes, so the tenant is read off the claimed row, travels in the job payload, and the dispatch
+ * processor enters it before a handler runs. Every query in this file is therefore either raw SQL
+ * (invisible to the tenant-scope extension by construction) or marked ALL_TENANTS on purpose.
  */
 import { Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
@@ -18,6 +25,7 @@ import { randomUUID } from 'node:crypto';
 
 import { AppConfigService } from '@core/config/config.service';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { acrossTenants } from '@core/prisma/tenant-scope.extension';
 import { fromDbJsonObject } from '@core/queue/json.util';
 import { DEFAULT_JOB_ATTEMPTS, DEFAULT_JOB_BACKOFF_MS } from '@core/queue/queue.constants';
 import { TASKS, type OutboxDispatchTask } from '@core/queue/queue.types';
@@ -142,7 +150,13 @@ export class OutboxRelayService implements OnModuleInit {
     }
   }
 
-  /** Status histogram for the health endpoint; a growing DEAD count is a page-worthy signal. */
+  /**
+   * Status histogram for the health endpoint; a growing DEAD count is a page-worthy signal.
+   *
+   * Platform-wide on purpose, and raw SQL, so no tenant filter applies: this answers "is the relay
+   * keeping up?", which is a property of the worker, not of any one operator. A per-operator view
+   * of the backlog would be a different query with a GROUP BY tenant_id.
+   */
   async statusCounts(): Promise<Record<string, number>> {
     const rows =
       await this.prisma.$queryRaw<{ status: string; count: number }[]>(buildStatusCountQuery());
@@ -151,6 +165,12 @@ export class OutboxRelayService implements OnModuleInit {
     return counts;
   }
 
+  /**
+   * Claims across every operator. The query is raw SQL, so tenant-scope.extension.ts never sees it
+   * and injects nothing — which is the behaviour we want here, not an oversight. Each claimed row
+   * carries its own tenantId out of the query, and that is what makes the per-message context in
+   * OutboxDispatchProcessor possible.
+   */
   private async claim(limit: number): Promise<ClaimedOutboxRow[]> {
     return this.prisma.$queryRaw<ClaimedOutboxRow[]>(buildClaimQuery(limit, this.workerId));
   }
@@ -158,6 +178,10 @@ export class OutboxRelayService implements OnModuleInit {
   private toJob(row: ClaimedOutboxRow): BulkTaskEntry<typeof TASKS.OUTBOX_DISPATCH> {
     const payload: OutboxDispatchTask = {
       outboxId: row.id,
+      // The producer already knew the operator and committed it on the row; passing it through the
+      // payload means the consumer never has to re-read the row to find out, and cannot read a
+      // tenant that changed underneath it.
+      tenantId: row.tenantId,
       topic: row.topic,
       aggregateType: row.aggregateType,
       aggregateId: row.aggregateId,
@@ -174,9 +198,19 @@ export class OutboxRelayService implements OnModuleInit {
     };
   }
 
+  /**
+   * ALL_TENANTS here is not laziness, it is the correction for a real failure: one claimed batch
+   * spans several operators, and `runOnce()` is public precisely so an operator endpoint can drain
+   * the outbox on demand — inside a request, which HAS a tenant context. Without the marker the
+   * extension would narrow this UPDATE to that one tenant and every other operator's row would stay
+   * IN_FLIGHT until the reaper noticed, delaying real side effects by the stale-lock window.
+   *
+   * It is safe because these ids are not user input: they came back from this relay's own claim,
+   * which took a row lock on each one.
+   */
   private async markSent(ids: readonly string[]): Promise<void> {
     await this.prisma.outboxMessage.updateMany({
-      where: { id: { in: [...ids] } },
+      where: acrossTenants({ id: { in: [...ids] } }),
       data: { status: 'SENT', sentAt: new Date(), lockedAt: null, lockedBy: null, lastError: null },
     });
   }
@@ -190,7 +224,8 @@ export class OutboxRelayService implements OnModuleInit {
 
     if (exhausted.length > 0) {
       await this.prisma.outboxMessage.updateMany({
-        where: { id: { in: exhausted.map((row) => row.id) } },
+        // Same reasoning as markSent: the batch spans operators and the ids are ours.
+        where: acrossTenants({ id: { in: exhausted.map((row) => row.id) } }),
         data: { status: 'DEAD', lockedAt: null, lockedBy: null, lastError: error },
       });
       this.logger.error(
@@ -208,7 +243,7 @@ export class OutboxRelayService implements OnModuleInit {
 
     for (const [attempts, ids] of byAttempts) {
       await this.prisma.outboxMessage.updateMany({
-        where: { id: { in: ids } },
+        where: acrossTenants({ id: { in: ids } }),
         data: {
           status: 'PENDING',
           lockedAt: null,

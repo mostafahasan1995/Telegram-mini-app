@@ -10,6 +10,7 @@ import { CreditVerifiedBy, DepositStatus, type DepositRequest } from '@prisma/cl
 import type { IchancyPort, IchancyResult, PlayerBalance } from '@core/ichancy';
 import { IchancyRejectionCodes } from '@core/ichancy';
 import { LedgerError } from '@core/ledger';
+import { getEffectiveTenantId } from '@core/tenant';
 
 import { DepositErrorCodes } from '../enums/deposit-error-code.enum';
 import type { PlayerLinkPort } from '../ports';
@@ -71,6 +72,8 @@ function makeDeposit(overrides: Partial<DepositRequest> = {}): DepositRequest {
 interface Harness {
   service: DepositCreditService;
   deposit: DepositRequest;
+  /** The effective tenant observed at each write, to prove the worker opened a context at all. */
+  writeTenants: (string | undefined)[];
   transitions: { to: DepositStatus; patch?: Record<string, unknown> }[];
   postings: { idempotencyKey: string }[];
   outbox: { topic: string; payload: Record<string, unknown> }[];
@@ -104,6 +107,7 @@ function makeHarness(options: HarnessOptions): Harness {
     balanceReads: 0,
     lockExtends: 0,
     lockReleases: 0,
+    writeTenants: [] as (string | undefined)[],
   };
 
   const prisma = {
@@ -145,6 +149,7 @@ function makeHarness(options: HarnessOptions): Harness {
           new LedgerError('LEDGER_SIGN_VIOLATION', 'agent float would go negative'),
         );
       }
+      state.writeTenants.push(getEffectiveTenantId());
       state.postings.push({ idempotencyKey: posting.idempotencyKey });
       return Promise.resolve({ transactionId: 'tx-t2' });
     },
@@ -183,7 +188,12 @@ function makeHarness(options: HarnessOptions): Harness {
     },
   };
 
-  const audit = { write: () => Promise.resolve('audit-id') };
+  const audit = {
+    write: () => {
+      state.writeTenants.push(getEffectiveTenantId());
+      return Promise.resolve('audit-id');
+    },
+  };
 
   const creditAnswers = [...options.creditAnswers];
   const balanceAnswers = [...options.balanceAnswers];
@@ -249,6 +259,9 @@ function makeHarness(options: HarnessOptions): Harness {
     },
     get lockReleases() {
       return state.lockReleases;
+    },
+    get writeTenants() {
+      return state.writeTenants;
     },
   };
 }
@@ -493,6 +506,27 @@ describe('DepositCreditService — the balance-delta protocol', () => {
     expect(outcome).toEqual({ kind: 'skipped', reason: 'ALREADY_CREDITED' });
     expect(harness.creditCalls).toBe(0);
     expect(harness.postings).toHaveLength(0);
+  });
+
+  /**
+   * The regression this guards: the ichancy queue has no request, so there is no ambient tenant and
+   * every write here — T2 and the audit row — would either throw or land against the wrong operator.
+   * The deposit row is where the tenant comes from, and it must still be in scope by the time the
+   * terminal transaction runs, several awaits and an HTTP round trip later.
+   */
+  it('does every write inside the tenant that owns the deposit, with nothing ambient', async () => {
+    const harness = makeHarness({
+      creditAnswers: [ok(1_000_000n)],
+      balanceAnswers: [balance(850_000n)],
+    });
+
+    expect(getEffectiveTenantId()).toBeUndefined();
+    await harness.service.credit(task);
+
+    expect(harness.writeTenants.length).toBeGreaterThan(0);
+    expect(harness.writeTenants.every((seen) => seen === TENANT_ID)).toBe(true);
+    // And the context does not leak out of the job.
+    expect(getEffectiveTenantId()).toBeUndefined();
   });
 
   it('refuses to credit a REJECTED deposit', async () => {

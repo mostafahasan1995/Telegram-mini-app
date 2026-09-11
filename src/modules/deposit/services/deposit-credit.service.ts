@@ -65,6 +65,7 @@ import {
 import { OutboxService } from '@core/outbox/outbox.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import type { Tx } from '@core/prisma/tx.type';
+import { runWithTenant } from '@core/tenant';
 
 import {
   BALANCE_VERIFY_DELAY_MS,
@@ -123,6 +124,17 @@ export class DepositCreditService {
     @Inject(PLAYER_LINK_PORT) private readonly playerLink: PlayerLinkPort,
   ) {}
 
+  /**
+   * WHOSE OPERATOR IS THIS? The ichancy queue has no request behind it, so there is no ambient
+   * tenant — and everything below writes rows that must name one: T2, the audit trail, every outbox
+   * message. The deposit row is the only honest answer, so the lookup that opens this method is
+   * also what establishes the tenant.
+   *
+   * It costs nothing extra — the stale-epoch guard needed this row anyway — and it cannot be
+   * answered with the wrong operator's deposit, because `id` is the primary key and the read is
+   * therefore not tenant-scoped at all. Carrying the tenant on the job payload instead would save
+   * no query and would add a second, forgeable copy of a fact the row already states.
+   */
   async credit(task: CreditTask): Promise<CreditOutcome> {
     const deposit = await this.prisma.depositRequest.findUnique({
       where: { id: task.depositRequestId },
@@ -145,21 +157,28 @@ export class DepositCreditService {
       return { kind: 'skipped', reason: `NOT_CREDITABLE_${deposit.status}` };
     }
 
-    // The mutex spans the ENTIRE verify window — see the header.
-    const lockKey = playerCreditLockKey(deposit.playerId);
-    const handle = await this.locks.acquire(lockKey, CREDIT_LOCK_TTL_MS, {
-      retries: CREDIT_LOCK_RETRIES,
-      retryDelayMs: CREDIT_LOCK_RETRY_DELAY_MS,
-    });
-    if (handle === null) {
-      throw new CreditRetryLaterError(`another credit is in flight for player ${deposit.playerId}`);
-    }
+    // Past this line every write belongs to the deposit's operator, so the whole attempt — the
+    // mutex, the Ichancy calls, and every terminal state — runs inside that tenant. The lock key is
+    // built from a player uuid and is already globally unique, so it needs no tenant of its own.
+    return runWithTenant(deposit.tenantId, async () => {
+      // The mutex spans the ENTIRE verify window — see the header.
+      const lockKey = playerCreditLockKey(deposit.playerId);
+      const handle = await this.locks.acquire(lockKey, CREDIT_LOCK_TTL_MS, {
+        retries: CREDIT_LOCK_RETRIES,
+        retryDelayMs: CREDIT_LOCK_RETRY_DELAY_MS,
+      });
+      if (handle === null) {
+        throw new CreditRetryLaterError(
+          `another credit is in flight for player ${deposit.playerId}`,
+        );
+      }
 
-    try {
-      return await this.creditUnderLock(deposit, task, handle);
-    } finally {
-      await this.locks.release(handle).catch(() => false);
-    }
+      try {
+        return await this.creditUnderLock(deposit, task, handle);
+      } finally {
+        await this.locks.release(handle).catch(() => false);
+      }
+    });
   }
 
   // ---------------------------------------------------------------------------------------------

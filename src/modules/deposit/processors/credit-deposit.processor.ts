@@ -12,6 +12,11 @@
  * ICHANCY_AGENT_FLOAT ledger account. More concurrency does not buy throughput here; it buys lock
  * contention on one hot row.
  *
+ * WHY THE TENANT IS NOT ESTABLISHED HERE: a BullMQ job has no request, so nothing is ambient — but
+ * this class does not know which operator a job belongs to either, and the payload's word for it
+ * would be a second copy of something the deposit row already states. DepositCreditService opens the
+ * tenant context from the row it loads first; see its `credit()`.
+ *
  * WHY a decided outcome never throws: `failed`, `needs_reconciliation` and `skipped` are ANSWERS.
  * Throwing on them would make BullMQ retry a deposit that has already been resolved — and the one
  * outcome we must never retry is the one where Ichancy told us the float is empty. Only

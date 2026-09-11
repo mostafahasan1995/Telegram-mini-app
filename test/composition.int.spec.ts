@@ -18,8 +18,11 @@ import { applyTestEnv } from './setup/test-env';
 import { THROTTLE_RULES, findUnmatchedRules } from '@core/throttler/throttle-routes';
 import { TELEGRAM_BOT } from '@core/telegram/telegram.constants';
 import { OUTBOX_HANDLERS, type OutboxTopicHandler } from '@core/outbox/outbox.types';
-// Not the '@core/tenant' barrel: it re-exports TENANT_ZERO_ID but not TENANT_BOOTSTRAP_ID.
-import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
+// The constants FILE, not the '@core/tenant' barrel — which does export both of these. The barrel
+// also exports TenantModule, and importing a Nest module here would build a slice of the DI graph
+// at file load, before `applyTestEnv()` has run. That is the same reason every module import in
+// this file is dynamic.
+import { TENANT_BOOTSTRAP_ID, TENANT_ZERO_ID } from '@core/tenant/tenant.constants';
 
 jest.setTimeout(180_000);
 
@@ -264,6 +267,52 @@ describe('api composition', () => {
       expect(await prisma.paymentMethod.count()).toBe(2);
       // 2 singletons (agent float, rounding) + 3 per rail.
       expect(await prisma.ledgerAccount.count()).toBe(8);
+    });
+
+    it('leaves the tenancy baseline standing after a reset', async () => {
+      // The row every other seeded row hangs off. Two ways it can be missing, and both break the
+      // whole suite with a foreign-key error pointing at the child rather than at the cause:
+      // truncate.ts forgetting to preserve `tenants`, or the factory not seeding them at all —
+      // which matters because this database is built by `prisma db push`, so the INSERTs in the
+      // multi-tenant MIGRATION never run here.
+      const { PrismaService } = await import('@core/prisma/prisma.service');
+      const prisma = ctx.app.get(PrismaService);
+
+      await ctx.reset();
+
+      const [platform, bootstrap, defaults] = await Promise.all([
+        prisma.tenant.findUnique({ where: { id: TENANT_ZERO_ID }, select: { slug: true } }),
+        prisma.tenant.findUnique({ where: { id: TENANT_BOOTSTRAP_ID }, select: { slug: true } }),
+        prisma.platformDefaults.findUnique({ where: { id: 1 }, select: { id: true } }),
+      ]);
+
+      expect(platform).not.toBeNull();
+      expect(bootstrap).not.toBeNull();
+      expect(defaults).not.toBeNull();
+    });
+
+    it('enters an operator for the tests that bypass the middleware', async () => {
+      // `ctx.inTenant` is what a direct `app.get(Service)` call has instead of
+      // TenantContextMiddleware. Proving it works means proving the scope extension SEES it, so the
+      // assertion is a findMany with no `tenantId` in the where — the exact query that returns
+      // every operator's rows when nobody opened a context.
+      const { PrismaService } = await import('@core/prisma/prisma.service');
+      const { getEffectiveTenantId } = await import('@core/tenant/tenant.storage');
+      const prisma = ctx.app.get(PrismaService);
+
+      await ctx.inTenant(async () => {
+        expect(getEffectiveTenantId()).toBe(TENANT_BOOTSTRAP_ID);
+        const methods = await prisma.paymentMethod.findMany({ select: { tenantId: true } });
+        expect(methods).toHaveLength(2);
+        expect(methods.every((method) => method.tenantId === TENANT_BOOTSTRAP_ID)).toBe(true);
+      });
+
+      // The same query as the platform. Nobody pays into tenant zero, so it owns no rails — and an
+      // empty result here is the injection actually happening rather than the filter being a no-op
+      // that only looks right while one operator exists.
+      await ctx.inTenant(async () => {
+        expect(await prisma.paymentMethod.findMany()).toEqual([]);
+      }, TENANT_ZERO_ID);
     });
   });
 

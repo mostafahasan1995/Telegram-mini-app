@@ -8,8 +8,13 @@ import type { Job } from 'bullmq';
 import { ActorContextService } from '@core/actor-context/actor-context.service';
 import { getActorContext } from '@core/actor-context/actor-context.storage';
 import type { OutboxDispatchTask } from '@core/queue/queue.types';
+import { getEffectiveTenantId } from '@core/tenant';
 
-import { NoOutboxHandlerError, OutboxDispatchProcessor } from './outbox-dispatch.processor';
+import {
+  MissingOutboxTenantError,
+  NoOutboxHandlerError,
+  OutboxDispatchProcessor,
+} from './outbox-dispatch.processor';
 import type { OutboxMessageView, OutboxTopicHandler } from './outbox.types';
 
 function job(
@@ -17,6 +22,7 @@ function job(
 ): Job<OutboxDispatchTask, unknown, string> {
   const data: OutboxDispatchTask = {
     outboxId: '018f0000-0000-7000-8000-000000000001',
+    tenantId: 'tenant-a',
     topic: 'deposit.credit.requested',
     aggregateType: 'DepositRequest',
     aggregateId: 'dep-1',
@@ -104,6 +110,48 @@ describe('OutboxDispatchProcessor — routing', () => {
       handle: () => Promise.reject(new Error('telegram 502')),
     };
     await expect(build([failing]).process(job())).rejects.toThrow('telegram 502');
+  });
+});
+
+describe('OutboxDispatchProcessor — tenant context', () => {
+  const tenantWatcher = (): OutboxTopicHandler & { seen: (string | undefined)[] } => {
+    const seen: (string | undefined)[] = [];
+    return {
+      topic: 'deposit.credit.requested',
+      seen,
+      handle: () => {
+        seen.push(getEffectiveTenantId());
+        return Promise.resolve();
+      },
+    };
+  };
+
+  it('runs handlers inside the operator whose commit produced the message', async () => {
+    // The worker has no ambient tenant — the relay claimed this row alongside other operators' —
+    // so anything the handler reads or writes would otherwise span every operator or throw.
+    const handler = tenantWatcher();
+    await build([handler]).process(job({ tenantId: 'tenant-b' }));
+    expect(handler.seen).toEqual(['tenant-b']);
+  });
+
+  it('leaves no tenant leaking into the next job', async () => {
+    const handler = tenantWatcher();
+    const processor = build([handler]);
+    await processor.process(job({ tenantId: 'tenant-b' }));
+    await processor.process(job({ tenantId: 'tenant-c' }));
+
+    expect(handler.seen).toEqual(['tenant-b', 'tenant-c']);
+    expect(getEffectiveTenantId()).toBeUndefined();
+  });
+
+  it('fails a payload with no tenant instead of guessing an operator', async () => {
+    // A job published before the relay carried tenants, still sitting in Redis across a deploy.
+    // Defaulting here would file a real money side effect against somebody else's book.
+    const handler = recorder('deposit.credit.requested');
+    await expect(build([handler]).process(job({ tenantId: undefined }))).rejects.toBeInstanceOf(
+      MissingOutboxTenantError,
+    );
+    expect(handler.seen).toHaveLength(0);
   });
 });
 

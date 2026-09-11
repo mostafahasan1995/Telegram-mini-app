@@ -15,6 +15,13 @@
  * WHY a failure downgrades rather than throws: an unreadable image is not a system fault — it is a
  * fact about the upload, and the right response is a PROOF_UNREADABLE risk flag on the admin card,
  * not a job that retries eight times and then sits in a dead-letter set nobody reads.
+ *
+ * WHOSE OPERATOR IS THIS: the media queue has no request, so nothing is ambient. The parent deposit
+ * is the only honest answer, and `ingest` reads it before doing anything else — so the work runs
+ * inside that tenant rather than stamping `tenantId` onto writes one at a time. That matters most
+ * for the READS: a duplicate proof is only a duplicate WITHIN one operator, and the sha256 lookup
+ * behind ProofDuplicateService is a `findMany` that, with no tenant in scope, would happily report
+ * another operator's proof as a match — evidence against a player that has nothing to do with them.
  */
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import type { DepositProof } from '@prisma/client';
@@ -35,6 +42,7 @@ import { OutboxService } from '@core/outbox/outbox.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { isUniqueConstraintError, mapPrismaError } from '@core/prisma/prisma-errors';
 import type { Tx } from '@core/prisma/tx.type';
+import { runWithTenant } from '@core/tenant';
 
 import { DEPOSIT_AGGREGATE, DEPOSIT_TOPICS } from '../deposit.constants';
 import { RiskFlags, RISK_FLAG_SEVERITY, type RiskFlag } from '../enums/risk-flag.enum';
@@ -45,6 +53,17 @@ export interface IngestOutcome {
   proofId: string;
   status: 'normalized' | 'already-normalized' | 'unreadable' | 'missing';
   riskFlags: RiskFlag[];
+}
+
+/**
+ * The slice of the parent deposit this job needs. `tenantId` rides along because every row written
+ * here hangs off THIS deposit and because it is what scopes the duplicate search — see the header.
+ */
+interface ParentDeposit {
+  id: string;
+  tenantId: string;
+  playerId: string;
+  shortId: string;
 }
 
 @Injectable()
@@ -69,12 +88,17 @@ export class ProofIngestService {
 
     const deposit = await this.prisma.depositRequest.findUniqueOrThrow({
       where: { id: proof.depositRequestId },
-      // `tenantId` rides along because every row this job writes hangs off THIS deposit. The media
-      // queue has no request and therefore no ambient tenant; the parent row is the only honest
-      // answer to "whose operator is this?".
       select: { id: true, tenantId: true, playerId: true, shortId: true },
     });
 
+    return runWithTenant(deposit.tenantId, () => this.ingestForDeposit(proof, deposit));
+  }
+
+  /** Everything past the parent lookup, running as the deposit's operator. */
+  private async ingestForDeposit(
+    proof: DepositProof,
+    deposit: ParentDeposit,
+  ): Promise<IngestOutcome> {
     if (isNormalizedKey(proof.storageKey)) {
       // Already normalized. Re-index anyway: it is idempotent and repairs a lost cache entry.
       await this.reindex(proof, deposit.playerId);
@@ -263,7 +287,7 @@ export class ProofIngestService {
 
   private async markUnreadable(
     proof: DepositProof,
-    deposit: { id: string; tenantId: string; playerId: string; shortId: string },
+    deposit: ParentDeposit,
     cause: unknown,
   ): Promise<IngestOutcome> {
     const reason = isFileStorageError(cause)
