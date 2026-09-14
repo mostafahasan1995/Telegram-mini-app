@@ -13,6 +13,7 @@ import helmet from 'helmet';
 import { Logger as PinoLogger } from 'nestjs-pino';
 
 import { GlobalExceptionFilter } from '@common/filters/global-exception.filter';
+import { redactWebhookPathToken } from '@common/helpers/request-url-redaction.util';
 import {
   CorrelationIdInterceptor,
   CORRELATION_ID_HEADER,
@@ -288,7 +289,9 @@ export async function bootstrapApi(): Promise<void> {
   await app.listen(config.app.port, '0.0.0.0');
 
   logger.log(`API listening on port ${config.app.port} (${config.app.nodeEnv})`);
-  logger.log(`Telegram webhook path: ${config.telegram.webhookPath}`);
+  // Masked: this banner is printed at every start and shipped to Loki, and the path token is one of the
+  // webhook's two locks. The route shape is what an operator needs to see here, not the token.
+  logger.log(`Telegram webhook path: ${redactWebhookPathToken(config.telegram.webhookPath)}`);
   if (!config.app.isProduction) logger.log(`OpenAPI UI: ${config.app.baseUrl}/docs`);
 }
 
