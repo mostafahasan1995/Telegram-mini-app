@@ -215,6 +215,11 @@ export class ReportScheduleCron {
    * Returns false when Telegram says the chat cannot receive messages at all. The feed branch is
    * only taken when a feed chat IS configured, so a false from it means "unreachable" and never
    * "unconfigured" — the ambiguity notifyFeed() normally carries cannot arise here.
+   *
+   * WHICH BOT: none yet. This report is deployment-wide and spans every operator, so it is a
+   * PLATFORM message and no operator's bot may carry it (that would post one operator's figures
+   * into another's chat). The platform has no bot, so both calls return null until platform
+   * messages are given a destination, and postIfDue logs the report as not delivered.
    */
   private async post(text: string): Promise<boolean> {
     const options = { parseMode: 'HTML', linkPreview: false } as const;
@@ -222,8 +227,8 @@ export class ReportScheduleCron {
 
     const sent =
       feedChatId !== null && feedFullDetail
-        ? await this.bot.notifyFeed(text, options)
-        : await this.bot.notifyAdmins(text, options);
+        ? await this.bot.notifyPlatformFeed(text, options)
+        : await this.bot.notifyPlatformAdmins(text, options);
 
     return sent !== null;
   }

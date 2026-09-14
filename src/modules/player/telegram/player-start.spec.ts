@@ -20,10 +20,12 @@
  */
 import type { Context } from 'grammy';
 
-import { TENANT_BOOTSTRAP_ID } from '@core/tenant';
+import { TENANT_BOOTSTRAP_ID, runWithTenant } from '@core/tenant';
 
 import { PlayerTelegramHandlers } from './player.handlers';
 
+/** Another operator, so a handler that named a fixed operator could not pass by coincidence. */
+const SECOND_OPERATOR_ID = '22222222-2222-4222-8222-222222222222';
 const TELEGRAM_USER_ID = 912911246;
 const PLAYER_ID = '9f3c1e58-0000-4000-8000-00000000aaaa';
 const AGENT_ID = '2372020';
@@ -122,10 +124,19 @@ function harness(options: { isNew?: boolean; alreadyLinked?: boolean } = {}): Ha
 const ctxOf = (handlers: PlayerTelegramHandlers): Context =>
   (handlers as unknown as { __ctx: Context }).__ctx;
 
+/**
+ * Runs a handler the way TelegramUpdateProcessor does: inside the tenant context of the operator
+ * whose bot received the update. The handlers read their operator from there.
+ */
+const asBotTenant = <T>(
+  body: () => Promise<T>,
+  tenantId: string = TENANT_BOOTSTRAP_ID,
+): Promise<T> => runWithTenant(tenantId, body);
+
 describe('/start registers the player under our agent', () => {
   it('creates the player row from the Telegram identity', async () => {
     const h = harness();
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     expect(h.upsertFromTelegram).toHaveBeenCalledTimes(1);
     // (tx, tenantId, profile, currencyCode): the tenant sits between the transaction and the
@@ -141,20 +152,20 @@ describe('/start registers the player under our agent', () => {
     expect(call[3]).toBe('NSP');
   });
 
-  it('files the player under the bot operator, not whatever tenant is ambient', async () => {
-    // A Telegram update carries no tenant of its own — no request, no header — so the handler names
-    // one itself: BOT_TENANT_ID in player.handlers.ts, which is TENANT_BOOTSTRAP_ID for as long as
-    // there is a single bot. Asserting the value is what stops a future second operator's players
-    // from being filed under whichever tenant happened to be ambient when the update landed.
+  it('files the player under the operator whose bot received the update', async () => {
+    // A Telegram update carries no tenant of its own — no request, no header. The update processor
+    // enters the operator the webhook resolved from its path token, and the player must be filed
+    // under THAT operator. A second operator is used on purpose: a handler that still named the
+    // bootstrap operator would file this player there and fail here.
     const h = harness();
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)), SECOND_OPERATOR_ID);
 
-    expect(h.upsertFromTelegram.mock.calls[0]?.[1]).toBe(TENANT_BOOTSTRAP_ID);
+    expect(h.upsertFromTelegram.mock.calls[0]?.[1]).toBe(SECOND_OPERATOR_ID);
   });
 
   it('registers the Ichancy account ON /start, not at the first credit', async () => {
     const h = harness();
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     expect(h.ensureLinked).toHaveBeenCalledTimes(1);
     expect(h.ensureLinked).toHaveBeenCalledWith(PLAYER_ID, 'telegram:/start');
@@ -162,14 +173,14 @@ describe('/start registers the player under our agent', () => {
 
   it('tells the player their gaming account is ready', async () => {
     const h = harness();
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     expect(h.replies.some((text) => text.includes('تم إنشاء حساب اللعب'))).toBe(true);
   });
 
   it('posts one arrivals card to the admin group, naming the agent-side identifiers', async () => {
     const h = harness();
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     expect(h.adminMessages).toHaveLength(1);
     const card = h.adminMessages[0];
@@ -185,7 +196,7 @@ describe('/start registers the player under our agent', () => {
     // A returning player: the row is not new and the account already exists. The agent must NOT see
     // a second player appear, and the group must not get a second arrivals card.
     const h = harness({ isNew: false, alreadyLinked: true });
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     // ensureLinked is still CALLED — it is the idempotent probe — but it reports created:false,
     // which is what keeps both the confirmation and the admin card from being sent again.
@@ -200,7 +211,7 @@ describe('/start registers the player under our agent', () => {
     const h = harness();
     h.ensureLinked.mockRejectedValueOnce(new Error('CLOUDFLARE_CHALLENGE'));
 
-    await expect(h.handlers.onStart(ctxOf(h.handlers))).resolves.toBeUndefined();
+    await expect(asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)))).resolves.toBeUndefined();
 
     expect(h.replies.some((text) => text.includes('أهلاً وسهلاً'))).toBe(true);
     expect(h.replies.some((text) => text.toLowerCase().includes('cloudflare'))).toBe(false);
@@ -214,7 +225,7 @@ describe('the player is told how to sign in', () => {
    */
   it('sends the login and password when the account is created', async () => {
     const h = harness();
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     const card = h.replies.find((text) => text.includes('اسم المستخدم'));
     expect(card).toBeDefined();
@@ -227,7 +238,7 @@ describe('the player is told how to sign in', () => {
     // They already have them; re-posting a password into a chat on every /start is a leak waiting
     // to be screenshotted. /account is how a player asks for them again.
     const h = harness({ isNew: false, alreadyLinked: true });
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     expect(h.replies.some((text) => text.includes('كلمة السر'))).toBe(false);
   });
@@ -239,7 +250,7 @@ describe('the player is told how to sign in', () => {
     const ctx = ctxOf(h.handlers) as unknown as { chat: { type: string } };
     ctx.chat.type = 'supergroup';
 
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     // Assert on the SECRET ITSELF, not on the word "password": the group reply deliberately mentions
     // the word while telling the player where to get them, and an assertion on the label would fail
@@ -316,7 +327,7 @@ describe('👤 حسابي shows an existing account its sign-in details', () => 
 
   it('prints the login and password in a private chat', async () => {
     const h = profileHarness('private');
-    await h.handlers.onProfile(h.ctx);
+    await asBotTenant(() => h.handlers.onProfile(h.ctx));
 
     const profile = h.replies[0] ?? '';
     expect(profile).toContain('p912911246_7fszgwgh');
@@ -326,7 +337,7 @@ describe('👤 حسابي shows an existing account its sign-in details', () => 
 
   it('withholds them in a group and points at a private chat instead', async () => {
     const h = profileHarness('supergroup');
-    await h.handlers.onProfile(h.ctx);
+    await asBotTenant(() => h.handlers.onProfile(h.ctx));
 
     const profile = h.replies[0] ?? '';
     expect(profile).not.toContain('Qk3mZ9xLp2vAa1!');

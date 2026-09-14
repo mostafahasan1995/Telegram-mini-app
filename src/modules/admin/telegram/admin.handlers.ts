@@ -47,7 +47,7 @@ import { AppConfigService } from '@core/config/config.service';
 import { ICHANCY_PORT, type IchancyPort, isIchancyOk } from '@core/ichancy';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { OnCommand } from '@core/telegram/decorators/handlers.decorator';
-import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
+import { requireEffectiveTenantId } from '@core/tenant/tenant.storage';
 
 import {
   ActivityReportService,
@@ -188,12 +188,15 @@ export class AdminTelegramHandlers {
       return;
     }
 
-    // A Telegram id identifies a player only WITHIN an operator now, and an inbound update carries
-    // no tenant. TEMPORARY: phase 6 resolves the tenant from the webhook path token; until then
-    // there is exactly one bot and every player it has ever seen is the bootstrap operator's.
+    // A Telegram id identifies a player only WITHIN an operator, and an inbound update carries no
+    // tenant of its own. The operator is the one whose bot received this command, which
+    // TelegramUpdateProcessor entered from the webhook path token.
     const player = await this.prisma.player.findUnique({
       where: {
-        tenantId_telegramUserId: { tenantId: TENANT_BOOTSTRAP_ID, telegramUserId: BigInt(raw) },
+        tenantId_telegramUserId: {
+          tenantId: requireEffectiveTenantId(),
+          telegramUserId: BigInt(raw),
+        },
       },
       select: { id: true, ichancyPlayerId: true },
     });
@@ -515,14 +518,13 @@ export class AdminTelegramHandlers {
     if (from === undefined || from.is_bot) return null;
 
     try {
-      // Authority is measured in a tenant, and an inbound update has none to measure it in. The one
-      // bot in service belongs to the bootstrap operator, so that is the only tenant in which a
-      // Telegram id here can mean staff. TEMPORARY: phase 6 resolves it from the webhook path
-      // token, and this becomes the tenant that actually received the update.
+      // Authority is measured in a tenant: the operator whose bot received this update, entered by
+      // TelegramUpdateProcessor. Staff of another operator are nobody here, even when the same
+      // Telegram account is an admin there. Inside the try, so a missing context fails closed too.
       //
       // The Telegram door, never the id door: a console-only admin (no Telegram id) cannot be
       // reached from the bot at all, which is correct — nothing here could prove it is them.
-      return await this.admins.resolveByTelegram(TENANT_BOOTSTRAP_ID, BigInt(from.id));
+      return await this.admins.resolveByTelegram(requireEffectiveTenantId(), BigInt(from.id));
     } catch (error: unknown) {
       // Failing CLOSED: a database or cache hiccup must not hand out the float, so an unreadable
       // identity is treated as "not an admin" rather than surfaced to the caller.

@@ -369,8 +369,10 @@ export class AgentFloatSyncService {
     const watermarkMinor = this.config.limits.agentFloatLowWatermarkMinor;
     const shortfallMinor = watermarkMinor - availableMinor;
     // notifyAdmins ONLY — never notifyFeed: this is our working capital and the fact that we are
-    // nearly out of it. The feed group may contain customers, for whom it is a run signal.
+    // nearly out of it. The feed group may contain customers, for whom it is a run signal. Sent
+    // through THIS operator's bot: it is this operator's float.
     await this.bot.notifyAdmins(
+      tenantId,
       [
         '⚠️ <b>تنبيه: رصيد الكاشيرة منخفض</b>',
         '━━━━━━━━━━━━━━━━━━━━',

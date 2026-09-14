@@ -36,8 +36,7 @@ import { PrismaService } from '@core/prisma/prisma.service';
 import { OnCallback, OnMessage } from '@core/telegram/decorators/handlers.decorator';
 import { BotService } from '@core/telegram/services/bot.service';
 import { decodeCallbackData } from '@core/telegram/utils/callback-data.util';
-// Imported from the source file rather than the '@core/tenant' barrel, which does not re-export it.
-import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 import { DEPOSIT_CALLBACK_NS } from '../deposit.constants';
 import { DepositService } from '../services/deposit.service';
@@ -81,12 +80,13 @@ export class DepositTelegramHandlers {
     // a payment proof, and attaching it to somebody's deposit would be worse than ignoring it.
     if (ctx.chat?.type !== 'private') return;
 
-    // TEMPORARY: there is one bot, and an inbound update carries nothing that identifies an
-    // operator, so every player the bot sees belongs to the bootstrap tenant. Phase 6 resolves the
-    // tenant from the webhook path token and this constant goes away.
+    // The operator whose bot received this photo. An update carries nothing that names an operator;
+    // TelegramUpdateProcessor entered it from the webhook path token the update arrived on. A
+    // Telegram id is a player only within one operator, so every lookup below is pinned to it.
+    const tenantId = requireEffectiveTenantId();
     const player = await this.prisma.player.findUnique({
       where: {
-        tenantId_telegramUserId: { tenantId: TENANT_BOOTSTRAP_ID, telegramUserId: BigInt(from.id) },
+        tenantId_telegramUserId: { tenantId, telegramUserId: BigInt(from.id) },
       },
       select: { id: true },
     });
@@ -96,9 +96,9 @@ export class DepositTelegramHandlers {
     }
 
     const open = await this.prisma.depositRequest.findMany({
-      // Spelled out rather than left to the tenant-scope extension: a bot update runs outside any
-      // request, so there is no ambient tenant for the extension to inject. Same phase-6 caveat.
-      where: { tenantId: TENANT_BOOTSTRAP_ID, playerId: player.id, status: { in: [...PROOFABLE] } },
+      // Spelled out as well as injected by the tenant-scope extension: this is the query that picks
+      // which deposit a receipt lands on, and its operator should be visible where it is decided.
+      where: { tenantId, playerId: player.id, status: { in: [...PROOFABLE] } },
       orderBy: { createdAt: 'desc' },
       take: 5,
       select: { id: true, shortId: true, status: true },
@@ -130,6 +130,7 @@ export class DepositTelegramHandlers {
       // Streamed straight into the bucket — never buffered. Normalization happens on the media
       // queue afterwards; see ProofIngestService.
       const stored = await this.files.fetchToStorage(
+        tenantId,
         largest.file_id,
         rawProofKey(target.id, `${largest.file_unique_id}.jpg`),
       );
@@ -186,24 +187,33 @@ export class DepositTelegramHandlers {
     const from = ctx.from;
     if (query === undefined || from === undefined) return;
 
+    // The operator whose bot carries this button, entered by TelegramUpdateProcessor. Both the reply
+    // and the authority check below belong to it.
+    const tenantId = requireEffectiveTenantId();
+
     const decoded = decodeCallbackData(query.data);
     if (decoded === null || decoded.ns !== DEPOSIT_CALLBACK_NS) {
-      await this.bot.answerCallback(query.id, 'That button is no longer valid.');
+      await this.bot.answerCallback(tenantId, query.id, 'That button is no longer valid.');
       return;
     }
 
     const depositRequestId = decoded.args[0];
     if (depositRequestId === undefined) {
-      await this.bot.answerCallback(query.id, 'That button is missing its deposit.');
+      await this.bot.answerCallback(tenantId, query.id, 'That button is missing its deposit.');
       return;
     }
 
-    // THE authority check. Never the chat, always the tapper — see the header. The tenant is the
-    // admin's HOME, which for the single bootstrap bot is the bootstrap operator; phase 6 derives
-    // it from the webhook path token instead.
-    const admin = await this.admins.resolveByTelegram(TENANT_BOOTSTRAP_ID, BigInt(from.id));
+    // THE authority check. Never the chat, always the tapper — see the header. It is measured in the
+    // operator that received the tap: staff of another operator are nobody here, even if the same
+    // Telegram account is an admin there.
+    const admin = await this.admins.resolveByTelegram(tenantId, BigInt(from.id));
     if (admin === null) {
-      await this.bot.answerCallback(query.id, 'You are not authorised to act on deposits.', true);
+      await this.bot.answerCallback(
+        tenantId,
+        query.id,
+        'You are not authorised to act on deposits.',
+        true,
+      );
       this.logger.warn(
         `non-admin telegram user ${from.id} tapped a deposit button on ${depositRequestId}`,
       );
@@ -212,14 +222,14 @@ export class DepositTelegramHandlers {
 
     try {
       const outcome = await this.dispatch(decoded.action, depositRequestId, admin);
-      await this.bot.answerCallback(query.id, this.describe(outcome, admin));
+      await this.bot.answerCallback(tenantId, query.id, this.describe(outcome, admin));
     } catch (cause) {
       const message = isAppException(cause) ? cause.message : 'That action could not be completed.';
       this.logger.warn(
         `deposit callback ${decoded.action} on ${depositRequestId} by ${admin.displayName} failed: ` +
           (cause instanceof Error ? cause.message : String(cause)),
       );
-      await this.bot.answerCallback(query.id, message, true);
+      await this.bot.answerCallback(tenantId, query.id, message, true);
     }
 
     // Redraw the SAME message, whatever happened — including on failure, because a failure usually
@@ -309,7 +319,7 @@ export class DepositTelegramHandlers {
       requiresSecondApproval: deposit.status === DepositStatus.PENDING_SECOND_APPROVAL,
     });
 
-    await this.bot.editMessageText(message.chat.id, message.message_id, text, {
+    await this.bot.editMessageText(deposit.tenantId, message.chat.id, message.message_id, text, {
       parseMode: 'HTML',
       replyMarkup: renderAdminKeyboard(deposit),
       linkPreview: false,

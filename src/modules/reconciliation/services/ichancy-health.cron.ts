@@ -118,9 +118,14 @@ export class IchancyHealthAlertCron {
     const text =
       snapshot.state === 'DOWN' ? this.downMessage(snapshot) : await this.upMessage(snapshot);
 
-    // notifyAdmins ONLY, never notifyFeed: the feed chat may contain customers, and "the casino
-    // integration is down" reads to them as "my money is gone".
-    const sent = await this.bot.notifyAdmins(text, { parseMode: 'HTML', linkPreview: false });
+    // Admins ONLY, never the feed: the feed chat may contain customers, and "the casino integration
+    // is down" reads to them as "my money is gone". A PLATFORM alert: the outage is the agent API's,
+    // not one operator's, so no operator's bot is the right sender, and it is not delivered until
+    // platform alerts are given a destination (it returns null, handled below).
+    const sent = await this.bot.notifyPlatformAdmins(text, {
+      parseMode: 'HTML',
+      linkPreview: false,
+    });
     if (sent === null) {
       // notifyAdmins returns null rather than throwing when the chat is unreachable. Keeping the
       // marker would mean we had "alerted" into a void and would never try again — so drop it and

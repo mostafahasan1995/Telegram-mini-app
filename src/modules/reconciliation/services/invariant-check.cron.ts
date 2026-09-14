@@ -245,8 +245,13 @@ export class InvariantCheckCron {
     if (worst.length > 0) {
       lines.push('', '<b>At least one is a real imbalance, not a cache drift.</b>');
     }
-    // notifyAdmins ONLY — never notifyFeed: "our books do not add up" is an internal engineering
-    // signal, and in a group that may contain customers it reads as "your money is missing".
-    await this.bot.notifyAdmins(lines.join('\n'), { parseMode: 'HTML', linkPreview: false });
+    // Admins ONLY — never the feed: "our books do not add up" is an internal engineering signal, and
+    // in a group that may contain customers it reads as "your money is missing". A PLATFORM alert:
+    // one check spans every operator's ledger, so no single operator's bot is the sender, and it is
+    // not delivered until platform alerts are given a destination. The error log above still fires.
+    await this.bot.notifyPlatformAdmins(lines.join('\n'), {
+      parseMode: 'HTML',
+      linkPreview: false,
+    });
   }
 }

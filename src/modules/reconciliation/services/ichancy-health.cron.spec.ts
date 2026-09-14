@@ -77,7 +77,8 @@ function build(options: { isWorker?: boolean; fake?: boolean } = {}): {
 
   const cron = new IchancyHealthAlertCron(
     { snapshot } as unknown as IchancyHealthService,
-    { notifyAdmins } as unknown as BotService,
+    // A platform alert: the outage is the agent API's, not one operator's.
+    { notifyPlatformAdmins: notifyAdmins } as unknown as BotService,
     {
       acquire: jest.fn().mockResolvedValue(HANDLE),
       release: jest.fn().mockResolvedValue(true),

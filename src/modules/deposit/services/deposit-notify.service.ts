@@ -13,6 +13,10 @@
  *
  * `adminChatId`/`adminMessageId` are recorded on the deposit the first time a card is posted, so
  * every later edit addresses that exact message across process restarts.
+ *
+ * WHICH BOT: always the bot of the operator that OWNS the deposit or player, read off that row. The
+ * telegram queue's jobs carry only an id and run with no tenant context, so the row is the one
+ * trustworthy answer, and a card sent through another operator's bot would leak this one's data.
  */
 import { Injectable, Logger } from '@nestjs/common';
 import { DepositStatus, type Prisma } from '@prisma/client';
@@ -22,6 +26,7 @@ import { IdempotencyService } from '@core/idempotency/idempotency.service';
 import { BALANCE_SNAPSHOT_METADATA_KEY, ichancyAgentFloatCode } from '@core/ledger';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { BotService } from '@core/telegram/services/bot.service';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 import { OPS_CARD_FEED_IDEMPOTENCY_SCOPE, OPS_CARD_IDEMPOTENCY_SCOPE } from '../deposit.constants';
 import { DepositRepository } from '../repositories/deposit.repository';
@@ -84,6 +89,7 @@ export class DepositNotifyService {
 
     if (deposit.adminChatId !== null && deposit.adminMessageId !== null) {
       const edited = await this.bot.editMessageText(
+        deposit.tenantId,
         deposit.adminChatId,
         Number(deposit.adminMessageId),
         text,
@@ -95,7 +101,7 @@ export class DepositNotifyService {
       this.logger.warn(`card for ${deposit.shortId} was gone; posting a new one (${reason})`);
     }
 
-    const message = await this.bot.notifyAdmins(text, {
+    const message = await this.bot.notifyAdmins(deposit.tenantId, text, {
       parseMode: 'HTML',
       replyMarkup: keyboard,
       linkPreview: false,
@@ -140,6 +146,7 @@ export class DepositNotifyService {
       where: { id: depositRequestId },
       select: {
         id: true,
+        tenantId: true,
         shortId: true,
         currencyCode: true,
         claimedAmountMinor: true,
@@ -204,7 +211,7 @@ export class DepositNotifyService {
    * failed send after giving the key back. This is the card that matters operationally.
    */
   private async postAdminOpsCard(
-    deposit: { id: string; shortId: string },
+    deposit: { id: string; tenantId: string; shortId: string },
     text: string,
   ): Promise<void> {
     const begun = await this.idempotency.begin({
@@ -231,7 +238,10 @@ export class DepositNotifyService {
     }
 
     try {
-      const message = await this.bot.notifyAdmins(text, { parseMode: 'HTML', linkPreview: false });
+      const message = await this.bot.notifyAdmins(deposit.tenantId, text, {
+        parseMode: 'HTML',
+        linkPreview: false,
+      });
       if (message === null) {
         // Permanently unreachable admin chat — same terminal outcome as the review card path.
         await this.idempotency.release(begun.lease, 'admin chat unreachable');
@@ -265,7 +275,7 @@ export class DepositNotifyService {
    * (or to a concurrent worker holding the key) stays lost — which is the right trade for a mirror.
    */
   private async postFeedOpsCard(
-    deposit: { id: string; shortId: string },
+    deposit: { id: string; tenantId: string; shortId: string },
     card: OpsCardInput,
     adminText: string,
   ): Promise<void> {
@@ -303,7 +313,10 @@ export class DepositNotifyService {
       const text = this.config.telegram.feedFullDetail ? adminText : renderOpsCardPublic(card);
 
       try {
-        const message = await this.bot.notifyFeed(text, { parseMode: 'HTML', linkPreview: false });
+        const message = await this.bot.notifyFeed(deposit.tenantId, text, {
+          parseMode: 'HTML',
+          linkPreview: false,
+        });
         if (message === null) {
           await this.idempotency.release(begun.lease, 'feed chat unreachable');
           this.logger.warn(
@@ -337,19 +350,28 @@ export class DepositNotifyService {
   ): Promise<void> {
     const player = await this.prisma.player.findUnique({
       where: { id: playerId },
-      select: { telegramUserId: true },
+      select: { tenantId: true, telegramUserId: true },
     });
     if (player === null) {
       this.logger.warn(`cannot notify unknown player ${playerId}`);
       return;
     }
-    await this.bot.sendMessage(player.telegramUserId, renderPlayerMessage(template, params), {
-      parseMode: 'HTML',
-      linkPreview: false,
-    });
+    // A player's Telegram id is only a chat the bot they started can write to, which is their
+    // operator's bot.
+    await this.bot.sendMessage(
+      player.tenantId,
+      player.telegramUserId,
+      renderPlayerMessage(template, params),
+      { parseMode: 'HTML', linkPreview: false },
+    );
   }
 
-  /** Operator alert. Deliberately loud and deliberately separate from the review cards. */
+  /**
+   * Operator alert. Deliberately loud and deliberately separate from the review cards.
+   *
+   * Runs only inside the outbox dispatcher, which enters `runWithTenant()` with the outbox row's own
+   * tenant, so the ambient tenant IS the operator the alert is about.
+   */
   async alertAdmins(payload: {
     shortId?: string;
     severity: string;
@@ -364,7 +386,10 @@ export class DepositNotifyService {
       payload.hint === undefined ? null : `<i>${esc(payload.hint)}</i>`,
     ].filter((line): line is string => line !== null);
 
-    await this.bot.notifyAdmins(lines.join('\n'), { parseMode: 'HTML', linkPreview: false });
+    await this.bot.notifyAdmins(requireEffectiveTenantId(), lines.join('\n'), {
+      parseMode: 'HTML',
+      linkPreview: false,
+    });
   }
 
   private playerLabel(player: { telegramUserId: bigint; telegramUsername: string | null }): string {

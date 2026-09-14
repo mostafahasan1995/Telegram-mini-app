@@ -8,12 +8,9 @@
  * `forbidNonWhitelisted` difference makes a request valid here and a 400 there. There is one
  * definition of "this api", and both callers use it.
  *
- * TWO THINGS ARE STUBBED, AND ONLY TWO:
- *  - the Ichancy port, by env (`ICHANCY_FAKE=1`), because the alternative is a test that moves
- *    real money;
- *  - the grammY Bot, whose factory otherwise calls getMe() against api.telegram.org on every boot.
- *    In the api role that failure is only a warning, so the suite would still work — it would just
- *    pay a network timeout per boot and be red when a laptop is offline.
+ * ONE THING IS STUBBED, AND ONLY ONE: the Ichancy port, by env (`ICHANCY_FAKE=1`), because the
+ * alternative is a test that moves real money. Telegram needs no stub at boot: no bot is built until
+ * an operator needs one (TenantBotRegistry), so booting never calls api.telegram.org.
  * Everything else is the production object: real Prisma, real Redis, real BullMQ producers, real
  * ledger triggers, real guards.
  *
@@ -27,8 +24,6 @@ import type { Server } from 'node:http';
 
 import { Test, type TestingModule } from '@nestjs/testing';
 import { type NestExpressApplication } from '@nestjs/platform-express';
-import { Bot } from 'grammy';
-import { type UserFromGetMe } from 'grammy/types';
 
 // The leaf tenancy files rather than the '@core/tenant' barrel. The barrel also exports TenantModule
 // and the middleware, and importing those evaluates a slice of the DI graph at FILE LOAD — before
@@ -88,31 +83,8 @@ export interface TestApp {
   close: () => Promise<void>;
 }
 
-/**
- * Offline stand-in for getMe(). EXPORTED so every suite that overrides TELEGRAM_BOT uses this one
- * object: grammY's `UserFromGetMe` gains required fields between versions, and a second copy of
- * this literal is a compile error waiting to happen in whichever file gets forgotten.
- */
-export const TEST_BOT_INFO: UserFromGetMe = {
-  id: 123_456_789,
-  is_bot: true,
-  first_name: 'Ichancy Cashier Test',
-  username: 'ichancy_cashier_test_bot',
-  can_join_groups: true,
-  can_read_all_group_messages: false,
-  supports_inline_queries: false,
-  can_connect_to_business: false,
-  has_main_web_app: false,
-  has_topics_enabled: false,
-  allows_users_to_create_topics: false,
-  can_manage_bots: false,
-  supports_join_request_queries: false,
-};
-
-/** The overridden Bot itself, so a suite that builds its own TestingModule matches the factory. */
-export function createTestBot(): Bot {
-  return new Bot(process.env.TELEGRAM_BOT_TOKEN ?? '1:x', { botInfo: TEST_BOT_INFO });
-}
+// Re-exported from its Nest-free home so existing imports keep working; see telegram-fixtures.ts.
+export { TEST_BOT_INFO } from './telegram-fixtures';
 
 export async function createTestApp(options: CreateTestAppOptions = {}): Promise<TestApp> {
   const shouldSeed = options.seed ?? true;
@@ -126,11 +98,8 @@ export async function createTestApp(options: CreateTestAppOptions = {}): Promise
   const { AppModule } = await import('../../src/app.module');
   const { configureApiApp, API_APP_OPTIONS } = await import('../../src/main');
   const { AppConfigService } = await import('@core/config/config.service');
-  const { TELEGRAM_BOT } = await import('@core/telegram/telegram.constants');
 
-  const builder = Test.createTestingModule({ imports: [AppModule] })
-    .overrideProvider(TELEGRAM_BOT)
-    .useValue(createTestBot());
+  const builder = Test.createTestingModule({ imports: [AppModule] });
 
   options.customize?.(builder);
 

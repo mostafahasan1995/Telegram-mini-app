@@ -30,8 +30,9 @@
  * therefore converges on the existing account instead of minting a second one.
  *
  * ══ WHY IT DOES NOT MESSAGE THE PLAYER ════════════════════════════════════════════════════════
- * modules/player must not import TelegramModule (the Bot factory calls getMe at construction — see
- * player.handlers.ts and src/modules/modules.int.spec.ts). A rescued player sees their credentials
+ * modules/player must not import TelegramModule (it would drag the webhook, the update queue and the
+ * bot registry into this module's graphs — see player.handlers.ts and
+ * src/modules/modules.int.spec.ts). A rescued player sees their credentials
  * under 👤 حسابي, and the admin group is told by IchancyHealthAlertCron. DMing them would be an
  * outbox topic plus a handler in OutboxModule.forWorker — a separable follow-up.
  */

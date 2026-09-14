@@ -11,12 +11,11 @@
 import request from 'supertest';
 import { Test } from '@nestjs/testing';
 
-import { createTestApp, createTestBot, type TestApp } from './setup/app-factory';
+import { createTestApp, type TestApp } from './setup/app-factory';
 import { startPostgres, stopPostgres } from './setup/postgres-container';
 import { startRedis, stopRedis } from './setup/redis-container';
 import { applyTestEnv } from './setup/test-env';
 import { THROTTLE_RULES, findUnmatchedRules } from '@core/throttler/throttle-routes';
-import { TELEGRAM_BOT } from '@core/telegram/telegram.constants';
 import { OUTBOX_HANDLERS, type OutboxTopicHandler } from '@core/outbox/outbox.types';
 // The constants FILE, not the '@core/tenant' barrel — which does export both of these. The barrel
 // also exports TenantModule, and importing a Nest module here would build a slice of the DI graph
@@ -352,12 +351,9 @@ describe('worker composition', () => {
     const { WorkerBootstrapService } = await import('../src/worker-bootstrap.service');
     const { OutboxDispatchProcessor } = await import('@core/outbox/outbox-dispatch.processor');
 
-    const moduleRef = await Test.createTestingModule({ imports: [WorkerModule] })
-      .overrideProvider(TELEGRAM_BOT)
-      // Without this the worker-role bot factory throws at boot: it hard-fails when getMe() cannot
-      // be resolved, because a worker that cannot match commands would mis-handle every one.
-      .useValue(createTestBot())
-      .compile();
+    // Nothing Telegram is stubbed: no bot is built at boot any more, so the worker graph must
+    // compile with no token and no network. A graph that needed a bot to boot would fail right here.
+    const moduleRef = await Test.createTestingModule({ imports: [WorkerModule] }).compile();
 
     try {
       // The consumer that did not exist before this composition: without it every Telegram update

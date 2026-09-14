@@ -74,8 +74,9 @@ import {
   encodeCallbackData,
 } from '@core/telegram/utils/callback-data.util';
 import { ICHANCY_PORT, type IchancyPort, isIchancyOk } from '@core/ichancy';
-// Not the '@core/tenant' barrel: it re-exports TENANT_ZERO_ID but not TENANT_BOOTSTRAP_ID.
-import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
+// The leaf file, not the '@core/tenant' barrel: the barrel also exports TenantModule, and this module
+// deliberately stays out of the Nest graphs it would pull in.
+import { requireEffectiveTenantId } from '@core/tenant/tenant.storage';
 import { isAppException } from '@common/exceptions/app.exception';
 import { formatMinorToDecimal, parseDecimalToMinor } from '@common/helpers/money.util';
 import { playerActor, type Actor } from '@common/types/actor.type';
@@ -91,15 +92,16 @@ import type { LinkedIchancyAccount } from '../player-link.port';
 const ABOUT_NAME = 'Ichancy Cashier';
 
 /**
- * Whose players these handlers act on. TEMPORARY — delete it in phase 6, when each operator has its
- * own bot and the tenant is resolved from the webhook path token.
+ * Whose players these handlers act on: the operator whose bot received the update.
  *
- * An inbound Telegram update carries no tenant: `from.id` is a Telegram account, and the same
- * account could be a player of two operators once there are two. There is exactly one bot today —
- * the one in TELEGRAM_BOT_TOKEN — so every update it receives belongs to the operator that was
- * taking deposits before multi-tenancy, which is what TENANT_BOOTSTRAP_ID names.
+ * An inbound Telegram update carries no tenant: `from.id` is a Telegram account, and the same account
+ * can be a player of two operators. Each operator has its own bot, the webhook resolves the operator
+ * from the path token the update arrived on, and TelegramUpdateProcessor dispatches the update inside
+ * `runWithTenant()` for that operator. Reading it here, instead of naming a fixed operator, is what
+ * files a second operator's players under that operator. Outside a dispatched update this throws,
+ * which is a bug worth hearing about rather than a tenant worth guessing.
  */
-const BOT_TENANT_ID = TENANT_BOOTSTRAP_ID;
+const botTenantId = (): string => requireEffectiveTenantId();
 
 /**
  * OUR callback namespace. `dep` belongs to the deposit module's ADMIN card
@@ -444,7 +446,7 @@ export class PlayerTelegramHandlers {
     const payload = typeof ctx.match === 'string' ? ctx.match : '';
 
     const referral = await this.referrals
-      .bindFromStartPayload(BOT_TENANT_ID, playerId, BigInt(from.id), payload, 'telegram:/start')
+      .bindFromStartPayload(botTenantId(), playerId, BigInt(from.id), payload, 'telegram:/start')
       .catch((error: unknown) => {
         // A broken deep link must never stop someone using the bot.
         this.logger.warn(`Referral capture failed for player ${playerId}: ${describeError(error)}`);
@@ -604,9 +606,10 @@ export class PlayerTelegramHandlers {
    * player's command, and a card that says "new player" for one would be a lie.
    *
    * WHY ctx.api RATHER THAN BotService.notifyAdmins: BotService lives in @core/telegram, which
-   * PlayerModule does not import — and importing it would drag the Bot factory (a getMe round trip at
-   * construction) into every graph that boots PlayerModule on its own, including
-   * src/modules/modules.int.spec.ts. `ctx.api` IS the very Api instance serving this update, autoRetry
+   * PlayerModule does not import — and importing it would drag the Telegram module (its queue, its
+   * webhook controller and the per-operator bot registry) into every graph that boots PlayerModule
+   * on its own, including src/modules/modules.int.spec.ts. `ctx.api` IS the Api of the operator's
+   * own bot serving this update, autoRetry
    * included; the only thing given up is BotService's blocked/unreachable classification, which the
    * catch below replaces. A card that cannot be delivered must never cost the player their /start.
    *
@@ -791,7 +794,7 @@ export class PlayerTelegramHandlers {
     const from = ctx.from;
     if (from === undefined || from.is_bot) return;
 
-    const player = await this.playerRepo.findByTelegramUserId(BOT_TENANT_ID, BigInt(from.id));
+    const player = await this.playerRepo.findByTelegramUserId(botTenantId(), BigInt(from.id));
     if (player === null) {
       await this.reply(ctx, 'Please send /start first to set up your account.');
       return;
@@ -1220,7 +1223,7 @@ export class PlayerTelegramHandlers {
     const from = ctx.from;
     const isAdmin =
       from !== undefined &&
-      (await this.admins.isAdminByTelegram(BOT_TENANT_ID, BigInt(from.id)).catch(() => false));
+      (await this.admins.isAdminByTelegram(botTenantId(), BigInt(from.id)).catch(() => false));
 
     if (isAdmin) {
       lines.push(
@@ -1558,7 +1561,7 @@ export class PlayerTelegramHandlers {
     if (from === undefined || from.is_bot) return null;
 
     try {
-      const player = await this.playerRepo.findByTelegramUserId(BOT_TENANT_ID, BigInt(from.id));
+      const player = await this.playerRepo.findByTelegramUserId(botTenantId(), BigInt(from.id));
       if (player !== null) return player;
     } catch (error: unknown) {
       this.logger.error(
@@ -1588,7 +1591,7 @@ export class PlayerTelegramHandlers {
       const { playerId, isNew } = await this.prisma.runInTransaction((tx) =>
         this.players.upsertFromTelegram(
           tx,
-          BOT_TENANT_ID,
+          botTenantId(),
           {
             telegramUserId: BigInt(from.id),
             telegramUsername: from.username ?? null,
