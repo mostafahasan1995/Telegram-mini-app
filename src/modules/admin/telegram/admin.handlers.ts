@@ -39,7 +39,7 @@ import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { AdminRole, BreakStatus } from '@prisma/client';
 import type { Context } from 'grammy';
 
-import type { AuthenticatedAdmin } from '@common/decorators/auth.types';
+import type { TelegramAuthenticatedAdmin } from '@common/decorators/auth.types';
 import { formatMinorToDecimal } from '@common/helpers/money.util';
 import { AdminIdentityService } from '@core/auth/services/admin-identity.service';
 import { AppConfigService } from '@core/config/config.service';
@@ -572,7 +572,7 @@ export class AdminTelegramHandlers {
    * cannot identify, for someone who is not staff, and for a lookup that failed — and the caller
    * answers all four the same way, with silence. See the header for why.
    */
-  private async requireAdmin(ctx: Context): Promise<AuthenticatedAdmin | null> {
+  private async requireAdmin(ctx: Context): Promise<TelegramAuthenticatedAdmin | null> {
     const from = ctx.from;
     if (from === undefined || from.is_bot) return null;
 
@@ -581,7 +581,10 @@ export class AdminTelegramHandlers {
       // bot in service belongs to the bootstrap operator, so that is the only tenant in which a
       // Telegram id here can mean staff. TEMPORARY: phase 6 resolves it from the webhook path
       // token, and this becomes the tenant that actually received the update.
-      return await this.admins.resolve(TENANT_BOOTSTRAP_ID, BigInt(from.id));
+      //
+      // The Telegram door, never the id door: a console-only admin (no Telegram id) cannot be
+      // reached from the bot at all, which is correct — nothing here could prove it is them.
+      return await this.admins.resolveByTelegram(TENANT_BOOTSTRAP_ID, BigInt(from.id));
     } catch (error: unknown) {
       // Failing CLOSED: a database or cache hiccup must not hand out the float, so an unreadable
       // identity is treated as "not an admin" rather than surfaced to the caller.

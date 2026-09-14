@@ -66,6 +66,9 @@ function sanitizeIp(ip: string | null | undefined): string | null {
 
 const sha256Hex = (value: string): string => createHash('sha256').update(value).digest('hex');
 
+/** A signed decimal Telegram id: at most 20 characters including a sign, nothing else. */
+const TELEGRAM_ID_CLAIM_PATTERN = /^-?\d{1,19}$/;
+
 @Injectable()
 export class SessionService {
   private readonly logger = new Logger(SessionService.name);
@@ -326,25 +329,45 @@ export class SessionService {
     // `tid` is required: a token minted before the tenant claim existed carries no operator, and
     // serving it would mean resolving identity with no tenant at all. Those tokens are rejected
     // rather than defaulted — their holders sign in again and get a well-formed one.
+    const invalid = (): UnauthorizedError =>
+      new UnauthorizedError(CommonErrorCodes.INVALID_TOKEN, 'The access token is not valid.');
+
     if (
       typeof claims?.sub !== 'string' ||
-      typeof claims.tgid !== 'string' ||
+      claims.sub.length === 0 ||
       typeof claims.sid !== 'string' ||
       typeof claims.role !== 'string' ||
       typeof claims.tid !== 'string' ||
       claims.tid.length === 0
     ) {
-      throw new UnauthorizedError(CommonErrorCodes.INVALID_TOKEN, 'The access token is not valid.');
+      throw invalid();
+    }
+
+    // `tgid` is required for a PLAYER — the player principal carries it — and optional for an
+    // admin, who is resolved by (tid, sub) alone: a console-only admin has no Telegram id to sign.
+    // When present it must be a decimal id either way, so the guard's BigInt() can never throw a
+    // SyntaxError that would surface as a 500 instead of a 401.
+    const tgid: unknown = claims.tgid;
+    if (claims.role === PLAYER_ROLE) {
+      if (typeof tgid !== 'string' || !TELEGRAM_ID_CLAIM_PATTERN.test(tgid)) throw invalid();
+    } else if (
+      tgid !== undefined &&
+      (typeof tgid !== 'string' || !TELEGRAM_ID_CLAIM_PATTERN.test(tgid))
+    ) {
+      throw invalid();
     }
 
     return claims;
   }
 
   /**
-   * Admins get an access token but no refresh token: they re-authenticate from Telegram initData,
-   * which is always available inside the mini-app. That keeps `player_sessions` exclusively about
-   * players (an admin is not necessarily a Player row) and means an admin's authority cannot
-   * outlive a deactivation by more than the 60s identity cache.
+   * Admins get an access token but no refresh token: they sign in again when it expires. That keeps
+   * `player_sessions` exclusively about players (an admin is not necessarily a Player row) and means
+   * an admin's authority cannot outlive a deactivation by more than the 60s identity cache.
+   *
+   * The token identifies the admin as (tid, sub = AdminUser.id) and carries NO `tgid`, whether or
+   * not the admin has a Telegram account: identity is the row, and a Telegram id in the token would
+   * only invite some later code to resolve the caller by it.
    */
   async issueAdminAccessToken(admin: AuthenticatedAdmin): Promise<{
     accessToken: string;
@@ -353,7 +376,7 @@ export class SessionService {
     const accessToken = await this.signAccessToken(
       admin.adminUserId,
       admin.tenantId,
-      admin.telegramUserId,
+      null,
       admin.role,
       randomUUID(),
     );
@@ -391,18 +414,19 @@ export class SessionService {
   private signAccessToken(
     subjectId: string,
     tenantId: string,
-    telegramUserId: bigint,
+    telegramUserId: bigint | null,
     role: TokenRole,
     sessionId: string,
   ): Promise<string> {
     // tgid is stringified here and nowhere else: a bigint would throw in JSON.stringify without the
-    // global toJSON patch, and a number would round a 64-bit Telegram id.
+    // global toJSON patch, and a number would round a 64-bit Telegram id. A null id OMITS the
+    // claim rather than signing `"tgid": null`, so "absent" has exactly one spelling.
     //
     // `tid` is SIGNED rather than sent by the client because it is authority: it decides which
     // tenant this principal's identity — and therefore their role — is resolved in.
     return this.jwt.signAsync({
       sub: subjectId,
-      tgid: telegramUserId.toString(),
+      ...(telegramUserId === null ? {} : { tgid: telegramUserId.toString() }),
       role,
       sid: sessionId,
       tid: tenantId,

@@ -201,7 +201,7 @@ export class DepositTelegramHandlers {
     // THE authority check. Never the chat, always the tapper — see the header. The tenant is the
     // admin's HOME, which for the single bootstrap bot is the bootstrap operator; phase 6 derives
     // it from the webhook path token instead.
-    const admin = await this.admins.resolve(TENANT_BOOTSTRAP_ID, BigInt(from.id));
+    const admin = await this.admins.resolveByTelegram(TENANT_BOOTSTRAP_ID, BigInt(from.id));
     if (admin === null) {
       await this.bot.answerCallback(query.id, 'You are not authorised to act on deposits.', true);
       this.logger.warn(

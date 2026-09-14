@@ -1,6 +1,6 @@
 /**
  * WHY MIDDLEWARE AND NOT AN INTERCEPTOR: this has to run BEFORE any guard. AuthGuard resolves the
- * admin identity through AdminIdentityService, which looks the row up by (tenantId, telegramUserId)
+ * admin identity through AdminIdentityService, which looks the row up by (tenantId, adminUserId)
  * — so the tenant has to be established before the guard, and Nest runs middleware first.
  * An interceptor runs AFTER guards and would be too late to be the thing authority is measured in.
  *

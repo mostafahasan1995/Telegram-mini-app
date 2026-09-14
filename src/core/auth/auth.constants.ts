@@ -37,14 +37,26 @@ export const initDataNonceKey = (hash: string): string => `auth:initdata:${hash}
 export const sessionRevocationKey = (sessionId: string): string => `auth:revoked:${sessionId}`;
 
 /**
- * Cached AdminUser lookup (positive AND negative).
+ * Cached AdminUser lookups (positive AND negative). Two keys because there are two ways in, and
+ * they must never share a namespace:
  *
- * KEYED ON THE TENANT AS WELL AS THE TELEGRAM ID, and it must stay that way: an agent principal
- * uses the reserved telegram id 0, so every operator has one. A key of `admin:tg:0` would make the
- * first operator's agent principal answer for all of them — one cached row silently granting
- * another operator's authority.
+ *  - BY ID — every HTTP request. The access token names the admin as (tid, sub), so this is the
+ *    only key the guard reads. A console-only admin has no Telegram id and exists ONLY here.
+ *  - BY TELEGRAM ID — the bot, which knows nothing but `ctx.from.id`.
+ *
+ * BOTH ARE KEYED ON THE TENANT, and must stay that way: an agent principal uses the reserved
+ * telegram id 0, so every operator has one. A key of `admin:tg:0` would make the first operator's
+ * agent principal answer for all of them — one cached row silently granting another operator's
+ * authority. The id key carries the tenant for the same reason the lookup checks it: a token whose
+ * `sub` lives in a different tenant than its `tid` must miss, not hit someone else's cached entry.
+ *
+ * Anything that changes an admin's role or isActive flag must evict BOTH (see
+ * AdminIdentityService.invalidate), or one door keeps the old authority for the TTL.
  */
-export const adminIdentityKey = (tenantId: string, telegramUserId: bigint): string =>
+export const adminIdentityByIdKey = (tenantId: string, adminUserId: string): string =>
+  `admin:id:${tenantId}:${adminUserId}`;
+
+export const adminIdentityByTelegramKey = (tenantId: string, telegramUserId: bigint): string =>
   `admin:tg:${tenantId}:${telegramUserId}`;
 
 export const ADMIN_IDENTITY_TTL_SECONDS = 60;

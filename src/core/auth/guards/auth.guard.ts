@@ -97,10 +97,12 @@ export class AuthGuard implements CanActivate {
       // Note what is NOT trusted here: `claims.role`. It only tells us to look the caller up as an
       // admin; the authoritative role comes from the database (60s cache).
       //
-      // The lookup is scoped to `claims.tid` — the caller's HOME tenant, signed into the token.
-      // Never to the X-Tenant-Id header: resolving identity in a tenant the client named would let
-      // anyone claim whatever role they hold in one operator inside every other operator.
-      const admin = await this.admins.resolve(claims.tid, BigInt(claims.tgid));
+      // The admin is the row named by `sub`, looked up in `claims.tid` — the caller's HOME tenant,
+      // signed into the token. Never the X-Tenant-Id header: resolving identity in a tenant the
+      // client named would let anyone claim whatever role they hold in one operator inside every
+      // other operator. And never `tgid`, even when an older token carries one: a console admin
+      // may have no Telegram account, and a bot-side identifier must not decide console authority.
+      const admin = await this.admins.resolveById(claims.tid, claims.sub);
       if (!admin) {
         throw new ForbiddenError(
           CommonErrorCodes.ADMIN_INACTIVE,

@@ -25,10 +25,14 @@ export class BotCodeDto {
  * `JSON.parse` in a client would round anything above 2^53. The Flutter console parses this field
  * with `BigInt.parse`, so changing it to a number is a breaking change even though the JSON still
  * "looks right".
+ *
+ * It is NULL for a console-only admin (username + password, no Telegram account) — the dashboard's
+ * `adminIdentitySchema` declares it `z.string().nullable()`. It is informational; the session is
+ * bound to `id`, never to this.
  */
 export interface AdminIdentityView {
   id: string;
-  telegramUserId: string;
+  telegramUserId: string | null;
   role: string;
   displayName: string;
 }

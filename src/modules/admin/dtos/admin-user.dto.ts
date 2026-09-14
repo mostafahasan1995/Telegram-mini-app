@@ -99,11 +99,16 @@ export class ListAdminUsersQueryDto {
   offset: number = 0;
 }
 
-/** Never exposes `passwordHash` or `totpSecretEnc`. */
+/**
+ * Never exposes `passwordHash` or `totpSecretEnc`. Mirrors the dashboard's `adminUserSchema`:
+ * `telegramUserId` is null for a console-only admin, and `hasPassword` is the only thing the view
+ * says about the password.
+ */
 export interface AdminUserView {
   id: string;
-  telegramUserId: string;
+  telegramUserId: string | null;
   username: string | null;
+  hasPassword: boolean;
   displayName: string;
   role: AdminRole;
   isActive: boolean;

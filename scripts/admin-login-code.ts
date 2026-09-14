@@ -55,7 +55,7 @@ async function main(): Promise<void> {
       console.log(`\nActive admins (${admins.length}):\n`);
       for (const a of admins) {
         console.log(
-          `  ${a.telegramUserId.toString().padEnd(14)} ` +
+          `  ${(a.telegramUserId === null ? '-' : a.telegramUserId.toString()).padEnd(14)} ` +
             `${(a.username === null ? '-' : `@${a.username}`).padEnd(20)} ` +
             `${a.role.padEnd(14)} ${a.displayName}`,
         );
@@ -82,6 +82,13 @@ async function main(): Promise<void> {
 
     if (admin === null) {
       console.error(`\nNo AdminUser matches "${target}". Run with no argument to list them.\n`);
+      process.exitCode = 1;
+      return;
+    }
+
+    if (admin.telegramUserId === null) {
+      // A bot code is redeemed by Telegram id. A console-only admin signs in with a password.
+      console.error(`\n"${target}" has no Telegram id, so there is no bot code to mint for it.\n`);
       process.exitCode = 1;
       return;
     }

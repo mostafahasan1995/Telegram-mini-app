@@ -8,7 +8,7 @@
  *
  *   HOME      who you ARE. The `tid` claim, signed into the access token at sign-in, taken from
  *             the tenant your `admin_users` row lives in. No header can move it. Authority is
- *             measured here — AdminIdentityService resolves (homeTenantId, telegramUserId).
+ *             measured here — AdminIdentityService resolves (homeTenantId, adminUserId).
  *
  *   EFFECTIVE whose data you are READING. Defaults to home. A PLATFORM_ADMIN whose row is in
  *             tenant zero may point it at another operator for one request with X-Tenant-Id.

@@ -1220,7 +1220,7 @@ export class PlayerTelegramHandlers {
     const from = ctx.from;
     const isAdmin =
       from !== undefined &&
-      (await this.admins.isAdmin(BOT_TENANT_ID, BigInt(from.id)).catch(() => false));
+      (await this.admins.isAdminByTelegram(BOT_TENANT_ID, BigInt(from.id)).catch(() => false));
 
     if (isAdmin) {
       lines.push(

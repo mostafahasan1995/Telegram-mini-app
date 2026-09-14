@@ -10,10 +10,11 @@
  *     two concurrent deactivations would each see "there is still one other" and both succeed —
  *     leaving a system with no administrator and no way in.
  *
- * WHY every mutation invalidates the identity cache: AdminIdentityService caches by Telegram id for
- * 60 seconds, including negative results. Without an explicit invalidation, a revoked admin keeps
- * their powers for up to a minute after being switched off — which is exactly the minute that
- * matters when someone is being offboarded in a hurry.
+ * WHY every mutation invalidates the identity cache: AdminIdentityService caches each admin for 60
+ * seconds, by id (the console) and by Telegram id (the bot), including negative results. Without an
+ * explicit invalidation of BOTH, a revoked admin keeps their powers for up to a minute after being
+ * switched off — which is exactly the minute that matters when someone is being offboarded in a
+ * hurry.
  */
 import { Injectable } from '@nestjs/common';
 import { Prisma, type AdminUser } from '@prisma/client';
@@ -37,11 +38,22 @@ import type {
   UpdateAdminUserDto,
 } from '../dtos/admin-user.dto';
 
+/**
+ * Usernames are stored lower-cased (API contract: "unique per tenant, lower-cased on write"). One
+ * function, used by every writer and by any lookup, so `Alice` and `alice` can never become two
+ * accounts in one operator, and a sign-in never misses because of how someone capitalised it.
+ */
+export function normalizeAdminUsername(username: string): string {
+  return username.trim().toLowerCase();
+}
+
 export function toAdminUserView(admin: AdminUser): AdminUserView {
   return {
     id: admin.id,
-    telegramUserId: admin.telegramUserId.toString(),
+    telegramUserId: admin.telegramUserId === null ? null : admin.telegramUserId.toString(),
     username: admin.username,
+    // Whether a console password is set — never the hash, not even its format.
+    hasPassword: admin.passwordHash !== null,
     displayName: admin.displayName,
     role: admin.role,
     isActive: admin.isActive,
@@ -93,7 +105,7 @@ export class AdminUserService {
             telegramUserId,
             displayName: dto.displayName,
             role: dto.role,
-            username: dto.username ?? null,
+            username: dto.username !== undefined ? normalizeAdminUsername(dto.username) : null,
           },
           tx,
         );
@@ -104,7 +116,8 @@ export class AdminUserService {
           subjectType: 'AdminUser',
           subjectId: admin.id,
           after: {
-            telegramUserId: admin.telegramUserId.toString(),
+            telegramUserId:
+              admin.telegramUserId === null ? null : admin.telegramUserId.toString(),
             displayName: admin.displayName,
             role: admin.role,
             isActive: admin.isActive,
@@ -126,10 +139,14 @@ export class AdminUserService {
         throw error;
       });
 
-    // A newly created admin may have been cached as a NEGATIVE lookup moments ago. The cache key is
-    // (tenant, telegram id), so the tenant comes off the row that was just written — the same one
-    // AdminIdentityService will resolve them in.
-    await this.identities.invalidate(created.tenantId, telegramUserId);
+    // A newly created admin may have been cached as a NEGATIVE Telegram lookup moments ago. The
+    // tenant comes off the row that was just written — the same one AdminIdentityService will
+    // resolve them in.
+    await this.identities.invalidate({
+      tenantId: created.tenantId,
+      adminUserId: created.id,
+      telegramUserId: created.telegramUserId,
+    });
     return toAdminUserView(created);
   }
 
@@ -171,7 +188,9 @@ export class AdminUserService {
             ...(dto.displayName !== undefined ? { displayName: dto.displayName } : {}),
             ...(dto.role !== undefined ? { role: dto.role } : {}),
             ...(dto.isActive !== undefined ? { isActive: dto.isActive } : {}),
-            ...(dto.username !== undefined ? { username: dto.username } : {}),
+            ...(dto.username !== undefined
+              ? { username: normalizeAdminUsername(dto.username) }
+              : {}),
           },
           tx,
         );
@@ -208,9 +227,13 @@ export class AdminUserService {
       });
 
     // The row's own tenant, not the ambient one: a platform admin editing operator X's staff must
-    // evict X's cache entry, otherwise the demotion they just made stays invisible for 60 seconds
-    // in the only tenant where it matters.
-    await this.identities.invalidate(updated.tenantId, updated.telegramUserId);
+    // evict X's cache entries, otherwise the demotion they just made stays invisible for 60 seconds
+    // in the only tenant where it matters. Both doors — the console by id, the bot by Telegram id.
+    await this.identities.invalidate({
+      tenantId: updated.tenantId,
+      adminUserId: updated.id,
+      telegramUserId: updated.telegramUserId,
+    });
     return toAdminUserView(updated);
   }
 

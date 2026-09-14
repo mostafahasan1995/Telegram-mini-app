@@ -17,9 +17,12 @@
  * code row); until then every miss is BOT_CODE_INVALID.
  *
  * WHY THE ADMIN IS RE-RESOLVED HERE: the code carries a Telegram id, not authority. Authority comes
- * from `resolveOrThrow`, which reads the database (60s cache) and refuses an inactive account. So
- * an admin deactivated between /login and sign-in is stopped at the door, and the 403 they get is
- * the exact ADMIN_INACTIVE the console already knows how to display.
+ * from `resolveByTelegramOrThrow`, which reads the database (60s cache) and refuses an inactive
+ * account. So an admin deactivated between /console and sign-in is stopped at the door, and the 403
+ * they get is the exact ADMIN_INACTIVE the console already knows how to display.
+ *
+ * The token issued is the same as any admin token: it names the admin by (tid, sub = AdminUser.id)
+ * and carries no Telegram id. The Telegram id is only how THIS door found the row.
  */
 import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
 
@@ -59,7 +62,7 @@ export class AdminAuthController {
     // bot's namespace. The bot that minted the code is the single bootstrap-tenant bot. TEMPORARY:
     // phase 6 gives each operator its own bot and the code will carry the tenant it was minted in.
     // Throws ForbiddenError(ADMIN_INACTIVE) if they are no longer staff.
-    const admin = await this.admins.resolveOrThrow(TENANT_BOOTSTRAP_ID, telegramUserId);
+    const admin = await this.admins.resolveByTelegramOrThrow(TENANT_BOOTSTRAP_ID, telegramUserId);
     const { accessToken, accessTokenExpiresAt } = await this.sessions.issueAdminAccessToken(admin);
 
     return {
@@ -67,7 +70,9 @@ export class AdminAuthController {
       expiresAt: accessTokenExpiresAt.toISOString(),
       admin: {
         id: admin.adminUserId,
-        // String, not number: a 64-bit Telegram id does not survive JSON.parse as a number.
+        // String, not number: a 64-bit Telegram id does not survive JSON.parse as a number. Never
+        // null on this route (the row was found by it), but the view type allows null because a
+        // console-only admin signing in another way has none.
         telegramUserId: admin.telegramUserId.toString(),
         role: admin.role,
         displayName: admin.displayName,

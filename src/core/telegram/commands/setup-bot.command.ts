@@ -102,13 +102,16 @@ export class SetupBotCommand extends CommandRunner {
 
     // 3 — the same admin menu in each active admin's PRIVATE chat, so /queue autocompletes when
     // they talk to the bot directly and not only in the group.
+    // Console-only admins (no Telegram id) have no private chat with the bot, so they are skipped
+    // in the query and again in the loop — the second check is what narrows the type.
     const admins = await this.prisma.adminUser.findMany({
-      where: { isActive: true },
+      where: { isActive: true, telegramUserId: { not: null } },
       select: { telegramUserId: true, displayName: true },
       orderBy: { displayName: 'asc' },
     });
 
     for (const admin of admins) {
+      if (admin.telegramUserId === null) continue;
       const chatId = this.toChatId(admin.telegramUserId);
       await this.attempt(
         `setMyCommands scope=chat:${chatId} (admin “${admin.displayName}”)`,

@@ -11,7 +11,7 @@
  */
 import { Injectable } from '@nestjs/common';
 
-import type { AuthenticatedAdmin } from '@common/decorators/auth.types';
+import type { TelegramAuthenticatedAdmin } from '@common/decorators/auth.types';
 import {
   LoginCodeService,
   LOGIN_CODE_TTL_MINUTES,
@@ -35,8 +35,11 @@ export class AdminLoginCodeService {
    * AdminIdentityService and re-checks `isActive`. An admin offboarded in the five minutes between
    * /login and sign-in is then refused at redemption — which is the whole point of resolving
    * authority on every request rather than trusting a snapshot.
+   *
+   * Typed to an admin found BY Telegram id, so the id is present by construction: a console-only
+   * admin has no Telegram account and therefore no bot code to receive.
    */
-  async mint(admin: AuthenticatedAdmin): Promise<MintedLoginCode> {
+  async mint(admin: TelegramAuthenticatedAdmin): Promise<MintedLoginCode> {
     return this.codes.mint(SCOPE, admin.telegramUserId);
   }
 

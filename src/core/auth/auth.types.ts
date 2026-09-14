@@ -15,11 +15,9 @@ export const PLAYER_ROLE = 'PLAYER' as const;
 
 export type TokenRole = typeof PLAYER_ROLE | AdminRole;
 
-export interface AccessTokenClaims {
+interface BaseAccessTokenClaims {
   /** Player.id or AdminUser.id, depending on `role`. */
   sub: string;
-  /** Telegram user id as a decimal string. */
-  tgid: string;
   role: TokenRole;
   /** PlayerSession.id for players; a random per-token id for admins (they have no session table). */
   sid: string;
@@ -36,6 +34,26 @@ export interface AccessTokenClaims {
   iat: number;
   exp: number;
 }
+
+/** A player IS a Telegram account (for now), so its token always names one. */
+export interface PlayerAccessTokenClaims extends BaseAccessTokenClaims {
+  role: typeof PLAYER_ROLE;
+  /** Telegram user id as a decimal string. Required for players. */
+  tgid: string;
+}
+
+/**
+ * An admin is identified by (tid, sub = AdminUser.id). A console-only admin has no Telegram id at
+ * all, so newly issued admin tokens carry no `tgid`. Tokens minted before this change still carry
+ * one; it is accepted and IGNORED — never used to resolve the admin.
+ */
+export interface AdminAccessTokenClaims extends BaseAccessTokenClaims {
+  role: AdminRole;
+  tgid?: string;
+}
+
+/** Discriminated on `role`: narrowing to PLAYER is what makes `tgid` a string. */
+export type AccessTokenClaims = PlayerAccessTokenClaims | AdminAccessTokenClaims;
 
 /** The `user` object embedded in Telegram initData. Only fields we actually consume are typed. */
 export interface TelegramInitDataUser {
