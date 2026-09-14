@@ -7,15 +7,22 @@
  * exported but not provided, or a token nobody binds are all invisible to `tsc` and to a unit test,
  * and they fail at boot in production. The DI graph is the thing most worth checking here.
  *
- * Run with:  npx jest --runInBand src/modules/modules.int.spec.ts
- * Requires the dev containers (docker compose up -d postgres redis).
+ * Run with:  POSTGRES_TEST_URL=... REDIS_TEST_URL=... npx jest --config jest-int.config.cjs \
+ *              --runInBand src/modules/modules.int.spec.ts
+ * against a THROWAWAY database that already has the schema and the prisma/sql guards applied.
  */
 process.env['APP_ROLE'] = 'api';
 process.env['NODE_ENV'] = 'test';
 process.env['PORT'] = '3000';
 process.env['API_BASE_URL'] = 'http://localhost:3000';
-process.env['DATABASE_URL'] ??= 'postgresql://ichancy:ichancy@localhost:55432/ichancy';
-process.env['REDIS_URL'] ??= 'redis://localhost:6379';
+// The documented escape hatch wins, and no address is guessed. The old default,
+// localhost:55432, is also where a live cashier stack publishes Postgres on a developer machine, so
+// a run without variables wrote to whatever listened there.
+process.env['DATABASE_URL'] = process.env['POSTGRES_TEST_URL'] ?? process.env['DATABASE_URL'] ?? '';
+process.env['REDIS_URL'] = process.env['REDIS_TEST_URL'] ?? process.env['REDIS_URL'] ?? '';
+if (process.env['DATABASE_URL'] === '' || process.env['REDIS_URL'] === '') {
+  throw new Error('Set POSTGRES_TEST_URL and REDIS_TEST_URL to a THROWAWAY database and Redis.');
+}
 process.env['JWT_SECRET'] = 'integration-test-secret-value-32-chars';
 process.env['TELEGRAM_BOT_TOKEN'] = '123456:AAtest_token_for_integration_only';
 process.env['TELEGRAM_WEBHOOK_SECRET'] = 'integration_webhook_secret_value';
@@ -49,6 +56,7 @@ import { PrismaService } from '@core/prisma/prisma.service';
 import { CacheModule } from '@core/cache/cache.module';
 import { RedisService } from '@core/cache/redis.service';
 import { AuditModule } from '@core/audit/audit.module';
+import { LedgerModule } from '@core/ledger/ledger.module';
 import { FakeIchancyAdapter } from '@core/ichancy/fake-ichancy.adapter';
 import { runWithTenant } from '@core/tenant';
 import { TENANT_BOOTSTRAP_ID } from '@core/tenant';
@@ -190,6 +198,10 @@ describe('feature modules (integration)', () => {
         PrismaModule,
         CacheModule,
         AuditModule,
+        // @Global, and imported by app.module and worker.module rather than by the features, so the
+        // harness has to stand in for the root here too: ActivityReportService (AdminModule) reads
+        // the float through AccountRegistryService and cannot be built without it.
+        LedgerModule,
         PlayerModule,
         AdminModule,
         PaymentMethodModule,
@@ -555,7 +567,9 @@ describe('feature modules (integration)', () => {
       const row = await prisma.player.findUniqueOrThrow({ where: { id: playerId } });
 
       expect(row.ichancyPlayerId).toBeTruthy();
-      expect(row.ichancyLogin).toMatch(/^[a-z][a-z0-9]{15}$/);
+      // The Telegram id is the readable half so the agent can find the row in their own panel; the
+      // keyed suffix is what stops that public id from revealing the login (ichancy-credentials.util).
+      expect(row.ichancyLogin).toMatch(new RegExp(`^p${row.telegramUserId.toString()}_[a-z0-9]{8}$`));
       expect(row.status).toBe('ACTIVE');
       // The stored value must be the sealed envelope, never the password itself.
       expect(row.ichancyPasswordEnc).toMatch(/^v1\./);

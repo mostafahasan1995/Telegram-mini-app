@@ -4,7 +4,8 @@
  * SET NX PX either wins or loses, and the compare-and-delete Lua script either runs atomically or
  * it does not. A mocked Redis would assert only that we call the methods we call.
  *
- * Run with `npm run test:int` (docker compose up redis first).
+ * Run with:  REDIS_TEST_URL=redis://<throwaway>/9 npx jest --config jest-int.config.cjs --runInBand \
+ *              src/core/cache/lock.service.int.spec.ts
  */
 import { Redis } from 'ioredis';
 import { CacheService } from './cache.service';
@@ -12,8 +13,12 @@ import { LockService, LockUnavailableError, type LockHandle } from './lock.servi
 import { redisUrlToOptions } from './redis-url.util';
 import { type RedisService } from './redis.service';
 
-// Database 9 so a stray run never touches development data.
-const REDIS_URL = process.env.TEST_REDIS_URL ?? 'redis://localhost:6379/9';
+// No guessed default: this suite FLUSHDBs, and a localhost Redis on a developer machine may be the
+// one a live cashier stack uses. Point it at database 9 (or any throwaway) of a Redis you own.
+const REDIS_URL = process.env.TEST_REDIS_URL ?? process.env.REDIS_TEST_URL ?? '';
+if (REDIS_URL === '') {
+  throw new Error('Set REDIS_TEST_URL (or TEST_REDIS_URL) to a THROWAWAY Redis database.');
+}
 
 describe('cache + lock (integration)', () => {
   let redis: Redis;

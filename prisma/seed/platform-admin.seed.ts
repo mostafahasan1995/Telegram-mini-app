@@ -6,7 +6,9 @@
  *   SEED_PLATFORM_ADMIN_USERNAME        required. Trimmed, lower-cased, 3–64 of [A-Za-z0-9._@+-]
  *   SEED_PLATFORM_ADMIN_PASSWORD        required. 8–72 characters, never trimmed, never printed
  *   SEED_ADMIN_DISPLAY_NAME             optional. "Owner" when the row is created
- *   SEED_ADMIN_TELEGRAM_ID              optional. Digits only; lets this admin also work the bot
+ *   SEED_ADMIN_TELEGRAM_ID              optional. Digits only; adopts a Telegram-id-only row (below).
+ *                                       It does NOT let this admin work the bot: bot commands
+ *                                       resolve staff inside an operator, never in tenant zero
  *   SEED_PLATFORM_ADMIN_RESET_PASSWORD  optional. `1` replaces an existing password
  *
  * It reads no TELEGRAM_* variable and no JWT_SECRET: it seals nothing and talks to nobody but the

@@ -6,7 +6,9 @@
  * What is being protected: a replayed `callback_query` carrying `dep:approve:<shortId>` must be
  * processed exactly once, no matter how many times Telegram redelivers it.
  *
- * Run with `npm run test:int` (docker compose up postgres redis first).
+ * Run with:  POSTGRES_TEST_URL=... REDIS_TEST_URL=... npx jest --config jest-int.config.cjs \
+ *              --runInBand src/core/telegram/services/update-dedupe.service.int.spec.ts
+ * against a THROWAWAY database and Redis.
  */
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@prisma/client';
@@ -17,9 +19,13 @@ import { type RedisService } from '../../cache/redis.service';
 import { UpdateDedupeService } from './update-dedupe.service';
 import { type PrismaService } from '../../prisma/prisma.service';
 
-const REDIS_URL = process.env.TEST_REDIS_URL ?? 'redis://localhost:6379/9';
-const DATABASE_URL =
-  process.env.TEST_DATABASE_URL ?? 'postgresql://ichancy:ichancy@localhost:55432/ichancy';
+// No guessed default: localhost:55432 is also where a live cashier stack publishes Postgres on a
+// developer machine. The harness-wide escape hatch is honoured next to this suite's own names.
+const REDIS_URL = process.env.TEST_REDIS_URL ?? process.env.REDIS_TEST_URL ?? '';
+const DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.POSTGRES_TEST_URL ?? '';
+if (REDIS_URL === '' || DATABASE_URL === '') {
+  throw new Error('Set POSTGRES_TEST_URL and REDIS_TEST_URL to a THROWAWAY database and Redis.');
+}
 
 /** Distinct per run so repeated local runs never collide on update_id. */
 let nextUpdateId = Date.now();

@@ -12,15 +12,22 @@
  * module would be providing its own — which is precisely the duplicate-implementation failure the
  * ports exist to prevent.
  *
- * Run with:  npx jest --runInBand src/modules/deposit/deposit.di.int.spec.ts
- * Requires the dev containers (docker compose up -d postgres redis).
+ * Run with:  POSTGRES_TEST_URL=... REDIS_TEST_URL=... npx jest --config jest-int.config.cjs \
+ *              --runInBand src/modules/deposit/deposit.di.int.spec.ts
+ * against a THROWAWAY database and Redis.
  */
 process.env['APP_ROLE'] = 'api';
 process.env['NODE_ENV'] = 'test';
 process.env['PORT'] = '3000';
 process.env['API_BASE_URL'] = 'http://localhost:3000';
-process.env['DATABASE_URL'] ??= 'postgresql://ichancy:ichancy@localhost:55432/ichancy';
-process.env['REDIS_URL'] ??= 'redis://localhost:6379';
+// The documented escape hatch wins, and no address is guessed. The old default,
+// localhost:55432, is also where a live cashier stack publishes Postgres on a developer machine, so
+// a run without variables wrote to whatever listened there.
+process.env['DATABASE_URL'] = process.env['POSTGRES_TEST_URL'] ?? process.env['DATABASE_URL'] ?? '';
+process.env['REDIS_URL'] = process.env['REDIS_TEST_URL'] ?? process.env['REDIS_URL'] ?? '';
+if (process.env['DATABASE_URL'] === '' || process.env['REDIS_URL'] === '') {
+  throw new Error('Set POSTGRES_TEST_URL and REDIS_TEST_URL to a THROWAWAY database and Redis.');
+}
 process.env['JWT_SECRET'] = 'integration-test-secret-value-32-chars';
 process.env['TELEGRAM_BOT_TOKEN'] = '123456:AAtest_token_for_integration_only';
 process.env['TELEGRAM_WEBHOOK_SECRET'] = 'integration_webhook_secret_value';

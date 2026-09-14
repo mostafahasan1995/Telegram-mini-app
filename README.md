@@ -455,7 +455,7 @@ These are read straight from the environment. They all have safe defaults.
 | `SEED_PLATFORM_ADMIN_PASSWORD`  | —                          | `seed:platform-admin`: 8–72 characters. Never printed. See Step 6.          |
 | `SEED_PLATFORM_ADMIN_RESET_PASSWORD` | —                     | `1` = replace the password of an existing platform admin.                   |
 | `SEED_ADMIN_DISPLAY_NAME`       | `Owner`                    | Name shown in the panel.                                                    |
-| `SEED_ADMIN_TELEGRAM_ID`        | —                          | Optional Telegram user id (digits), so the platform admin can also use the bot. |
+| `SEED_ADMIN_TELEGRAM_ID`        | —                          | Optional, digits. Adopts a platform admin left by the old Telegram-id seed. It does not give this admin the bot: the bot only knows its own operator's staff. |
 | `SEED_ALLOW_PRODUCTION`         | —                          | `1` lets the fixture seed (`npm run seed`) run with `NODE_ENV=production`.  |
 | `SEED_DATABASE_URL`             | `DATABASE_URL`             | Seed with a different (owner) connection.                                   |
 | `MIGRATE_DATABASE_URL`          | `DATABASE_URL`             | Migrate as the schema owner.                                                |

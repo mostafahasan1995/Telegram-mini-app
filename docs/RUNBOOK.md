@@ -74,7 +74,7 @@ Remove-Item Env:SEED_PLATFORM_ADMIN_PASSWORD; Remove-Variable secure
 | `SEED_PLATFORM_ADMIN_USERNAME` | yes | trimmed and lower-cased; 3–64 of `A-Z a-z 0-9 . _ @ + -` |
 | `SEED_PLATFORM_ADMIN_PASSWORD` | yes | 8–72 characters, never trimmed, never printed |
 | `SEED_ADMIN_DISPLAY_NAME` | no | `Owner` when the row is created; applied on a re-run only when set |
-| `SEED_ADMIN_TELEGRAM_ID` | no | digits only; lets the same person work the bot. Adopts an old Telegram-id-only platform admin with that id |
+| `SEED_ADMIN_TELEGRAM_ID` | no | digits only. Adopts an old Telegram-id-only platform admin with that id. It does NOT make the bot recognise this admin: bot commands resolve staff inside the operator, and this row lives in tenant zero |
 | `SEED_PLATFORM_ADMIN_RESET_PASSWORD` | no | `1` replaces the password of an existing platform admin |
 
 Re-running prints `unchanged`, or `updated` when it re-activated the admin, applied a display name / Telegram id you passed, or reset the password. **A re-run never changes the password without `SEED_PLATFORM_ADMIN_RESET_PASSWORD=1`**, so a password changed in the console survives redeploys. If the username belongs to another role in tenant zero it refuses (exit 2) rather than promoting that account. Created and updated are audited in tenant zero's log as `admin.user.created` / `admin.user.updated` with a `SYSTEM` actor.

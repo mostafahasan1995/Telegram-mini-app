@@ -55,7 +55,7 @@ import { runWithTenant } from '@core/tenant/tenant.storage';
 
 import { AdminErrorCodes } from '../admin.constants';
 import type { AdminCredentialsDto, AdminSessionView } from '../dtos/admin-auth.dto';
-import { normalizeAdminUsername } from './admin-user.service';
+import { normalizeAdminUsername } from '../admin-username';
 
 /** The operator a proven credential opens. */
 export interface OperatorRef {
