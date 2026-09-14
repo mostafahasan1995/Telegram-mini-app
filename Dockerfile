@@ -77,9 +77,10 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates tini \
   && rm -rf /var/lib/apt/lists/*
 
-# NODE_ENV=production keeps the seed's refuse-in-production guard armed (prisma/seed.ts) and makes the
-# CLI ignore any stray .env (src/core/config/config.module.ts). A deliberate production seed still
-# works, with SEED_ALLOW_PRODUCTION=1, exactly as documented there.
+# NODE_ENV=production keeps the development fixture seed's refuse-in-production guard armed
+# (prisma/seed.ts; its npm script no longer overrides NODE_ENV) and makes the CLI ignore any stray
+# .env (src/core/config/config.module.ts). The first platform admin comes from
+# `npm run seed:platform-admin`, which is production-safe and needs no override.
 ENV NODE_ENV=production
 # The Prisma CLI phones home for update checks. The migrate container sits on an internal-only
 # network, so that request can only time out — and it should not be tried at all from a prod box.

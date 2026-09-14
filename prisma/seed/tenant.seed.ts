@@ -1,28 +1,31 @@
 /**
- * The two rows every other seed now hangs off, plus the single PlatformDefaults row.
+ * The two rows every other seed now hangs off, plus the single PlatformDefaults row. A DEVELOPMENT
+ * fixture (see prisma/seed.ts): production gets these rows from the multi-tenant migration.
  *
  * TENANT ZERO is the platform itself. It is not an operator and never takes a deposit; it exists so
  * that platform staff have somewhere to live that is not a customer's tenant. Its Telegram and
  * Ichancy columns are NOT NULL in the schema and there is nothing truthful to put in them, so they
- * get openly-labelled placeholders rather than a copy of the operator's real credentials — a
+ * get openly-labelled placeholders rather than a copy of an operator's real credentials — a
  * platform row holding a working bot token is a second, unaudited way to speak as that operator.
  *
- * THE BOOTSTRAP OPERATOR is the tenant that was actually taking deposits before multi-tenancy. Its
- * columns are filled from the deployment's own environment, because until phase 6 gives each
- * operator its own bot there is exactly one bot, one agent panel and one set of money settings —
- * the ones in .env. Seeding it from anywhere else would produce a tenant row that disagrees with
- * the process reading those same variables.
+ * THE BOOTSTRAP OPERATOR is the tenant that was taking deposits before multi-tenancy, and the one
+ * every fixture below (rails, ledger accounts) belongs to.
  *
- * WHY BOTH LAND `ACTIVE` and not the schema's SUSPENDED default: that default protects an operator
- * created through the admin panel, where nothing has verified the agent id yet. These two are the
- * opposite case — tenant zero holds the logins that would do the verifying, and the bootstrap
- * operator's credentials are the ones this deployment has been running on. Landing either
- * SUSPENDED would lock the install out of itself on first boot.
+ * NOTHING HERE READS A TELEGRAM VARIABLE. Each operator's bot token, webhook and chat ids are pasted
+ * into the dashboard by a platform admin; a seed that copied one deployment-wide TELEGRAM_BOT_TOKEN
+ * into a tenant row would recreate exactly the global bot the platform no longer has. Those columns
+ * get placeholders (NOT NULL ones) or NULL. The Ichancy agent credentials are still repaired from
+ * .env below, because per-operator Ichancy settings do not exist yet.
  *
- * WHY EVERY UPSERT HERE HAS AN EMPTY `update`: the columns are secrets, webhook routing and
- * serving status. An operator who rotated a bot token, re-pointed a webhook or suspended a tenant
- * did it deliberately and through an audited path; a redeploy running the seed again must not
- * silently revert any of it. Same rule, and the same reason, as the payment destinations.
+ * WHY BOTH ARE CREATED `ACTIVE` and not the schema's SUSPENDED default: this path only runs on a
+ * database with no migration rows (the integration harness builds its schema with `db push`), and
+ * every fixture and test assumes it can sign into and serve through these two. Landing either
+ * SUSPENDED would lock a developer's install out of itself on first boot.
+ *
+ * WHY EVERY UPSERT HERE HAS AN EMPTY `update` (bar the narrow sentinel repair): the columns are
+ * secrets, webhook routing and serving status. An operator who rotated a credential or suspended a
+ * tenant did it deliberately and through an audited path; running the seed again must not silently
+ * revert any of it. Same rule, and the same reason, as the payment destinations.
  */
 import { TenantStatus, type Prisma, type PrismaClient } from '@prisma/client';
 
@@ -40,9 +43,8 @@ import { deriveKey, sealSecret } from '@modules/player/utils/secret-box.util';
 /**
  * HKDF label for the tenant-scoped secret columns (bot token, webhook secret, Ichancy password,
  * Sham Cash key). It is separate from the player-credential label on purpose: the two protect
- * different things and must not share a key. WHATEVER READS THESE COLUMNS IN PHASE 6 MUST DERIVE
- * WITH THIS EXACT STRING — a mismatch does not fail loudly at boot, it fails the first time a bot
- * token is opened.
+ * different things and must not share a key. WHATEVER READS THESE COLUMNS MUST DERIVE WITH THIS
+ * EXACT STRING — a mismatch does not fail loudly at boot, it fails the first time a secret is opened.
  */
 const TENANT_SECRET_INFO = 'ichancy-tenant-secret-enc:v1';
 
@@ -59,14 +61,9 @@ const PLACEHOLDER_PREFIX = 'SEED-PLACEHOLDER';
 /**
  * What `20260911090000_multi_tenant_core` writes into the bootstrap operator's NOT NULL credential
  * columns. A migration cannot read the deployment's environment, so it writes these and the seed —
- * which can — repairs them.
+ * which can — repairs the Ichancy ones.
  *
- * WHY THE REPAIR IS NEEDED AT ALL: every tenant upsert below has `update: {}`, so that re-running
- * the seed can never revert an audited operator decision. On a FRESH install, though, the migration
- * has already inserted the row by the time the seed runs, so without this the sentinels would win
- * permanently and the real credentials in .env would silently never land.
- *
- * The repair is therefore deliberately narrow: a column is overwritten ONLY while it still holds the
+ * The repair is deliberately narrow: a column is overwritten ONLY while it still holds the
  * sentinel. Anything a human has since set is left exactly as they left it.
  */
 const MIGRATION_SENTINEL_PREFIX = 'REPLACE-ME';
@@ -79,6 +76,12 @@ const DEFAULT_DUAL_APPROVAL_THRESHOLD_MINOR = 100_000_000n;
 const DEFAULT_AGENT_FLOAT_LOW_WATERMARK_MINOR = 50_000_000n;
 const DEFAULT_DEPOSIT_EXPIRY_MINUTES = 120;
 
+/**
+ * Chat id 0 is what the migration writes for "not configured": Telegram never issues it. The real
+ * chat ids arrive with the operator's bot, from the dashboard.
+ */
+const UNCONFIGURED_CHAT_ID = 0n;
+
 export interface SeededTenant {
   id: string;
   slug: string;
@@ -89,11 +92,6 @@ export interface SeededTenancy {
   platform: SeededTenant;
   bootstrap: SeededTenant;
   defaultsCreated: boolean;
-  /**
-   * True when at least one sealed column on the bootstrap operator holds a placeholder instead of a
-   * real secret — the bot cannot answer and Ichancy cannot be signed into until they are replaced.
-   */
-  secretsArePlaceholders: boolean;
 }
 
 interface SealedValue {
@@ -106,16 +104,6 @@ function readBigintMinor(raw: string | undefined, fallback: bigint, label: strin
   if (value === undefined || value.length === 0) return fallback;
   if (!/^\d+$/.test(value)) {
     throw new Error(`${label} must be a non-negative integer in MINOR units, got "${raw ?? ''}"`);
-  }
-  return BigInt(value);
-}
-
-/** Chat ids are signed: a supergroup's is negative (-1001234567890). */
-function readChatId(raw: string | undefined, label: string): bigint | null {
-  const value = raw?.trim();
-  if (value === undefined || value.length === 0) return null;
-  if (!/^-?\d+$/.test(value)) {
-    throw new Error(`${label} must be an integer Telegram chat id, got "${raw ?? ''}"`);
   }
   return BigInt(value);
 }
@@ -166,9 +154,9 @@ function sealOrPlaceholder(
 
 /**
  * The bot's "open the app" button. Today `PlayerHandlers.miniAppKeyboard()` opens
- * `config.app.baseUrl` and omits the button entirely below https, so that is what this column has to
- * hold for phase 6 to change nothing an existing player can see. Null means "no button", which is
- * already the behaviour on a developer's http://localhost.
+ * `config.app.baseUrl` and omits the button entirely below https, so that is what this column holds
+ * for a fixture operator. Null means "no button", which is already the behaviour on a developer's
+ * http://localhost.
  */
 function readMiniAppUrl(env: NodeJS.ProcessEnv): string | null {
   const url = env.API_BASE_URL?.trim();
@@ -200,12 +188,9 @@ export async function seedTenancy(
   );
 
   const ichancyBaseUrl = readText(env.ICHANCY_BASE_URL, 'ICHANCY-BASE-URL');
-  const adminChatId = readChatId(env.TELEGRAM_ADMIN_CHAT_ID, 'TELEGRAM_ADMIN_CHAT_ID');
 
   // ---- Tenant zero -----------------------------------------------------------------------------
-  // Every credential here is a placeholder by design; see the header. `adminChatId` is the one
-  // exception worth filling when we know it, because platform-level alerts have to reach a human,
-  // and 0 is a chat id Telegram will never issue, so it reads unambiguously as "not configured".
+  // Every credential here is a placeholder by design; see the header.
   const existingPlatform = await prisma.tenant.findUnique({
     where: { id: TENANT_ZERO_ID },
     select: { id: true },
@@ -219,7 +204,7 @@ export async function seedTenancy(
       displayName: 'Platform',
       status: TenantStatus.ACTIVE,
       botTokenEnc: `${PLACEHOLDER_PREFIX}-PLATFORM-HAS-NO-BOT`,
-      adminChatId: adminChatId ?? 0n,
+      adminChatId: UNCONFIGURED_CHAT_ID,
       ichancyBaseUrl,
       ichancyUsername: `${PLACEHOLDER_PREFIX}-PLATFORM-HAS-NO-AGENT`,
       ichancyPasswordEnc: `${PLACEHOLDER_PREFIX}-PLATFORM-HAS-NO-AGENT`,
@@ -234,37 +219,25 @@ export async function seedTenancy(
   });
 
   // ---- The bootstrap operator ------------------------------------------------------------------
-  const botToken = sealOrPlaceholder(seal, env.TELEGRAM_BOT_TOKEN, 'TELEGRAM-BOT-TOKEN');
   const ichancyPassword = sealOrPlaceholder(seal, env.ICHANCY_PASSWORD, 'ICHANCY-PASSWORD');
-  const webhookSecret = sealOrPlaceholder(seal, env.TELEGRAM_WEBHOOK_SECRET, 'WEBHOOK-SECRET');
 
   const existingBootstrap = await prisma.tenant.findUnique({
     where: { id: TENANT_BOOTSTRAP_ID },
     select: {
       id: true,
       status: true,
-      botTokenEnc: true,
       ichancyUsername: true,
       ichancyPasswordEnc: true,
       ichancyAgentId: true,
-      adminChatId: true,
     },
   });
 
   // See MIGRATION_SENTINEL_PREFIX. Each field is repaired independently, because a half-configured
-  // deployment is the normal case: somebody sets TELEGRAM_BOT_TOKEN today and the Ichancy password
-  // next week, and the second seed run must not undo the first.
+  // environment is the normal case, and a second seed run must not undo the first.
   const repair: Prisma.TenantUpdateInput = {};
   if (existingBootstrap !== null) {
     // Each field resolves to what the row WILL hold after this run: the repaired value when we are
-    // replacing a sentinel, otherwise whatever is already there. Deciding anything from `repair`
-    // itself is awkward — Prisma's update inputs are `string | StringFieldUpdateOperationsInput` —
-    // and the point of these four is to be plainly readable.
-    const nextBotToken =
-      isMigrationSentinel(existingBootstrap.botTokenEnc) && !botToken.isPlaceholder
-        ? botToken.value
-        : existingBootstrap.botTokenEnc;
-
+    // replacing a sentinel, otherwise whatever is already there.
     const nextIchancyPassword =
       isMigrationSentinel(existingBootstrap.ichancyPasswordEnc) && !ichancyPassword.isPlaceholder
         ? ichancyPassword.value
@@ -278,13 +251,6 @@ export async function seedTenancy(
       ? (readOptionalText(env.ICHANCY_AGENT_ID) ?? existingBootstrap.ichancyAgentId)
       : existingBootstrap.ichancyAgentId;
 
-    // 0 is the migration's "not configured": Telegram never issues chat id 0.
-    const nextAdminChatId =
-      existingBootstrap.adminChatId === 0n && adminChatId !== null
-        ? adminChatId
-        : existingBootstrap.adminChatId;
-
-    if (nextBotToken !== existingBootstrap.botTokenEnc) repair.botTokenEnc = nextBotToken;
     if (nextIchancyPassword !== existingBootstrap.ichancyPasswordEnc) {
       repair.ichancyPasswordEnc = nextIchancyPassword;
     }
@@ -294,40 +260,32 @@ export async function seedTenancy(
     if (nextIchancyAgentId !== existingBootstrap.ichancyAgentId) {
       repair.ichancyAgentId = nextIchancyAgentId;
     }
-    if (nextAdminChatId !== existingBootstrap.adminChatId) repair.adminChatId = nextAdminChatId;
 
     /**
-     * Finish the job the migration could not.
-     *
-     * It writes the row SUSPENDED precisely BECAUSE the credentials were sentinels: an operator
-     * able to serve with them would fail against Telegram and Ichancy on its first real request
-     * rather than at the moment somebody looks at it. Once this run has replaced them that reason
-     * is gone — and leaving it SUSPENDED means a fresh install comes up with real credentials and
-     * an operator that is switched off, with nothing anywhere saying why.
+     * The migration writes the row SUSPENDED because its credentials were sentinels. Once this run
+     * has replaced the Ichancy ones, a developer's fixture operator is switched on — the bot token
+     * is not part of the test any more, because it arrives from the dashboard and the runtime does
+     * not read it from this row yet.
      *
      * Narrow on purpose, so a human's suspension is never reverted:
      *   - only FROM SUSPENDED, the value the migration wrote;
      *   - only when this run actually repaired something;
-     *   - only when nothing is left unconfigured.
+     *   - only when the Ichancy credentials are no longer unconfigured.
      * On a row whose credentials a human already set, no repair happens, so this cannot fire.
      */
-    const fullyConfigured =
-      !isMigrationSentinel(nextBotToken) &&
-      !nextBotToken.startsWith(PLACEHOLDER_PREFIX) &&
+    const ichancyConfigured =
       !isMigrationSentinel(nextIchancyPassword) &&
       !nextIchancyPassword.startsWith(PLACEHOLDER_PREFIX) &&
-      !isMigrationSentinel(nextIchancyUsername) &&
-      nextAdminChatId !== 0n;
+      !isMigrationSentinel(nextIchancyUsername);
 
     if (
       Object.keys(repair).length > 0 &&
-      fullyConfigured &&
+      ichancyConfigured &&
       existingBootstrap.status === TenantStatus.SUSPENDED
     ) {
       repair.status = TenantStatus.ACTIVE;
     }
   }
-
 
   await prisma.tenant.upsert({
     where: { id: TENANT_BOOTSTRAP_ID },
@@ -337,14 +295,14 @@ export async function seedTenancy(
       // Cosmetic, and the one field here an operator is likely to want their own name in.
       displayName: readOptionalText(env.SEED_TENANT_DISPLAY_NAME) ?? 'Default operator',
       status: TenantStatus.ACTIVE,
-      botTokenEnc: botToken.value,
-      // Left null rather than guessed: it is filled from getMe the first time the bot answers, and
-      // a wrong @username in a support ticket is worse than an absent one.
+      // Telegram columns: nothing from the environment — see the header. The NOT NULL ones say out
+      // loud that they are unset; the nullable ones are simply absent.
+      botTokenEnc: `${PLACEHOLDER_PREFIX}-TELEGRAM-BOT-TOKEN`,
       botUsername: null,
-      webhookPathToken: readOptionalText(env.TELEGRAM_WEBHOOK_PATH_TOKEN),
-      webhookSecretEnc: webhookSecret.isPlaceholder ? null : webhookSecret.value,
-      adminChatId: adminChatId ?? 0n,
-      feedChatId: readChatId(env.TELEGRAM_FEED_CHAT_ID, 'TELEGRAM_FEED_CHAT_ID'),
+      webhookPathToken: null,
+      webhookSecretEnc: null,
+      adminChatId: UNCONFIGURED_CHAT_ID,
+      feedChatId: null,
       ichancyBaseUrl,
       ichancyUsername: readText(env.ICHANCY_USERNAME, 'ICHANCY-USERNAME'),
       ichancyPasswordEnc: ichancyPassword.value,
@@ -363,11 +321,9 @@ export async function seedTenancy(
   });
 
   // ---- PlatformDefaults ------------------------------------------------------------------------
-  // What the NEXT operator inherits. Seeded from the same environment as the bootstrap operator
-  // because those numbers are the only ones this deployment has ever been reviewed against; a
-  // platform admin changes them from the console afterwards, and that change is what `update: {}`
-  // protects. `ichancyAgentId` stays nullable here — the house agent is a deliberate naming, and an
-  // absent one has to stay absent rather than inherit the bootstrap operator's.
+  // Only for a database the migration never ran on (the migration inserts id=1 itself, so on any
+  // migrated database this create is a no-op). Filling the migration's literals from .env is the
+  // PlatformDefaults service's job on first read, not this script's.
   const existingDefaults = await prisma.platformDefaults.findUnique({
     where: { id: 1 },
     select: { id: true },
@@ -399,33 +355,5 @@ export async function seedTenancy(
       created: existingBootstrap === null,
     },
     defaultsCreated: existingDefaults === null,
-    // Read back rather than inferred from what we intended to write. Three paths reach this line —
-    // the row was created here, it was repaired, or it was left alone — and the only answer that is
-    // true on all three is the one the database actually holds.
-    secretsArePlaceholders: await bootstrapHoldsPlaceholders(prisma),
   };
-}
-
-/**
- * Whether the bootstrap operator's credential columns still hold something nobody can open: either
- * the migration's `REPLACE-ME…` sentinel or this seed's own `SEED-PLACEHOLDER-…`.
- *
- * The warning this drives is the only signal an operator gets. A row with placeholders looks
- * completely normal until the bot fails to answer, so a false negative here is a silent outage.
- */
-async function bootstrapHoldsPlaceholders(prisma: PrismaClient): Promise<boolean> {
-  const row = await prisma.tenant.findUnique({
-    where: { id: TENANT_BOOTSTRAP_ID },
-    select: { botTokenEnc: true, ichancyPasswordEnc: true, ichancyUsername: true },
-  });
-  if (row === null) return false;
-
-  const unopenable = (value: string): boolean =>
-    value.startsWith(MIGRATION_SENTINEL_PREFIX) || value.startsWith(PLACEHOLDER_PREFIX);
-
-  return (
-    unopenable(row.botTokenEnc) ||
-    unopenable(row.ichancyPasswordEnc) ||
-    unopenable(row.ichancyUsername)
-  );
 }

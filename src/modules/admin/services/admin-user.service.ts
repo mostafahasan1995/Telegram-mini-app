@@ -30,6 +30,7 @@ import { BusinessRuleError, ConflictError, NotFoundError } from '@common/excepti
 import { paginate, type PaginatedResult } from '@common/dtos/paginated.dto';
 
 import { AdminErrorCodes } from '../admin.constants';
+import { normalizeAdminUsername } from '../admin-username';
 import { AdminUserRepository } from '../repositories/admin-user.repository';
 import type {
   AdminUserView,
@@ -38,14 +39,9 @@ import type {
   UpdateAdminUserDto,
 } from '../dtos/admin-user.dto';
 
-/**
- * Usernames are stored lower-cased (API contract: "unique per tenant, lower-cased on write"). One
- * function, used by every writer and by any lookup, so `Alice` and `alice` can never become two
- * accounts in one operator, and a sign-in never misses because of how someone capitalised it.
- */
-export function normalizeAdminUsername(username: string): string {
-  return username.trim().toLowerCase();
-}
+// Re-exported so existing importers keep one path; the rule itself lives in admin-username.ts,
+// where the platform-admin seed can reach it without loading this service's dependencies.
+export { normalizeAdminUsername };
 
 export function toAdminUserView(admin: AdminUser): AdminUserView {
   return {

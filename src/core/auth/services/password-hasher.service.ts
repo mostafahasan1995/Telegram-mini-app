@@ -115,8 +115,12 @@ function sameCost(a: ScryptCost, b: ScryptCost): boolean {
   return a.ln === b.ln && a.r === b.r && a.p === b.p;
 }
 
-/** Characters as a person counts them (code points), matching class-validator's length rules. */
-function lengthIsAcceptable(password: string): boolean {
+/**
+ * Characters as a person counts them (code points), matching class-validator's length rules.
+ * Exported so a caller outside HTTP (the platform-admin seed) can refuse bad input with its own
+ * message instead of reaching `hash()`'s RangeError.
+ */
+export function passwordLengthIsAcceptable(password: string): boolean {
   // Cheap reject first: a code point is at most two UTF-16 units, so anything longer than twice
   // the limit cannot fit, and a megabyte body never reaches Array.from.
   if (password.length > PASSWORD_MAX_LENGTH * 2) return false;
@@ -143,7 +147,7 @@ export class PasswordHasherService {
    * not a user error. The message never includes the value.
    */
   async hash(password: string): Promise<string> {
-    if (typeof password !== 'string' || !lengthIsAcceptable(password)) {
+    if (typeof password !== 'string' || !passwordLengthIsAcceptable(password)) {
       throw new RangeError(
         `password must be ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH} characters`,
       );
@@ -168,7 +172,7 @@ export class PasswordHasherService {
     // An out-of-bounds password is refused without deriving anything. That timing difference only
     // reveals the length of the password the CALLER typed, which the caller already knows; it says
     // nothing about whether the account exists.
-    if (typeof password !== 'string' || !lengthIsAcceptable(password)) return refused;
+    if (typeof password !== 'string' || !passwordLengthIsAcceptable(password)) return refused;
 
     const parsed = stored === null ? null : this.parse(stored);
     if (parsed === null) {

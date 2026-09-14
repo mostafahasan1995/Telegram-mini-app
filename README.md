@@ -288,26 +288,63 @@ append-only ledger, no four-eyes check.
 
 ### Step 6 — seed
 
+There are two seeds, and they are for different machines.
+
+**The first admin — any machine, production included:**
+
+```bash
+read -rs SEED_PLATFORM_ADMIN_PASSWORD && export SEED_PLATFORM_ADMIN_PASSWORD   # typed, not echoed
+SEED_PLATFORM_ADMIN_USERNAME=owner npm run seed:platform-admin
+unset SEED_PLATFORM_ADMIN_PASSWORD
+```
+
+This creates **one** `PLATFORM_ADMIN` in tenant zero. You sign into the dashboard with that username
+and password, and do everything else there (create operators, paste their bot tokens, add staff).
+It needs no Telegram bot token and no `JWT_SECRET`. It prints only the username and `created`,
+`updated` or `unchanged`.
+
+Running it again is safe. It re-activates the admin if someone switched it off, but it **does not
+change the password** unless you add `SEED_PLATFORM_ADMIN_RESET_PASSWORD=1`. If the username is
+already used by another role in tenant zero, it refuses. Bad input exits non-zero with a message
+saying what to fix.
+
+With Docker (the `tools` image), a bare `-e NAME` passes your shell's value through, so the
+password never appears in the command or in shell history:
+
+```bash
+read -rs SEED_PLATFORM_ADMIN_PASSWORD && export SEED_PLATFORM_ADMIN_PASSWORD
+docker compose run --rm -e SEED_PLATFORM_ADMIN_USERNAME=owner -e SEED_PLATFORM_ADMIN_PASSWORD \
+  tools npm run seed:platform-admin
+unset SEED_PLATFORM_ADMIN_PASSWORD
+```
+
+PowerShell — read the password as a secure string, put it in the environment for this one command,
+then remove it:
+
+```powershell
+$secure = Read-Host -AsSecureString 'Platform admin password'
+$env:SEED_PLATFORM_ADMIN_PASSWORD = [System.Net.NetworkCredential]::new('', $secure).Password
+docker compose run --rm -e SEED_PLATFORM_ADMIN_USERNAME=owner -e SEED_PLATFORM_ADMIN_PASSWORD tools npm run seed:platform-admin
+Remove-Item Env:SEED_PLATFORM_ADMIN_PASSWORD; Remove-Variable secure
+```
+
+**Development fixtures — your own machine only:**
+
 ```bash
 npm run seed
 ```
 
-This creates: the NSP currency, two payment methods, the ledger accounts, and one owner admin.
-
-To create the owner admin, set this first (your Telegram user id — ask `@userinfobot`):
-
-```bash
-SEED_ADMIN_TELEGRAM_ID=123456789
-SEED_ADMIN_DISPLAY_NAME="Your Name"
-```
+This creates: the NSP currency, the two baseline tenants (when the migration did not), two payment
+methods and the ledger accounts. If `SEED_PLATFORM_ADMIN_USERNAME` and
+`SEED_PLATFORM_ADMIN_PASSWORD` are set, it also runs the platform-admin seed above.
 
 The seed is safe to run again. It never makes copies.
 
 > The seed creates **placeholder** payment destinations. A player who pays into them sends money
 > nowhere. Replace them before you take real money. The seed prints a big warning about this.
 
-The seed **refuses to run** when `NODE_ENV=production`. That is on purpose. If you really mean it:
-`SEED_ALLOW_PRODUCTION=1 npm run seed`.
+`npm run seed` **refuses to run** when `NODE_ENV=production` (the `tools` image sets it). That is on
+purpose. If you really mean it: `SEED_ALLOW_PRODUCTION=1 npm run seed`.
 
 ### Step 7 — run it
 
@@ -414,12 +451,12 @@ These are read straight from the environment. They all have safe defaults.
 | `ICHANCY_FAKE`                  | fake when `NODE_ENV=test`  | `1` = use the fake casino. No real money moves.                             |
 | `FILE_STORAGE_DRIVER`           | `local` in test, else `s3` | `local` writes photos to disk.                                              |
 | `FILE_STORAGE_LOCAL_DIR`        | temp folder                | Where `local` writes.                                                       |
-| `SEED_ADMIN_TELEGRAM_ID`        | —                          | Telegram id of the first admin. No value = no admin is created.             |
+| `SEED_PLATFORM_ADMIN_USERNAME`  | —                          | `seed:platform-admin`: the console login. 3–64 of `A-Z a-z 0-9 . _ @ + -`.  |
+| `SEED_PLATFORM_ADMIN_PASSWORD`  | —                          | `seed:platform-admin`: 8–72 characters. Never printed. See Step 6.          |
+| `SEED_PLATFORM_ADMIN_RESET_PASSWORD` | —                     | `1` = replace the password of an existing platform admin.                   |
 | `SEED_ADMIN_DISPLAY_NAME`       | `Owner`                    | Name shown in the panel.                                                    |
-| `SEED_ADMIN_USERNAME`           | —                          | Telegram `@username`, without the `@`.                                      |
-| `SEED_ADMIN_SINGLE_LIMIT_MINOR` | `500000000`                | Most the first admin may approve at once.                                   |
-| `SEED_ADMIN_DAILY_LIMIT_MINOR`  | `5000000000`               | Most the first admin may approve per day.                                   |
-| `SEED_ALLOW_PRODUCTION`         | —                          | `1` lets the seed run with `NODE_ENV=production`.                           |
+| `SEED_ADMIN_TELEGRAM_ID`        | —                          | Optional Telegram user id (digits), so the platform admin can also use the bot. |
+| `SEED_ALLOW_PRODUCTION`         | —                          | `1` lets the fixture seed (`npm run seed`) run with `NODE_ENV=production`.  |
 | `SEED_DATABASE_URL`             | `DATABASE_URL`             | Seed with a different (owner) connection.                                   |
 | `MIGRATE_DATABASE_URL`          | `DATABASE_URL`             | Migrate as the schema owner.                                                |
 | `POSTGRES_TEST_URL`             | —                          | Integration tests use this database instead of starting a container.        |
