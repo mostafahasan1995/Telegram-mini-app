@@ -71,16 +71,23 @@ export const THROTTLE_RULES: readonly ThrottleRule[] = Object.freeze([
     samplePath: '/v1/auth/bot-code',
   },
   {
-    name: 'admin-bot-code',
+    name: 'admin-sign-in',
     method: 'POST',
-    // The admin console's sign-in exchange. Stricter than the player rule and blocked for longer:
-    // the NAT argument above is about a crowd of players sharing an IP, and staff are a handful of
-    // people who type one code each. A guessing loop here is never legitimate traffic.
-    pattern: /^\/v1\/admin\/auth\/bot-code$/,
+    // The admin console's password sign-in, and the operator's Ichancy-agent sign-in beside it
+    // (API-CONTRACT.md §2a/§2b). Strict: the NAT argument above is about a crowd of players sharing
+    // an IP, and staff are a handful of people who each type one password.
+    //
+    // WHY BLOCKED FOR 15 MINUTES: a password, unlike a bot code, does not expire on its own. A
+    // five-minute block only makes a patient guessing loop slow; fifteen makes it hopeless.
+    //
+    // `ichancy` is in the pattern before its route exists on purpose: a second door onto the same
+    // secret must not ship unthrottled because somebody forgot this file. The boot self-check only
+    // needs the pattern to match ONE registered route, which /credentials does.
+    pattern: /^\/v1\/admin\/auth\/(credentials|ichancy)$/,
     limit: 10,
     ttlMs: MINUTE,
-    blockMs: 5 * MINUTE,
-    samplePath: '/v1/admin/auth/bot-code',
+    blockMs: 15 * MINUTE,
+    samplePath: '/v1/admin/auth/credentials',
   },
   {
     name: 'deposit-create',

@@ -46,7 +46,7 @@ import { AdminApprovalLimitRepository } from './repositories/admin-approval-limi
 import { AdminUserRepository } from './repositories/admin-user.repository';
 import { ActivityReportService } from './services/activity-report.service';
 import { AdminApprovalLimitService } from './services/admin-approval-limit.service';
-import { AdminLoginCodeService } from './services/admin-login-code.service';
+import { AdminCredentialsService } from './services/admin-credentials.service';
 import { AdminUserService } from './services/admin-user.service';
 import { ReportScheduleCron } from './services/report-schedule.cron';
 import { AdminTelegramHandlers } from './telegram/admin.handlers';
@@ -60,11 +60,10 @@ import { APPROVAL_LIMIT_PORT } from './approval-limit.port';
     AdminApprovalLimitRepository,
     AdminUserService,
     AdminApprovalLimitService,
+    // The console sign-in. Uses PasswordHasherService and SessionService from AuthModule.
+    AdminCredentialsService,
     ActivityReportService,
     ReportScheduleCron,
-    // Provided unconditionally like AdminTelegramHandlers: the api role serves the redemption
-    // route and the worker role mints codes from the bot, so BOTH processes need it.
-    AdminLoginCodeService,
     AdminTelegramHandlers,
     { provide: APPROVAL_LIMIT_PORT, useExisting: AdminApprovalLimitService },
   ],

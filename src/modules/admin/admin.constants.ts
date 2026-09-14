@@ -19,6 +19,19 @@ export const AdminErrorCodes = {
 
   APPROVAL_LIMIT_NOT_FOUND: 'APPROVAL_LIMIT_NOT_FOUND',
   APPROVAL_LIMIT_INVALID: 'APPROVAL_LIMIT_INVALID',
+
+  // ── Console sign-in (API-CONTRACT.md §2a). The console's login page switches on these. ──────
+  //
+  // BOT_CODE_INVALID and BOT_CODE_EXPIRED were this surface's codes for the bot-code door removed
+  // on 2026-09-05. They are RETIRED here and must never be reused for anything else. (The player
+  // app's own BOT_CODE_INVALID, in player.constants.ts, is a different, still-live route.)
+
+  /** 401. No usable account holds this username and password. One sentence for every cause. */
+  ADMIN_CREDENTIALS_INVALID: 'ADMIN_CREDENTIALS_INVALID',
+  /** 409. Right password, several active operators. `details.operators`; retry with operatorSlug. */
+  ADMIN_OPERATOR_AMBIGUOUS: 'ADMIN_OPERATOR_AMBIGUOUS',
+  /** 403. Right password, but every operator it opens is SUSPENDED. `details.operators`. */
+  ADMIN_OPERATOR_NOT_ACTIVE: 'ADMIN_OPERATOR_NOT_ACTIVE',
 } as const;
 
 export type AdminErrorCode = (typeof AdminErrorCodes)[keyof typeof AdminErrorCodes];

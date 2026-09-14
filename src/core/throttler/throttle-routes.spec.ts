@@ -13,6 +13,8 @@ describe('throttle rules', () => {
     it.each([
       ['POST', '/v1/auth/telegram', 'auth-exchange'],
       ['POST', '/v1/auth/refresh', 'auth-exchange'],
+      ['POST', '/v1/admin/auth/credentials', 'admin-sign-in'],
+      ['POST', '/v1/admin/auth/ichancy', 'admin-sign-in'],
       ['POST', '/v1/deposits', 'deposit-create'],
       ['POST', '/v1/deposits/01ARZ3NDEK/proof', 'proof-upload'],
     ])('%s %s is throttled by %s', (method, path, expected) => {
@@ -29,8 +31,25 @@ describe('throttle rules', () => {
       ['POST', '/v1/admin/deposits/abc/approve'],
       ['POST', '/v1/deposits/01ARZ3NDEK/cancel'],
       ['POST', '/telegram/webhook/token'],
+      // The retired bot-code door has no route and therefore no rule.
+      ['POST', '/v1/admin/auth/bot-code'],
     ])('%s %s is NOT throttled', (method, path) => {
       expect(matchRule(method, path)).toBeUndefined();
+    });
+
+    it('limits console sign-in to 10 a minute and blocks for 15 minutes', () => {
+      // A password does not expire on its own the way a bot code did; the block is what makes a
+      // patient guessing loop hopeless rather than merely slow (API-CONTRACT.md §2a).
+      expect(matchRule('POST', '/v1/admin/auth/credentials')).toMatchObject({
+        limit: 10,
+        ttlMs: 60_000,
+        blockMs: 15 * 60_000,
+      });
+    });
+
+    it('does not let a deeper path smuggle past the admin sign-in rule', () => {
+      expect(matchRule('POST', '/v1/admin/auth/credentials/x')).toBeUndefined();
+      expect(matchRule('POST', '/v1/admin/auth/credentialsx')).toBeUndefined();
     });
 
     it('ignores the query string and a trailing slash', () => {
@@ -92,7 +111,7 @@ describe('throttle rules', () => {
         { method: 'post', path: '/v1/auth/telegram' },
         { method: 'post', path: '/v1/auth/refresh' },
         { method: 'post', path: '/v1/auth/bot-code' },
-        { method: 'post', path: '/v1/admin/auth/bot-code' },
+        { method: 'post', path: '/v1/admin/auth/credentials' },
         { method: 'post', path: '/v1/deposits' },
         { method: 'post', path: '/v1/deposits/{shortId}/proof' },
       ];
@@ -103,7 +122,7 @@ describe('throttle rules', () => {
       const routes = [
         { method: 'post', path: '/v1/auth/telegram' },
         { method: 'post', path: '/v1/auth/bot-code' },
-        { method: 'post', path: '/v1/admin/auth/bot-code' },
+        { method: 'post', path: '/v1/admin/auth/credentials' },
         { method: 'post', path: '/v1/deposits' },
         { method: 'post', path: '/v1/deposits/:shortId/proof' },
       ];
@@ -114,12 +133,23 @@ describe('throttle rules', () => {
       const routes = [
         { method: 'post', path: '/v1/auth/telegram' },
         { method: 'post', path: '/v1/auth/bot-code' },
-        { method: 'post', path: '/v1/admin/auth/bot-code' },
+        { method: 'post', path: '/v1/admin/auth/credentials' },
         { method: 'post', path: '/v1/deposits' },
         // proof moved to /v1/deposits/{shortId}/receipt and nobody updated the rule
         { method: 'post', path: '/v1/deposits/{shortId}/receipt' },
       ];
       expect(findUnmatchedRules(routes).map((rule) => rule.name)).toEqual(['proof-upload']);
+    });
+
+    it('reports the admin sign-in rule as INACTIVE if only the retired bot-code route existed', () => {
+      const routes = [
+        { method: 'post', path: '/v1/auth/telegram' },
+        { method: 'post', path: '/v1/auth/bot-code' },
+        { method: 'post', path: '/v1/admin/auth/bot-code' },
+        { method: 'post', path: '/v1/deposits' },
+        { method: 'post', path: '/v1/deposits/{shortId}/proof' },
+      ];
+      expect(findUnmatchedRules(routes).map((rule) => rule.name)).toEqual(['admin-sign-in']);
     });
 
     it('every rule ships with a sample path its own pattern accepts', () => {

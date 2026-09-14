@@ -45,8 +45,8 @@ import { SessionService } from './services/session.service';
     InitDataService,
     SessionService,
     AdminIdentityService,
-    // Shared by the admin console and the player app: both exchange a bot-minted code for a token,
-    // and modules/player may not import modules/admin.
+    // The player app's bot-minted sign-in code. The staff console's code door was retired; staff
+    // sign in with a username and password through PasswordHasherService below.
     LoginCodeService,
     // Console passwords. Stateless, so one instance serves the credentials route and the staff
     // directory alike.
