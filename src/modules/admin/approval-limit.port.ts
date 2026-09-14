@@ -23,7 +23,8 @@ export interface ApprovalLimitPort {
    */
   evaluate(
     tx: Tx,
-    admin: { readonly adminUserId: string; readonly role: AdminRole },
+    /** `tenantId` is the admin's HOME tenant: platform staff is PLATFORM_ADMIN in tenant zero. */
+    admin: { readonly adminUserId: string; readonly role: AdminRole; readonly tenantId: string },
     amountMinor: bigint,
     currencyCode: string,
   ): Promise<ApprovalDecisionValue>;

@@ -50,6 +50,7 @@ import { formatMinorToDecimal } from '@common/helpers/money.util';
 import type { AuthenticatedAdmin } from '@common/decorators/auth.types';
 import { adminActor } from '@common/types/actor.type';
 import { AuditService } from '@core/audit/audit.service';
+import { holdsAnyRole } from '@core/auth/admin-authority';
 import { AppConfigService } from '@core/config/config.service';
 import {
   AccountRegistryService,
@@ -96,7 +97,11 @@ export type ReviewOutcome =
   /** Somebody else already decided. NOT an error — see DepositStateMachine's header. */
   | { kind: 'alreadyHandled'; status: DepositStatus | null };
 
-/** Roles allowed to decide money. VIEWER and SUPPORT can look; they cannot approve. */
+/**
+ * Roles allowed to decide money. VIEWER and SUPPORT can look; they cannot approve. Platform staff
+ * (PLATFORM_ADMIN in tenant zero) also decides, as the contract's owner superset — through
+ * `holdsAnyRole`, not by being listed here.
+ */
 const DECIDING_ROLES: readonly AdminRole[] = Object.freeze([
   AdminRole.SUPER_ADMIN,
   AdminRole.FINANCE_ADMIN,
@@ -563,7 +568,13 @@ export class DepositReviewService {
   ): Promise<ApprovalDecisionValue> {
     const decision = await this.approvalLimits.evaluate(
       tx,
-      { adminUserId: input.admin.adminUserId, role: input.admin.role },
+      // tenantId is the HOME tenant off the principal: the evaluator exempts PLATFORM_ADMIN from
+      // ceilings only when that home is tenant zero, never on the strength of an X-Tenant-Id header.
+      {
+        adminUserId: input.admin.adminUserId,
+        role: input.admin.role,
+        tenantId: input.admin.tenantId,
+      },
       amountMinor,
       currencyCode,
     );
@@ -612,7 +623,7 @@ export class DepositReviewService {
   }
 
   private assertCanDecide(admin: AuthenticatedAdmin): void {
-    if (!DECIDING_ROLES.includes(admin.role)) {
+    if (!holdsAnyRole(admin, DECIDING_ROLES)) {
       throw new ForbiddenError(
         DepositErrorCodes.ADMIN_NO_APPROVAL_LIMIT,
         'Your role cannot decide deposits.',

@@ -45,8 +45,9 @@ enum PlayerStatus {
 
 enum AdminRole {
   /// Platform staff. Lives ONLY in tenant zero (enforced by a CHECK constraint) and is the
-  /// only role whose X-Tenant-Id header is honoured. Not a superset of SUPER_ADMIN: it runs
-  /// the platform, it does not approve an operator's deposits.
+  /// only role whose X-Tenant-Id header is honoured. The owner superset (dashboard
+  /// API-CONTRACT.md §3): it passes every role list and is unbounded by approval limits, but
+  /// four-eyes still applies above the dual-approval threshold. See core/auth/admin-authority.ts.
   PLATFORM_ADMIN
   SUPER_ADMIN
   FINANCE_ADMIN

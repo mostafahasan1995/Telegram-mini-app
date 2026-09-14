@@ -41,6 +41,7 @@ import type { Context } from 'grammy';
 
 import type { TelegramAuthenticatedAdmin } from '@common/decorators/auth.types';
 import { formatMinorToDecimal } from '@common/helpers/money.util';
+import { holdsAnyRole } from '@core/auth/admin-authority';
 import { AdminIdentityService } from '@core/auth/services/admin-identity.service';
 import { AppConfigService } from '@core/config/config.service';
 import { ICHANCY_PORT, type IchancyPort, isIchancyOk } from '@core/ichancy';
@@ -228,7 +229,7 @@ export class AdminTelegramHandlers {
   async onRegister(ctx: Context): Promise<void> {
     const admin = await this.requireAdmin(ctx);
     if (admin === null) return;
-    if (!REGISTER_ROLES.includes(admin.role)) return;
+    if (!holdsAnyRole(admin, REGISTER_ROLES)) return;
 
     if (this.playerLink === null) {
       // Only reachable in a graph without the composition root, i.e. never in production.

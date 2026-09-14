@@ -29,7 +29,12 @@ export type AdminErrorCode = (typeof AdminErrorCodes)[keyof typeof AdminErrorCod
  * cannot be confused with one another.
  *
  * SUPER_ADMIN is listed EXPLICITLY rather than being implicitly granted everywhere: an implicit
- * god-role is exactly the thing that silently survives a permissions refactor.
+ * god-role among the TENANT roles is exactly the thing that silently survives a permissions
+ * refactor.
+ *
+ * PLATFORM_ADMIN is deliberately absent from this and every other role list: it is the owner
+ * superset by contract, and that single exemption is applied in one place
+ * (`@core/auth/admin-authority` `holdsAnyRole`) so these lists keep describing the tenant roles.
  */
 export const APPROVER_ROLES: readonly AdminRole[] = Object.freeze([
   'SUPER_ADMIN',

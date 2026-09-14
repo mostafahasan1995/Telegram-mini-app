@@ -19,6 +19,7 @@ import type { AuthenticatedAdmin } from '@common/decorators/auth.types';
 import { BusinessRuleError, ForbiddenError, NotFoundError } from '@common/exceptions/app.exception';
 import { adminActor } from '@common/types/actor.type';
 import { AuditService } from '@core/audit/audit.service';
+import { holdsAnyRole } from '@core/auth/admin-authority';
 import { OutboxService } from '@core/outbox/outbox.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 
@@ -51,7 +52,8 @@ export class DepositRetryService {
   ) {}
 
   async requeueCredit(input: RequeueInput): Promise<{ requeued: boolean; creditKeyEpoch: number }> {
-    if (!ALLOWED_ROLES.includes(input.admin.role)) {
+    // Platform staff passes as the contract's owner superset; see @core/auth/admin-authority.
+    if (!holdsAnyRole(input.admin, ALLOWED_ROLES)) {
       throw new ForbiddenError(
         DepositErrorCodes.ADMIN_NO_APPROVAL_LIMIT,
         'Your role cannot re-run a credit.',

@@ -1,5 +1,6 @@
 export * from './auth.constants';
 export * from './auth.types';
+export * from './admin-authority';
 export * from './auth.module';
 export * from './services/init-data.service';
 export * from './services/session.service';

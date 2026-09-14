@@ -1,6 +1,7 @@
 import type { AdminApprovalLimit } from '@prisma/client';
 
 import type { Tx } from '@core/prisma/tx.type';
+import { TENANT_ZERO_ID } from '@core/tenant/tenant.constants';
 import { AdminApprovalLimitService, type ApprovingAdmin } from './admin-approval-limit.service';
 import type { AdminApprovalLimitRepository } from '../repositories/admin-approval-limit.repository';
 import type { AdminUserRepository } from '../repositories/admin-user.repository';
@@ -14,10 +15,32 @@ const GLOBAL_THRESHOLD = 100_000n;
  */
 const FIXTURE_TENANT_ID = '11111111-1111-1111-1111-111111111111';
 
-const FINANCE: ApprovingAdmin = { adminUserId: 'admin-1', role: 'FINANCE_ADMIN' };
-const SUPPORT: ApprovingAdmin = { adminUserId: 'admin-2', role: 'SUPPORT' };
-const VIEWER: ApprovingAdmin = { adminUserId: 'admin-3', role: 'VIEWER' };
-const SUPER: ApprovingAdmin = { adminUserId: 'admin-4', role: 'SUPER_ADMIN' };
+const FINANCE: ApprovingAdmin = {
+  adminUserId: 'admin-1',
+  role: 'FINANCE_ADMIN',
+  tenantId: FIXTURE_TENANT_ID,
+};
+const SUPPORT: ApprovingAdmin = {
+  adminUserId: 'admin-2',
+  role: 'SUPPORT',
+  tenantId: FIXTURE_TENANT_ID,
+};
+const VIEWER: ApprovingAdmin = {
+  adminUserId: 'admin-3',
+  role: 'VIEWER',
+  tenantId: FIXTURE_TENANT_ID,
+};
+const SUPER: ApprovingAdmin = {
+  adminUserId: 'admin-4',
+  role: 'SUPER_ADMIN',
+  tenantId: FIXTURE_TENANT_ID,
+};
+/** Platform staff: PLATFORM_ADMIN whose row lives in tenant zero. */
+const PLATFORM: ApprovingAdmin = {
+  adminUserId: 'admin-5',
+  role: 'PLATFORM_ADMIN',
+  tenantId: TENANT_ZERO_ID,
+};
 
 function limitRow(overrides: Partial<AdminApprovalLimit> = {}): AdminApprovalLimit {
   return {
@@ -182,6 +205,78 @@ describe('AdminApprovalLimitService.evaluate', () => {
     const at = new Date('2026-06-01T12:00:00Z');
     await service.evaluateDetailed(tx, FINANCE, 1_000n, 'NSP', at);
     expect(findEffective).toHaveBeenCalledWith('admin-1', 'NSP', at, tx);
+  });
+});
+
+/**
+ * API-CONTRACT.md §3: PLATFORM_ADMIN's "money decisions are unbounded by an approval limit (the
+ * backend `RolesGuard` and the approval-limit evaluator both exempt it)". Four eyes is not an
+ * approval limit, so the dual threshold still applies to it.
+ */
+describe('AdminApprovalLimitService.evaluate — PLATFORM_ADMIN (owner superset)', () => {
+  it('is not ROLE_MAY_NOT_APPROVE and does NOT fail closed without a limit row', async () => {
+    const { service, findEffective, tx } = harness();
+    findEffective.mockResolvedValue(null);
+
+    const result = await service.evaluateDetailed(tx, PLATFORM, 50_000n, 'NSP');
+    expect(result.decision).toBe('ALLOWED');
+    expect(result.reason).toBe('WITHIN_LIMITS');
+    expect(result.maxSingleApprovalMinor).toBeNull();
+    expect(result.maxDailyApprovalMinor).toBeNull();
+    // Unbounded means no row is consulted at all — see evaluatePlatformStaff for why.
+    expect(findEffective).not.toHaveBeenCalled();
+  });
+
+  it('ignores the ceilings of a limit row that exists', async () => {
+    const { service, findEffective, findMany, tx } = harness();
+    findEffective.mockResolvedValue(
+      limitRow({
+        adminUserId: 'admin-5',
+        maxSingleApprovalMinor: 1_000n,
+        maxDailyApprovalMinor: 1_000n,
+        secondApprovalAboveMinor: 900_000_000n,
+      }),
+    );
+    findMany.mockResolvedValue([{ claimedAmountMinor: 5_000_000n, verifiedAmountMinor: null }]);
+
+    // Above the row's single AND daily ceiling, below the global threshold: allowed alone.
+    const result = await service.evaluateDetailed(tx, PLATFORM, GLOBAL_THRESHOLD, 'NSP');
+    expect(result.decision).toBe('ALLOWED');
+    expect(result.dailyUsedMinor).toBe(5_000_000n);
+    expect(findEffective).not.toHaveBeenCalled();
+  });
+
+  it('still needs a SECOND approver above the global dual threshold — with or without a row', async () => {
+    for (const row of [
+      null,
+      limitRow({ adminUserId: 'admin-5', secondApprovalAboveMinor: 900_000_000n }),
+    ]) {
+      const { service, findEffective, tx } = harness();
+      findEffective.mockResolvedValue(row);
+
+      const result = await service.evaluateDetailed(tx, PLATFORM, GLOBAL_THRESHOLD + 1n, 'NSP');
+      expect(result.decision).toBe('NEEDS_SECOND');
+      expect(result.reason).toBe('ABOVE_DUAL_THRESHOLD');
+      // A row cannot lift four eyes for platform staff: the threshold applied is the global one.
+      expect(result.secondApprovalAboveMinor).toBe(GLOBAL_THRESHOLD);
+    }
+  });
+
+  it('still DENIES a zero or negative amount', async () => {
+    const { service, tx } = harness();
+    const result = await service.evaluateDetailed(tx, PLATFORM, 0n, 'NSP');
+    expect(result.decision).toBe('DENIED');
+    expect(result.reason).toBe('INVALID_AMOUNT');
+  });
+
+  it('grants nothing to a PLATFORM_ADMIN row outside tenant zero', async () => {
+    const { service, findEffective, tx } = harness();
+    const stray: ApprovingAdmin = { ...PLATFORM, tenantId: FIXTURE_TENANT_ID };
+
+    const result = await service.evaluateDetailed(tx, stray, 1_000n, 'NSP');
+    expect(result.decision).toBe('DENIED');
+    expect(result.reason).toBe('ROLE_MAY_NOT_APPROVE');
+    expect(findEffective).not.toHaveBeenCalled();
   });
 });
 

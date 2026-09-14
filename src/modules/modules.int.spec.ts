@@ -425,7 +425,12 @@ describe('feature modules (integration)', () => {
 
       // No limit configured yet -> fails closed.
       const denied = await prisma.runInTransaction((tx) =>
-        limits.evaluate(tx, { adminUserId: adminId, role: 'FINANCE_ADMIN' }, 50_000n, 'NSP'),
+        limits.evaluate(
+          tx,
+          { adminUserId: adminId, role: 'FINANCE_ADMIN', tenantId: TENANT_BOOTSTRAP_ID },
+          50_000n,
+          'NSP',
+        ),
       );
       expect(denied).toBe('DENIED');
 
@@ -436,9 +441,24 @@ describe('feature modules (integration)', () => {
       });
 
       const [allowed, needsSecond, aboveCeiling] = await prisma.runInTransaction(async (tx) => [
-        await limits.evaluate(tx, { adminUserId: adminId, role: 'FINANCE_ADMIN' }, 50_000n, 'NSP'),
-        await limits.evaluate(tx, { adminUserId: adminId, role: 'FINANCE_ADMIN' }, 150_000n, 'NSP'),
-        await limits.evaluate(tx, { adminUserId: adminId, role: 'FINANCE_ADMIN' }, 600_000n, 'NSP'),
+        await limits.evaluate(
+          tx,
+          { adminUserId: adminId, role: 'FINANCE_ADMIN', tenantId: TENANT_BOOTSTRAP_ID },
+          50_000n,
+          'NSP',
+        ),
+        await limits.evaluate(
+          tx,
+          { adminUserId: adminId, role: 'FINANCE_ADMIN', tenantId: TENANT_BOOTSTRAP_ID },
+          150_000n,
+          'NSP',
+        ),
+        await limits.evaluate(
+          tx,
+          { adminUserId: adminId, role: 'FINANCE_ADMIN', tenantId: TENANT_BOOTSTRAP_ID },
+          600_000n,
+          'NSP',
+        ),
       ]);
 
       expect(allowed).toBe('ALLOWED');
