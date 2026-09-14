@@ -15,16 +15,29 @@
  *
  * TenantOverrideInterceptor is APP_INTERCEPTOR because Nest runs interceptors AFTER guards, which
  * is exactly when the X-Tenant-Id decision can be made: it needs the principal AuthGuard attached.
+ *
+ * WHY TenantSecretService IS BUILT BY A FACTORY: the class is framework-free so the seed can seal
+ * with exactly the same code outside Nest. Constructing it only derives a key and never opens a
+ * secret, so a tenant with no bot token cannot stop the api or the worker from booting.
  */
-import { Global, Module } from '@nestjs/common';
+import { Global, Module, type Provider } from '@nestjs/common';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { JwtModule } from '@nestjs/jwt';
 
 import { AppConfigService } from '../config/config.service';
 
 import { TenantRegistryService } from './services/tenant-registry.service';
+import { TenantSecretService } from './services/tenant-secret.service';
 import { TenantContextMiddleware } from './tenant-context.middleware';
 import { TenantOverrideInterceptor } from './tenant-override.interceptor';
+
+const tenantSecretProvider: Provider = {
+  provide: TenantSecretService,
+  inject: [AppConfigService],
+  // The validated JWT secret, never raw process.env: @nestjs/config does not populate process.env.
+  useFactory: (config: AppConfigService): TenantSecretService =>
+    new TenantSecretService(config.jwt.secret),
+};
 
 @Global()
 @Module({
@@ -41,9 +54,10 @@ import { TenantOverrideInterceptor } from './tenant-override.interceptor';
   ],
   providers: [
     TenantRegistryService,
+    tenantSecretProvider,
     TenantContextMiddleware,
     { provide: APP_INTERCEPTOR, useClass: TenantOverrideInterceptor },
   ],
-  exports: [TenantRegistryService, TenantContextMiddleware],
+  exports: [TenantRegistryService, TenantSecretService, TenantContextMiddleware],
 })
 export class TenantModule {}

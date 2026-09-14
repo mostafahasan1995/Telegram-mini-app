@@ -13,6 +13,17 @@ export { TenantOverrideInterceptor } from './tenant-override.interceptor';
 export { TenantModule } from './tenant.module';
 export { TenantRegistryService, type TenantSummary } from './services/tenant-registry.service';
 export {
+  TENANT_SECRET_INFO,
+  TENANT_SECRET_SENTINEL_PREFIXES,
+  TenantSecretError,
+  TenantSecretErrorCodes,
+  TenantSecretService,
+  isTenantSecretError,
+  isTenantSecretSentinel,
+  type TenantSecretErrorCode,
+  type TenantSecretField,
+} from './services/tenant-secret.service';
+export {
   createTenantContext,
   getEffectiveTenantId,
   getHomeTenantId,

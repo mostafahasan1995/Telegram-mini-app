@@ -38,20 +38,18 @@ import {
   TENANT_ZERO_ID,
   TENANT_ZERO_SLUG,
 } from '@core/tenant/tenant.constants';
-import { deriveKey, sealSecret } from '@modules/player/utils/secret-box.util';
+// The service FILE for the same reason: it is framework-free on purpose, so the seed seals with the
+// exact label, key derivation and refusal rules the runtime opens with. A private copy here is how a
+// reader and a writer drift apart without anything failing until a secret is opened.
+import {
+  TenantSecretService,
+  isTenantSecretSentinel,
+} from '@core/tenant/services/tenant-secret.service';
 
 /**
- * HKDF label for the tenant-scoped secret columns (bot token, webhook secret, Ichancy password,
- * Sham Cash key). It is separate from the player-credential label on purpose: the two protect
- * different things and must not share a key. WHATEVER READS THESE COLUMNS MUST DERIVE WITH THIS
- * EXACT STRING — a mismatch does not fail loudly at boot, it fails the first time a secret is opened.
- */
-const TENANT_SECRET_INFO = 'ichancy-tenant-secret-enc:v1';
-
-/**
- * The root the rest of the codebase already derives from (PlayerLinkService uses `config.jwt.secret`
- * for exactly this). There is no dedicated credential secret in the env schema, and the seed is not
- * the place to introduce one.
+ * The root TenantSecretService derives from at runtime (`config.jwt.secret`), as TENANT-OPERATIONS.md
+ * specifies. There is no dedicated credential secret in the env schema, and the seed is not the place
+ * to introduce one.
  */
 const ROOT_SECRET_VAR = 'JWT_SECRET';
 
@@ -136,8 +134,9 @@ function buildSealer(env: NodeJS.ProcessEnv): ((plaintext: string) => string) | 
   const rootSecret = env[ROOT_SECRET_VAR]?.trim();
   if (rootSecret === undefined || rootSecret.length === 0) return null;
 
-  const key = deriveKey(rootSecret, TENANT_SECRET_INFO);
-  return (plaintext: string): string => sealSecret(key, plaintext);
+  // The Ichancy password is the only secret this seed seals: nothing here reads a Telegram variable.
+  const secrets = new TenantSecretService(rootSecret);
+  return (plaintext: string): string => secrets.sealIchancyPassword(plaintext);
 }
 
 function sealOrPlaceholder(
@@ -146,7 +145,14 @@ function sealOrPlaceholder(
   placeholder: string,
 ): SealedValue {
   const plaintext = raw?.trim();
-  if (seal === null || plaintext === undefined || plaintext.length === 0) {
+  // A sentinel copied into .env (REPLACE-ME, …) is "unset", not a password. Sealing it would hide it
+  // from the repair and activation checks below; the service would refuse to seal it anyway.
+  if (
+    seal === null ||
+    plaintext === undefined ||
+    plaintext.length === 0 ||
+    isTenantSecretSentinel(plaintext)
+  ) {
     return { value: `${PLACEHOLDER_PREFIX}-${placeholder}`, isPlaceholder: true };
   }
   return { value: seal(plaintext), isPlaceholder: false };
