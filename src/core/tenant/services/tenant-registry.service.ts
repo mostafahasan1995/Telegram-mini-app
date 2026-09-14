@@ -9,12 +9,18 @@
  * The TTL is short (30s). This is the row that says whether an operator is suspended, and a
  * suspension that takes a minute to bite is a minute of an operator still taking money.
  */
+import { createHash } from 'node:crypto';
+
 import { Injectable } from '@nestjs/common';
 import { type TenantStatus } from '@prisma/client';
 
 import { CacheService } from '../../cache/cache.service';
 import { PrismaService } from '../../prisma/prisma.service';
-import { TENANT_REGISTRY_TTL_SECONDS, tenantRegistryKey } from '../tenant.constants';
+import {
+  TENANT_REGISTRY_TTL_SECONDS,
+  tenantRegistryKey,
+  tenantWebhookRouteKey,
+} from '../tenant.constants';
 
 /** JSON-safe. Nothing here may become a bigint without revisiting the cache round trip. */
 export interface TenantSummary {
@@ -23,6 +29,20 @@ export interface TenantSummary {
   displayName: string;
   status: TenantStatus;
   currencyCode: string;
+}
+
+/**
+ * Where an inbound webhook call belongs, and what it must prove. JSON-safe for the same reason.
+ *
+ * The secret stays SEALED here, and so does the cached copy: only TenantSecretService opens it, at the
+ * moment of comparison, and the plaintext never reaches Redis. The status is deliberately absent. It
+ * is read through `find()`, whose cache `invalidate()` already evicts, so a suspension reaches the
+ * webhook through the same path as every other caller instead of through a second cache nobody
+ * remembers to clear.
+ */
+export interface TenantWebhookRoute {
+  tenantId: string;
+  webhookSecretEnc: string | null;
 }
 
 @Injectable()
@@ -56,12 +76,56 @@ export class TenantRegistryService {
   }
 
   /**
+   * The operator whose webhook is served under `pathToken`, or null when none is.
+   *
+   * Misses are cached like hits, so a scanner walking random tokens costs Redis reads, not Postgres
+   * queries. A token that is not even shaped like one is refused before either. That early return
+   * is the only timing difference between two unknown tokens, and it tells the caller nothing
+   * beyond what it already knows: that it sent something malformed.
+   */
+  async findByWebhookPathToken(pathToken: string): Promise<TenantWebhookRoute | null> {
+    if (!WEBHOOK_PATH_TOKEN.test(pathToken)) return null;
+
+    return this.cache.getOrSet<TenantWebhookRoute | null>(
+      tenantWebhookRouteKey(digestPathToken(pathToken)),
+      TENANT_REGISTRY_TTL_SECONDS,
+      async () => {
+        const row = await this.prisma.tenant.findUnique({
+          where: { webhookPathToken: pathToken },
+          select: { id: true, webhookSecretEnc: true },
+        });
+        return row === null ? null : { tenantId: row.id, webhookSecretEnc: row.webhookSecretEnc };
+      },
+      { cacheNull: true },
+    );
+  }
+
+  /**
    * MUST be called by anything that changes a tenant's status, slug or currency, otherwise a
    * suspended operator keeps serving for up to the TTL.
    */
   async invalidate(tenantId: string): Promise<void> {
     await this.cache.del(tenantRegistryKey(tenantId));
   }
+
+  /**
+   * MUST be called with the OLD token by anything that rotates a webhook path token or its secret.
+   * Otherwise, for up to the TTL, the old token keeps routing, or the old secret keeps authenticating.
+   * The route cache is keyed by the token, so the tenant id alone cannot find the entry.
+   */
+  async invalidateWebhookPathToken(pathToken: string): Promise<void> {
+    await this.cache.del(tenantWebhookRouteKey(digestPathToken(pathToken)));
+  }
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * URL-safe and bounded. Generated tokens are CSPRNG bytes in a URL-safe encoding, and the path segment
+ * is what Caddy's and the backend's redaction regexes match. The upper bound keeps an absurd segment
+ * out of the unique index lookup.
+ */
+const WEBHOOK_PATH_TOKEN = /^[A-Za-z0-9_-]{8,256}$/;
+
+const digestPathToken = (pathToken: string): string =>
+  createHash('sha256').update(pathToken, 'utf8').digest('hex');

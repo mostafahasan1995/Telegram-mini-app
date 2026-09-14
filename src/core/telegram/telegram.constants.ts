@@ -22,13 +22,25 @@ export const TELEGRAM_SECRET_HEADER = 'x-telegram-bot-api-secret-token';
 
 /**
  * Redis dedupe window for update ids. Telegram retries an unacknowledged update for a while and
- * then gives up; an hour comfortably covers that. Postgres' UNIQUE(update_id) is the real
- * guarantee — this only spares it the duplicate traffic.
+ * then gives up; an hour comfortably covers that. Postgres' UNIQUE(tenant_id, update_id) is the
+ * real guarantee — this only spares it the duplicate traffic.
  */
 export const TELEGRAM_UPDATE_DEDUPE_TTL_SECONDS = 3_600;
 
-export const telegramUpdateDedupeKey = (updateId: number | bigint | string): string =>
-  `tg:upd:${updateId}`;
+/**
+ * WHY BOTH IDENTIFIERS BELOW CARRY THE TENANT: `update_id` is a counter Telegram keeps PER BOT, and
+ * every operator has its own bot. Sooner or later two operators' bots both deliver an update 1000.
+ * Keyed on the update id alone, the second one is a "duplicate" and a player's tap or an admin's
+ * approval is silently dropped for whichever operator happened to be second.
+ */
+export const telegramUpdateDedupeKey = (
+  tenantId: string,
+  updateId: number | bigint | string,
+): string => `tg:upd:${tenantId}:${updateId}`;
+
+/** BullMQ job id. Hyphens rather than colons, because colons separate BullMQ's own Redis keys. */
+export const telegramUpdateJobId = (tenantId: string, updateId: number | bigint | string): string =>
+  `tg-${tenantId}-${updateId}`;
 
 /**
  * Cached getMe result. Presetting `botInfo` is what lets a Bot be constructed without a network

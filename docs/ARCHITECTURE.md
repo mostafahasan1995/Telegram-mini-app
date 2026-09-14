@@ -69,8 +69,8 @@ The pain in dev is real. Planned fix: a `TELEGRAM_POLLING=true` dev mode (not bu
 
 ## What happens when a player sends /deposit 50000
 
-1. Telegram POSTs the update to `POST /telegram/webhook/<secret-path>`
-2. API checks the secret header, writes `telegram_updates` (`ON CONFLICT DO NOTHING` — a resend is ignored), queues a job, replies 200 — all in ~10 ms
+1. Telegram POSTs the update to `POST /telegram/webhook/<path-token>`. Each operator's bot has its own path token.
+2. API looks the operator up by that path token and checks the secret header against that operator's sealed secret. Unknown tokens and wrong secrets get the same 403. For a SUSPENDED or CLOSED operator it replies 200 and drops the update. Otherwise it writes `telegram_updates` (`ON CONFLICT (tenant_id, update_id) DO NOTHING`, so a resend is ignored), queues a job tagged with the tenant, and replies 200, all in about 10 ms.
 3. Worker picks the job, runs the handler
 4. Handler calls `DepositService.create` — one DB transaction: the `DepositRequest` row, a `DepositTransition` row, an audit row
 5. Bot replies: reference, where to pay, deadline

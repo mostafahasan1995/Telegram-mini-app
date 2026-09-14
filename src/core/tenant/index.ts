@@ -6,12 +6,17 @@ export {
   TENANT_ZERO_ID,
   TENANT_ZERO_SLUG,
   tenantRegistryKey,
+  tenantWebhookRouteKey,
 } from './tenant.constants';
 export { TenantErrorCodes, type TenantErrorCode } from './tenant-error-codes';
 export { TenantContextMiddleware } from './tenant-context.middleware';
 export { TenantOverrideInterceptor } from './tenant-override.interceptor';
 export { TenantModule } from './tenant.module';
-export { TenantRegistryService, type TenantSummary } from './services/tenant-registry.service';
+export {
+  TenantRegistryService,
+  type TenantSummary,
+  type TenantWebhookRoute,
+} from './services/tenant-registry.service';
 export {
   TENANT_SECRET_INFO,
   TENANT_SECRET_SENTINEL_PREFIXES,

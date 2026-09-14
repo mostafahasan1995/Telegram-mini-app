@@ -45,6 +45,14 @@ export const TENANT_HEADER = 'x-tenant-id';
 export const tenantRegistryKey = (tenantId: string): string => `tenant:id:${tenantId}`;
 
 /**
+ * Cached webhook route, keyed by the SHA-256 hex of the path token and never by the token itself.
+ * The token is half of a webhook's credentials, and Redis keys show up in MONITOR, in SCAN output
+ * and in every "what is filling Redis" investigation.
+ */
+export const tenantWebhookRouteKey = (pathTokenDigest: string): string =>
+  `tenant:webhook:${pathTokenDigest}`;
+
+/**
  * Short on purpose. This caches "does this operator exist, and is it serving" — a suspension has
  * to take effect quickly, and the row is tiny enough that re-reading it is cheap.
  */

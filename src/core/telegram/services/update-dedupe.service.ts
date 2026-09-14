@@ -4,8 +4,14 @@
  * `dep:approve:<shortId>` must approve exactly once, no matter how many times Telegram sends it.
  *
  * TWO LAYERS, ONE TRUTH:
- *  - `telegram_updates.update_id` is UNIQUE. That is the guarantee, and it survives a Redis flush.
+ *  - `telegram_updates (tenant_id, update_id)` is UNIQUE. That is the guarantee, and it survives a
+ *    Redis flush.
  *  - A Redis claim in front of it is an optimisation, so ordinary retries never reach Postgres.
+ *
+ * WHY EVERYTHING IS KEYED BY TENANT: `update_id` is numbered per bot, and every operator has its
+ * own bot. The same update id arriving from two operators is two different updates. Both must be
+ * stored, and neither may dedupe the other away. The Redis claim is namespaced the same way (see
+ * telegram.constants).
  *
  * THE SUBTLE PART — the claim must be undone if anything downstream fails. If Redis says "new",
  * the row is inserted, and then the enqueue fails, returning 500 makes Telegram retry; but by then
@@ -74,11 +80,14 @@ export class UpdateDedupeService {
   ) {}
 
   /**
-   * Persists an update exactly once. `isNew: false` means it was already recorded and the caller
-   * must NOT enqueue it again.
+   * Persists an update exactly once per operator. `isNew: false` means this tenant's bot already
+   * delivered it and the caller must NOT enqueue it again.
+   *
+   * `tenantId` must come from an authenticated webhook route, never from the update: nothing inside
+   * an update says which bot it was sent to.
    */
-  async record(update: Update): Promise<RecordedUpdate> {
-    const dedupeKey = telegramUpdateDedupeKey(update.update_id);
+  async record(tenantId: string, update: Update): Promise<RecordedUpdate> {
+    const dedupeKey = telegramUpdateDedupeKey(tenantId, update.update_id);
 
     // Fast path: an ordinary Telegram retry never touches Postgres.
     const claimed = await this.locks
@@ -93,16 +102,19 @@ export class UpdateDedupeService {
       // Raw SQL because Prisma's `createMany({ skipDuplicates: true })` does the ON CONFLICT part
       // but cannot RETURN the generated id, and we need it to enqueue and to roll back.
       // Ids are bound as text and cast, so a 64-bit value never passes through a JS number.
+      // The conflict target is the (tenant_id, update_id) unique index. Raw SQL bypasses the tenant
+      // scope extension, which is why tenant_id is written explicitly rather than left to it.
       const rows = await this.prisma.$queryRaw<Array<{ id: string }>>`
-        INSERT INTO telegram_updates (update_id, kind, chat_id, from_user_id, payload)
+        INSERT INTO telegram_updates (tenant_id, update_id, kind, chat_id, from_user_id, payload)
         VALUES (
+          ${tenantId}::uuid,
           ${String(update.update_id)}::bigint,
           ${kind},
           ${chatId === null ? null : chatId.toString()}::bigint,
           ${fromUserId === null ? null : fromUserId.toString()}::bigint,
           ${JSON.stringify(update)}::jsonb
         )
-        ON CONFLICT (update_id) DO NOTHING
+        ON CONFLICT (tenant_id, update_id) DO NOTHING
         RETURNING id
       `;
 
@@ -126,9 +138,11 @@ export class UpdateDedupeService {
    * deduplicated into oblivion. Deliberately best-effort: it runs on an error path, and throwing
    * here would replace the real error with a less useful one.
    */
-  async rollback(updateRowId: string, updateId: number | bigint): Promise<void> {
+  async rollback(tenantId: string, updateRowId: string, updateId: number | bigint): Promise<void> {
     try {
-      await this.prisma.telegramUpdate.delete({ where: { id: updateRowId } });
+      // Pinned to the tenant as well as the row id, so a mismatched pair deletes nothing rather than
+      // another operator's update.
+      await this.prisma.telegramUpdate.deleteMany({ where: { id: updateRowId, tenantId } });
     } catch (error: unknown) {
       this.logger.error(
         `Failed to roll back telegram_updates row ${updateRowId}: ${
@@ -136,7 +150,9 @@ export class UpdateDedupeService {
         }`,
       );
     }
-    await this.locks.releaseClaim(telegramUpdateDedupeKey(updateId)).catch(() => undefined);
+    await this.locks
+      .releaseClaim(telegramUpdateDedupeKey(tenantId, updateId))
+      .catch(() => undefined);
   }
 
   /** Marks an update as handled. Called by the worker after `bot.handleUpdate()` returns. */

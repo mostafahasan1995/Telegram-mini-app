@@ -1,7 +1,8 @@
 /**
  * WHY the backend redacts its own request URLs even though Caddy already rewrites them: the Telegram
- * webhook is served at /telegram/webhook/<TELEGRAM_WEBHOOK_PATH_TOKEN>, and that path segment is the
- * second lock on the endpoint (the secret header is the first). Caddy's access-log regexp keeps the
+ * webhook is served at /telegram/webhook/<path token>, one token per operator, and that segment is
+ * half of the endpoint's credentials: it selects the operator whose secret header is then checked.
+ * Caddy's access-log regexp keeps the
  * token out of ITS lines, but pino-http, the exception filter and the boot banner used to write the
  * same URL straight to stdout, which Docker keeps and Alloy ships to Loki. Anyone with Grafana would
  * then read the token from the upstream's lines instead of the proxy's.
