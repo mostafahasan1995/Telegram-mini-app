@@ -53,6 +53,7 @@ export class ReconProcessor extends WorkerHost {
           ichancyMinor: result.ichancyMinor?.toString() ?? null,
           deltaMinor: result.deltaMinor?.toString() ?? null,
           breakId: result.breakId,
+          ichancyFake: result.ichancyFake,
         };
       }
       case TASKS.RECON_STUCK_DEPOSITS: {

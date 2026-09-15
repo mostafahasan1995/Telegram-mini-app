@@ -92,6 +92,15 @@ export const IMPORT_FAILED_UNEXPECTEDLY_MESSAGE =
 /** The dashboard's own sentence for 409 IMPORT_ALREADY_RUNNING (src/features/tenants tests). */
 export const IMPORT_ALREADY_RUNNING_MESSAGE = 'An import is already running for this operator.';
 
+/**
+ * health.ichancy.error under ICHANCY_FAKE. Health answers `ok: false` with this sentence and
+ * `fake: true` instead of asking the fake adapter, because the fake answers every wallet read with a
+ * made-up float: an `ok: true` beside a plausible number was read on a laptop as a working connection
+ * to a real agent, which is the one conclusion a fixture must never support.
+ */
+export const ICHANCY_FAKE_MODE_MESSAGE =
+  'Ichancy is in fake mode (ICHANCY_FAKE=true): no real connection was made.';
+
 /** health.ichancy.error, and every credential refusal, for tenant zero. */
 export const PLATFORM_HAS_NO_AGENT_MESSAGE =
   'Tenant zero is the platform, not an operator: it has no Ichancy agent.';

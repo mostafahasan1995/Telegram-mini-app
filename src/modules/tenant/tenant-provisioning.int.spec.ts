@@ -88,6 +88,7 @@ const tenantSchema = z.looseObject({
   depositMode: z.enum(['AUTO', 'MANUAL']).optional(),
   withdrawalMode: z.enum(['AUTO', 'MANUAL']).optional(),
   miniAppUrl: z.string().nullable().optional(),
+  ichancyFake: z.boolean(),
   createdAt: isoDateTime,
   updatedAt: isoDateTime,
   counts: z.looseObject({ players: z.number(), deposits: z.number() }).optional(),
@@ -113,6 +114,7 @@ const tenantHealthSchema = z.looseObject({
   }),
   ichancy: z.looseObject({
     ok: z.boolean(),
+    fake: z.boolean(),
     baseUrl: z.string(),
     username: z.string(),
     agentId: z.string(),
@@ -140,6 +142,7 @@ const tenantProvisioningSchema = z.looseObject({
   paymentMethodsNeedAccounts: z.boolean(),
   playersImported: z.number(),
   playersImportError: z.string().nullable(),
+  ichancyFake: z.boolean(),
 });
 const tenantCreatedSchema = tenantSchema.extend({ provisioning: tenantProvisioningSchema });
 const errorEnvelopeSchema = z.looseObject({
@@ -379,7 +382,10 @@ describe('Tenant creation and Telegram operations (integration)', () => {
       playersImported: 0,
       playersImportError:
         'Players were not imported: the operator was not activated. Import them from the operator once it is.',
+      // This suite runs under ICHANCY_FAKE, and the report says so.
+      ichancyFake: true,
     });
+    expect(created.ichancyFake).toBe(true);
 
     // Sealed on the row, and the webhook Telegram holds is exactly this deployment's, with its secret.
     const row = await prisma.tenant.findUniqueOrThrow({ where: { id: created.id } });
@@ -853,15 +859,18 @@ describe('Tenant creation and Telegram operations (integration)', () => {
       lastErrorMessage: null,
       lastErrorDate: null,
     });
-    // The agent answered with its float (the fake's wallet here; tenant-ichancy.int.spec.ts reads a
-    // stubbed Ichancy with real credentials), and the operators on the same login are named.
+    // This suite runs under ICHANCY_FAKE, so nothing real can answer for the agent: health says fake
+    // mode, not ok, with no float (the fake's wallet is a made-up number that once read as a working
+    // connection). tenant-ichancy.int.spec.ts reads a stubbed real Ichancy and gets the float. The
+    // operators on the same login are still named: that needs no Ichancy at all.
     expect(healthy.ichancy).toMatchObject({
-      ok: true,
+      ok: false,
+      fake: true,
       username: SHARED_AGENT_LOGIN,
       agentId: PLATFORM_DEFAULT_AGENT,
-      error: null,
-      floatMinor: '10000000',
-      belowWatermark: expect.any(Boolean),
+      error: 'Ichancy is in fake mode (ICHANCY_FAKE=true): no real connection was made.',
+      floatMinor: null,
+      belowWatermark: false,
       sharesAgentWith: [`${SLUG_PREFIX}${RUN}-laptop`],
     });
     expect(healthy.counts).toEqual({ players: 0, deposits: 0 });

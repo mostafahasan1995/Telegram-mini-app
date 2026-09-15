@@ -69,12 +69,25 @@ export interface TenantView {
   depositMode: DepositMode;
   withdrawalMode: WithdrawalMode;
   miniAppUrl: string | null;
+  /**
+   * True when this deployment runs with ICHANCY_FAKE. Deployment-wide, repeated on every operator
+   * because the console reads operators, not deployments: an ACTIVE status reached under the fake was
+   * "verified" by a fixture, and the screen showing that status is where it has to be said.
+   */
+  ichancyFake: boolean;
   createdAt: string;
   updatedAt: string;
   counts?: TenantCounts;
 }
 
-export function toTenantView(row: TenantViewRow, counts?: TenantCounts): TenantView {
+/** What the mapper needs beyond the row. `ichancyFake` is required so no caller can forget it. */
+export interface TenantViewContext {
+  ichancyFake: boolean;
+  counts?: TenantCounts;
+}
+
+export function toTenantView(row: TenantViewRow, context: TenantViewContext): TenantView {
+  const { counts } = context;
   return {
     id: row.id,
     slug: row.slug,
@@ -96,6 +109,7 @@ export function toTenantView(row: TenantViewRow, counts?: TenantCounts): TenantV
     depositMode: row.depositMode,
     withdrawalMode: row.withdrawalMode,
     miniAppUrl: row.miniAppUrl,
+    ichancyFake: context.ichancyFake,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     ...(counts === undefined ? {} : { counts: { players: counts.players, deposits: counts.deposits } }),

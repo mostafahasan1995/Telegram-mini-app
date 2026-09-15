@@ -3,6 +3,7 @@ import { DepositMode, TenantStatus, WithdrawalMode } from '@prisma/client';
 import type { AuditWriteInput } from '@core/audit/audit.types';
 import type { AuditService } from '@core/audit/audit.service';
 import type { InitDataService } from '@core/auth/services/init-data.service';
+import type { AppConfigService } from '@core/config/config.service';
 import type { PrismaService } from '@core/prisma/prisma.service';
 import type { TenantBotRegistry } from '@core/telegram/services/tenant-bot-registry.service';
 import type { TenantRegistryService } from '@core/tenant/services/tenant-registry.service';
@@ -43,6 +44,8 @@ const operatorRow = (overrides: Partial<TenantViewRow> = {}): TenantViewRow => (
 interface HarnessOptions {
   /** The view row a read AFTER the write answers. Defaults to `current`. */
   after?: TenantViewRow;
+  /** The deployment's ICHANCY_FAKE. Defaults to false, real mode. */
+  ichancyFake?: boolean;
 }
 
 function harness(current: TenantViewRow | null, options: HarnessOptions = {}) {
@@ -80,10 +83,21 @@ function harness(current: TenantViewRow | null, options: HarnessOptions = {}) {
     registry as unknown as TenantRegistryService,
     bots as unknown as TenantBotRegistry,
     initData as unknown as InitDataService,
+    { ichancy: { fake: options.ichancyFake ?? false } } as unknown as AppConfigService,
   );
 
   return { service, tx, prisma, audits, registry, bots, initData };
 }
+
+describe('TenantAdminService views and ICHANCY_FAKE', () => {
+  it('marks every view with the deployment’s fake mode, and real mode as false', async () => {
+    expect(await harness(operatorRow(), { ichancyFake: true }).service.get(OPERATOR_ID)).toMatchObject({
+      status: 'ACTIVE',
+      ichancyFake: true,
+    });
+    expect(await harness(operatorRow()).service.get(OPERATOR_ID)).toMatchObject({ ichancyFake: false });
+  });
+});
 
 describe('TenantAdminService.suspend', () => {
   it("suspends an ACTIVE operator, audits it in that operator's own log and evicts all three caches", async () => {

@@ -73,6 +73,7 @@ const tenantSchema = z.looseObject({
   depositMode: z.enum(['AUTO', 'MANUAL']).optional(),
   withdrawalMode: z.enum(['AUTO', 'MANUAL']).optional(),
   miniAppUrl: z.string().nullable().optional(),
+  ichancyFake: z.boolean(),
   createdAt: isoDateTime,
   updatedAt: isoDateTime,
   counts: z.looseObject({ players: z.number(), deposits: z.number() }).optional(),
@@ -260,6 +261,8 @@ describe('Tenant admin surface (integration)', () => {
       adminChatId: '-1001234567890',
       dualApprovalThresholdMinor: '30000000',
       counts: { players: 0, deposits: 0 },
+      // The test env runs ICHANCY_FAKE, so every operator view says so.
+      ichancyFake: true,
     });
 
     const wire = JSON.stringify(response.body);

@@ -156,6 +156,7 @@ export class ReconciliationController {
     deltaMinor: string | null;
     breakId: string | null;
     belowWatermark: boolean;
+    ichancyFake: boolean;
   }> {
     // The OPERATOR's currency, as the sweep uses: its float account and its agent wallet are in the
     // currency it trades in, which is not necessarily the deployment's.
@@ -172,6 +173,7 @@ export class ReconciliationController {
       deltaMinor: result.deltaMinor?.toString() ?? null,
       breakId: result.breakId,
       belowWatermark: result.belowWatermark,
+      ichancyFake: result.ichancyFake,
     };
   }
 

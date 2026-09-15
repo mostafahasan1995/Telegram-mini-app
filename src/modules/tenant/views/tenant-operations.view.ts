@@ -18,6 +18,14 @@
  * ══ BOOLEAN AND ERROR, NEVER A TRI-STATE ═════════════════════════════════════════════════════════
  * The provisioning report keeps each step as a boolean AND a nullable error, as the contract insists:
  * "did not run" and "ran and failed" send an operator to two different places.
+ *
+ * ══ FAKE MODE IS SAID OUT LOUD, NEVER IMPLIED ════════════════════════════════════════════════════
+ * Under ICHANCY_FAKE every Ichancy answer is a fixture. Each shape here that reports something Ichancy
+ * said carries an explicit boolean (`fake` on the health block, `ichancyFake` on the provisioning
+ * report and the import summary) so the console can say "nothing real was checked" instead of leaving
+ * an operator to infer it from a number that looks real. The health block goes further and reports
+ * `ok: false` with ICHANCY_FAKE_MODE_MESSAGE: a success there is exactly what was mistaken for a live
+ * connection.
  */
 import type { WebhookInfo } from 'grammy/types';
 
@@ -54,7 +62,13 @@ export interface TenantBotHealthView {
 }
 
 export interface TenantIchancyHealthView {
+  /** False whenever nothing real answered, including under ICHANCY_FAKE (see `fake`). */
   ok: boolean;
+  /**
+   * True when this deployment runs with ICHANCY_FAKE: no connection to Ichancy was made, `ok` is
+   * false, `error` says so and `floatMinor` is null. Always present, false in real mode.
+   */
+  fake: boolean;
   baseUrl: string;
   username: string;
   agentId: string;
@@ -90,6 +104,11 @@ export interface TenantProvisioningView {
   paymentMethodsNeedAccounts: boolean;
   playersImported: number;
   playersImportError: string | null;
+  /**
+   * True under ICHANCY_FAKE: `activated` and `playersImported` were answered by the fake adapter, so
+   * the agent's credentials were never proven and any imported players are fixtures.
+   */
+  ichancyFake: boolean;
 }
 
 /** POST /v1/admin/tenants: `{ ...TenantView, provisioning }`, flattened as the contract answers it. */
@@ -110,6 +129,8 @@ export interface PlayerImportSummaryView {
   error: string | null;
   startedAt: string;
   finishedAt: string;
+  /** True under ICHANCY_FAKE: the listing was the fake adapter's, so every count is of fixtures. */
+  ichancyFake: boolean;
 }
 
 /** A webhook URL or a Telegram sentence, with any path token masked. */
@@ -203,10 +224,11 @@ export function botHealthUnavailable(username: string | null, reason: string): T
 }
 
 /**
- * The Ichancy half of GET /health when no check can be made at all (tenant zero, which has no agent):
- * a schema-valid "not checked", never a success. `floatMinor` is null and `belowWatermark` false,
- * which the contract defines as "no comparison was possible". `sharesAgentWith` needs no sign-in and
- * is real.
+ * The Ichancy half of GET /health when no check can be made at all (tenant zero, which has no agent;
+ * any operator under ICHANCY_FAKE, where nothing real can answer): a schema-valid "not checked", never
+ * a success. `floatMinor` is null and `belowWatermark` false, which the contract defines as "no
+ * comparison was possible". `sharesAgentWith` needs no sign-in and is real. `fake` is the deployment's
+ * mode, passed in rather than inferred from the reason, so tenant zero on a fake deployment says both.
  */
 export function ichancyHealthNotChecked(input: {
   baseUrl: string;
@@ -214,10 +236,12 @@ export function ichancyHealthNotChecked(input: {
   agentId: string;
   sharesAgentWith: string[];
   reason: string;
+  fake: boolean;
   checkedAt: Date;
 }): TenantIchancyHealthView {
   return {
     ok: false,
+    fake: input.fake,
     baseUrl: input.baseUrl,
     username: input.username,
     agentId: input.agentId,

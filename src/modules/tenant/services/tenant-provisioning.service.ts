@@ -29,6 +29,7 @@ import { Injectable, Logger } from '@nestjs/common';
 
 import { adminActor } from '@common/types/actor.type';
 import { AuditService } from '@core/audit/audit.service';
+import { AppConfigService } from '@core/config/config.service';
 import {
   OPERATOR_DEFAULT_PAYMENT_METHODS,
   ensurePaymentMethods,
@@ -64,6 +65,7 @@ export class TenantProvisioningService {
     private readonly audit: AuditService,
     private readonly telegram: TenantTelegramService,
     private readonly ichancy: TenantIchancyService,
+    private readonly config: AppConfigService,
   ) {}
 
   async provision(actorAdminId: string, tenant: ProvisioningTarget): Promise<TenantProvisioningView> {
@@ -89,6 +91,7 @@ export class TenantProvisioningService {
       paymentMethodsNeedAccounts: rails.needAccounts,
       playersImported: players.imported,
       playersImportError: players.error,
+      ichancyFake: this.config.ichancy.fake,
     };
 
     await this.recordReport(actorAdminId, tenant.id, report);
@@ -170,6 +173,7 @@ export class TenantProvisioningService {
               paymentMethodsCreated: report.paymentMethodsCreated,
               paymentMethodsNeedAccounts: report.paymentMethodsNeedAccounts,
               playersImported: report.playersImported,
+              ichancyFake: report.ichancyFake,
             },
           }),
         ),

@@ -28,9 +28,11 @@ const row = (overrides: Partial<TenantViewRow> = {}): TenantViewRow => ({
   ...overrides,
 });
 
+const REAL = { ichancyFake: false } as const;
+
 describe('toTenantView', () => {
   it('answers every field the console tenantSchema reads, with ids and money as strings', () => {
-    expect(toTenantView(row(), { players: 12, deposits: 40 })).toEqual({
+    expect(toTenantView(row(), { ...REAL, counts: { players: 12, deposits: 40 } })).toEqual({
       id: '11111111-1111-4111-8111-111111111111',
       slug: 'northern-branch',
       displayName: 'Northern branch',
@@ -49,30 +51,38 @@ describe('toTenantView', () => {
       depositMode: 'MANUAL',
       withdrawalMode: 'AUTO',
       miniAppUrl: 'https://cashier.example.app',
+      ichancyFake: false,
       createdAt: '2026-09-01T10:00:00.000Z',
       updatedAt: '2026-09-02T11:30:00.000Z',
       counts: { players: 12, deposits: 40 },
     });
   });
 
+  it('says so when the deployment runs with ICHANCY_FAKE, whatever the status', () => {
+    expect(toTenantView(row({ status: TenantStatus.ACTIVE }), { ichancyFake: true })).toMatchObject({
+      status: 'ACTIVE',
+      ichancyFake: true,
+    });
+  });
+
   it('reports the webhook path only as a boolean, and never the token itself', () => {
-    const view = toTenantView(row());
+    const view = toTenantView(row(), REAL);
     expect(view.hasWebhookPath).toBe(true);
     expect(JSON.stringify(view)).not.toContain(PATH_TOKEN);
     expect(view).not.toHaveProperty('webhookPathToken');
 
-    expect(toTenantView(row({ webhookPathToken: null })).hasWebhookPath).toBe(false);
-    expect(toTenantView(row({ webhookPathToken: '' })).hasWebhookPath).toBe(false);
+    expect(toTenantView(row({ webhookPathToken: null }), REAL).hasWebhookPath).toBe(false);
+    expect(toTenantView(row({ webhookPathToken: '' }), REAL).hasWebhookPath).toBe(false);
   });
 
   it('keeps a channel id past what a JS number holds exactly', () => {
-    const view = toTenantView(row({ feedChatId: -1009007199254740993n }));
+    const view = toTenantView(row({ feedChatId: -1009007199254740993n }), REAL);
     expect(view.feedChatId).toBe('-1009007199254740993');
   });
 
   it('omits counts when nothing was counted, rather than claiming zero', () => {
-    expect(toTenantView(row())).not.toHaveProperty('counts');
-    expect(toTenantView(row(), { players: 0, deposits: 0 }).counts).toEqual({
+    expect(toTenantView(row(), REAL)).not.toHaveProperty('counts');
+    expect(toTenantView(row(), { ...REAL, counts: { players: 0, deposits: 0 } }).counts).toEqual({
       players: 0,
       deposits: 0,
     });

@@ -75,6 +75,11 @@ export interface FloatSyncResult {
   deltaMinor: bigint | null;
   breakId: string | null;
   belowWatermark: boolean;
+  /**
+   * True under ICHANCY_FAKE: the wallet was NOT read (the fake's is a fixture), so `ichancyMinor` and
+   * `deltaMinor` are null, no break was opened and `belowWatermark` judges the ledger alone.
+   */
+  ichancyFake: boolean;
 }
 
 /** Money is missing or unexplained. Not the top severity — the books are still internally consistent. */
@@ -180,6 +185,22 @@ export class AgentFloatSyncService {
     const tenantId = requireEffectiveTenantId();
     const ledgerMinor = await this.ledgerFloat(currencyCode);
 
+    // Fake mode reads no wallet, for the reason the tick is inert (see tick): the fake's wallet is a
+    // fixture, so a "drift" against it is noise, and on this route it would also OPEN a break that a
+    // human is then asked to work. The answer says the comparison was not made, with `ichancyFake`
+    // so the console can say why instead of reporting an Ichancy outage.
+    if (this.config.ichancy.fake) {
+      return {
+        currencyCode,
+        ledgerMinor,
+        ichancyMinor: null,
+        deltaMinor: null,
+        breakId: null,
+        belowWatermark: ledgerMinor < this.config.limits.agentFloatLowWatermarkMinor,
+        ichancyFake: true,
+      };
+    }
+
     const wallet = await this.ichancy.getAgentWallet({ correlationId: 'agent-float-sync' });
     if (wallet.kind !== 'ok') {
       const cause = wallet.kind === 'rejected' ? `${wallet.code} ${wallet.message}` : wallet.cause;
@@ -193,6 +214,7 @@ export class AgentFloatSyncService {
         deltaMinor: null,
         breakId: null,
         belowWatermark: ledgerMinor < this.config.limits.agentFloatLowWatermarkMinor,
+        ichancyFake: false,
       };
     }
 
@@ -210,7 +232,15 @@ export class AgentFloatSyncService {
       this.logger.debug(
         `agent float in sync: ${formatMinorToDecimal(ledgerMinor)} ${currencyCode}`,
       );
-      return { currencyCode, ledgerMinor, ichancyMinor, deltaMinor, breakId: null, belowWatermark };
+      return {
+        currencyCode,
+        ledgerMinor,
+        ichancyMinor,
+        deltaMinor,
+        breakId: null,
+        belowWatermark,
+        ichancyFake: false,
+      };
     }
 
     const account = await this.accounts.findByCode(
@@ -253,6 +283,7 @@ export class AgentFloatSyncService {
       deltaMinor,
       breakId: opened.id,
       belowWatermark,
+      ichancyFake: false,
     };
   }
 

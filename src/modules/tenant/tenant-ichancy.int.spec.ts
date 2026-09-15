@@ -100,6 +100,7 @@ const provisioningSchema = z.looseObject({
   activationError: z.string().nullable(),
   playersImported: z.number(),
   playersImportError: z.string().nullable(),
+  ichancyFake: z.boolean(),
 });
 const tenantCreatedSchema = tenantSchema.extend({ provisioning: provisioningSchema });
 const playerImportSummarySchema = z.looseObject({
@@ -109,10 +110,12 @@ const playerImportSummarySchema = z.looseObject({
   error: z.string().nullable(),
   startedAt: z.string(),
   finishedAt: z.string(),
+  ichancyFake: z.boolean(),
 });
 const ichancyHealthSchema = z.looseObject({
   ichancy: z.looseObject({
     ok: z.boolean(),
+    fake: z.boolean(),
     baseUrl: z.string(),
     username: z.string(),
     agentId: z.string(),
@@ -506,7 +509,7 @@ describe('Per-operator Ichancy agents through an HTTP-level stub (integration)',
     expect(await registry.find(alpha.id)).toMatchObject({ status: TenantStatus.SUSPENDED });
 
     const response = await activate(alpha.id).expect(200);
-    expect(tenantSchema.parse((response.body as Body).data).status).toBe('ACTIVE');
+    expect(tenantSchema.parse((response.body as Body).data)).toMatchObject({ status: 'ACTIVE', ichancyFake: false });
 
     // Exactly one sign-in, at alpha's host, presenting alpha's login and alpha's password.
     expect(signIns(HOST_A, login).map((row) => row.passwordMatched)).toEqual([true]);
@@ -609,6 +612,8 @@ describe('Per-operator Ichancy agents through an HTTP-level stub (integration)',
     );
     expect(health.ichancy).toMatchObject({
       ok: true,
+      // Real mode (ICHANCY_FAKE=0 for this suite): the flag is present and false.
+      fake: false,
       baseUrl: HOST_B,
       username: login,
       agentId: '6001',
@@ -842,7 +847,7 @@ describe('Per-operator Ichancy agents through an HTTP-level stub (integration)',
       api().post(`/v1/admin/tenants/${id}/import-players`).set('authorization', platformBearer);
 
     const firstRun = playerImportSummarySchema.parse(((await importPlayers(first.id).expect(200)).body as Body).data);
-    expect(firstRun).toMatchObject({ scanned: 2, created: 2, existing: 0, error: null });
+    expect(firstRun).toMatchObject({ scanned: 2, created: 2, existing: 0, error: null, ichancyFake: false });
 
     const secondRun = playerImportSummarySchema.parse(((await importPlayers(second.id).expect(200)).body as Body).data);
     expect(secondRun).toMatchObject({ scanned: 2, created: 0, existing: 0 });
@@ -881,6 +886,7 @@ describe('Per-operator Ichancy agents through an HTTP-level stub (integration)',
       activationError: null,
       playersImported: 2,
       playersImportError: null,
+      ichancyFake: false,
     });
     expect(await prisma.player.count({ where: { tenantId: activated.id, source: PlayerSource.ICHANCY_IMPORT } })).toBe(2);
 

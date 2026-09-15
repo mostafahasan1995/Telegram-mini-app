@@ -23,6 +23,8 @@
  *
  * UNDER ICHANCY_FAKE the fake adapter answers the sign-in. The activation is still recorded, with
  * `adapter: 'fake'` in its audit row, so a fake verification can never be mistaken for a real one.
+ * What the console reads says the same: TenantView and the import summary carry `ichancyFake`, and
+ * health does not ask the fake at all (see health).
  *
  * ══ THE CREDENTIAL EDIT VERIFIES BEFORE IT SAVES ═════════════════════════════════════════════════
  * PATCH /:id/ichancy (TENANT-OPERATIONS.md §6) writes only fields that change, refuses a new agent id
@@ -104,6 +106,7 @@ import {
   ICHANCY_HEALTH_CACHE_SECONDS,
   IMPORT_ALREADY_RUNNING_MESSAGE,
   IMPORT_CURSOR_TTL_SECONDS,
+  ICHANCY_FAKE_MODE_MESSAGE,
   IMPORT_FAILED_UNEXPECTEDLY_MESSAGE,
   IMPORT_LOCK_TTL_MS,
   PLATFORM_HAS_NO_AGENT_MESSAGE,
@@ -633,6 +636,8 @@ export class TenantIchancyService {
         ...counts,
         startedAt: startedAt.toISOString(),
         finishedAt: finishedAt.toISOString(),
+        // The counts above came from the fake adapter's fixtures when this is true.
+        ichancyFake: this.config.ichancy.fake,
       };
     } finally {
       await this.locks.release(handle).catch(() => false);
@@ -915,16 +920,24 @@ export class TenantIchancyService {
       target.id,
     );
 
-    if (target.id === TENANT_ZERO_ID) {
-      return ichancyHealthNotChecked({
+    const fake = this.config.ichancy.fake;
+    const notChecked = (reason: string): TenantIchancyHealthView =>
+      ichancyHealthNotChecked({
         baseUrl: target.ichancyBaseUrl,
         username: target.ichancyUsername,
         agentId: target.ichancyAgentId,
         sharesAgentWith,
-        reason: PLATFORM_HAS_NO_AGENT_MESSAGE,
+        reason,
+        fake,
         checkedAt: new Date(),
       });
-    }
+
+    if (target.id === TENANT_ZERO_ID) return notChecked(PLATFORM_HAS_NO_AGENT_MESSAGE);
+
+    // Under ICHANCY_FAKE the adapter is not asked at all: its wallet is a made-up float, and `ok: true`
+    // beside it was read as a real connection. Nothing is cached either, so a restart into real mode
+    // never serves a fixture's answer.
+    if (fake) return notChecked(ICHANCY_FAKE_MODE_MESSAGE);
 
     const check = await this.cache.getOrSet<IchancyCheck>(
       ichancyHealthCacheKey(target.id),
@@ -934,6 +947,7 @@ export class TenantIchancyService {
 
     return {
       ok: check.ok,
+      fake: false,
       baseUrl: target.ichancyBaseUrl,
       username: target.ichancyUsername,
       agentId: target.ichancyAgentId,

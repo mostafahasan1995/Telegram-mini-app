@@ -136,10 +136,12 @@ describe('bot health', () => {
         agentId: '10045',
         sharesAgentWith: ['south-branch'],
         reason: 'Not checked',
+        fake: false,
         checkedAt,
       }),
     ).toEqual({
       ok: false,
+      fake: false,
       baseUrl: 'https://agents.ichancy.com',
       username: 'agent_north',
       agentId: '10045',

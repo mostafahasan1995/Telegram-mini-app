@@ -56,6 +56,7 @@ import { BusinessRuleError, ValidationError } from '@common/exceptions/app.excep
 import { adminActor } from '@common/types/actor.type';
 import { AuditService } from '@core/audit/audit.service';
 import { InitDataService } from '@core/auth/services/init-data.service';
+import { AppConfigService } from '@core/config/config.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { acrossTenants } from '@core/prisma/tenant-scope.extension';
 import { TenantBotRegistry } from '@core/telegram/services/tenant-bot-registry.service';
@@ -74,6 +75,7 @@ import {
   toTenantView,
   type TenantCounts,
   type TenantView,
+  type TenantViewRow,
 } from '../views/tenant.view';
 
 /** The audit subject of every row this service writes. */
@@ -87,7 +89,16 @@ export class TenantAdminService {
     private readonly registry: TenantRegistryService,
     private readonly bots: TenantBotRegistry,
     private readonly initData: InitDataService,
+    private readonly config: AppConfigService,
   ) {}
+
+  /** Every view this service answers, with the deployment's fake-mode flag (see TenantView). */
+  private view(row: TenantViewRow, counts?: TenantCounts): TenantView {
+    return toTenantView(row, {
+      ichancyFake: this.config.ichancy.fake,
+      ...(counts === undefined ? {} : { counts }),
+    });
+  }
 
   async list(): Promise<TenantView[]> {
     const [rows, players, deposits] = await Promise.all([
@@ -113,7 +124,7 @@ export class TenantAdminService {
     const depositsBy = new Map(deposits.map((group) => [group.tenantId, group._count._all]));
 
     return rows.map((row) =>
-      toTenantView(row, {
+      this.view(row, {
         players: playersBy.get(row.id) ?? 0,
         deposits: depositsBy.get(row.id) ?? 0,
       }),
@@ -123,7 +134,7 @@ export class TenantAdminService {
   async get(id: string): Promise<TenantView> {
     const row = await this.prisma.tenant.findUnique({ where: { id }, select: TENANT_VIEW_SELECT });
     if (row === null) throw tenantNotFound();
-    return toTenantView(row, await this.countsOf(id));
+    return this.view(row, await this.countsOf(id));
   }
 
   async update(actorAdminId: string, id: string, dto: UpdateTenantDto): Promise<TenantView> {
@@ -168,7 +179,7 @@ export class TenantAdminService {
     // .chatsOf), so nothing else holds a copy of what a PATCH can change.
     if (changed) await this.registry.invalidate(id);
 
-    return toTenantView(row, await this.countsOf(id));
+    return this.view(row, await this.countsOf(id));
   }
 
   async suspend(actorAdminId: string, id: string): Promise<TenantView> {
@@ -216,7 +227,7 @@ export class TenantAdminService {
     // eviction (a process that died between commit and here) gets cleared.
     await this.evictOperator(id);
 
-    return toTenantView(row, await this.countsOf(id));
+    return this.view(row, await this.countsOf(id));
   }
 
   /**
