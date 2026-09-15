@@ -16,6 +16,10 @@ import {
   type TenantSummary,
 } from '../../tenant/services/tenant-registry.service';
 import { getEffectiveTenantId } from '../../tenant/tenant.storage';
+import {
+  type ChatProjectionResult,
+  type TelegramChatProjectionService,
+} from '../chat-binding/chat-projection.service';
 import { type TenantBotRegistry } from '../services/tenant-bot-registry.service';
 import { type UpdateDedupeService } from '../services/update-dedupe.service';
 import { TELEGRAM_UPDATE_JOB } from '../telegram.constants';
@@ -58,6 +62,10 @@ describe('TelegramUpdateProcessor', () => {
   let seen: Array<{ tenantId: string | undefined; actor: string }>;
   let warn: jest.SpyInstance;
   let processor: TelegramUpdateProcessor;
+  let project: jest.Mock<Promise<ChatProjectionResult>, [string, Update]>;
+  let projection: ChatProjectionResult;
+  /** The tenant context each projection ran in. */
+  let projected: Array<string | undefined>;
 
   const botFor = (label: string): Bot =>
     ({
@@ -83,6 +91,13 @@ describe('TelegramUpdateProcessor', () => {
     markProcessed = jest.fn().mockResolvedValue(undefined);
     markFailed = jest.fn().mockResolvedValue(undefined);
 
+    project = jest.fn<Promise<ChatProjectionResult>, [string, Update]>(() => {
+      projected.push(getEffectiveTenantId());
+      return Promise.resolve(projection);
+    });
+    projected = [];
+    projection = { relevant: false, consumed: false };
+
     processor = new TelegramUpdateProcessor(
       { get } as unknown as TenantBotRegistry,
       { markProcessed, markFailed } as unknown as UpdateDedupeService,
@@ -93,6 +108,7 @@ describe('TelegramUpdateProcessor', () => {
           return Promise.resolve(status === undefined ? null : summary(id, status));
         },
       } as unknown as TenantRegistryService,
+      { project } as unknown as TelegramChatProjectionService,
     );
   });
 
@@ -140,6 +156,53 @@ describe('TelegramUpdateProcessor', () => {
       expect(warn).toHaveBeenCalledTimes(1);
     },
   );
+
+  it.each([TenantStatus.SUSPENDED, TenantStatus.CLOSED])(
+    'runs only the chat projection for a %s operator, in its context, and marks the row processed by it',
+    async (status) => {
+      statuses.set(TENANT_A, status);
+      projection = { relevant: true, consumed: false };
+
+      await expect(processor.process(jobOf({}))).resolves.toBeUndefined();
+
+      expect(projected).toEqual([TENANT_A]);
+      expect(get).not.toHaveBeenCalled();
+      expect(seen).toHaveLength(0);
+      expect(markProcessed).toHaveBeenCalledWith('row-1', 'TelegramChatProjection');
+      expect(markFailed).not.toHaveBeenCalled();
+    },
+  );
+
+  it('gives a bind command consumed by the projection to no handler, for an ACTIVE operator too', async () => {
+    projection = { relevant: true, consumed: true };
+
+    await processor.process(jobOf({}));
+
+    expect(get).not.toHaveBeenCalled();
+    expect(seen).toHaveLength(0);
+    expect(markProcessed).toHaveBeenCalledWith('row-1', 'TelegramChatProjection');
+  });
+
+  it('projects before dispatching an ACTIVE operator’s ordinary update', async () => {
+    projection = { relevant: true, consumed: false };
+
+    await processor.process(jobOf({}));
+
+    expect(project).toHaveBeenCalledTimes(1);
+    expect(seen).toEqual([{ tenantId: TENANT_A, actor: `${TENANT_A}:SYSTEM` }]);
+    expect(markProcessed).toHaveBeenCalledWith('row-1', TelegramUpdateProcessor.name);
+  });
+
+  it('records a projection failure and rethrows it before anything is dispatched', async () => {
+    const boom = new Error('database is down');
+    project.mockRejectedValueOnce(boom);
+
+    await expect(processor.process(jobOf({}))).rejects.toBe(boom);
+
+    expect(get).not.toHaveBeenCalled();
+    expect(markFailed).toHaveBeenCalledWith('row-1', boom);
+    expect(markProcessed).not.toHaveBeenCalled();
+  });
 
   it('drops the update of an operator that no longer exists', async () => {
     statuses.delete(TENANT_A);

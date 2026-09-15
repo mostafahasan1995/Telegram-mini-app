@@ -286,6 +286,45 @@ describe('TelegramWebhookController (integration)', () => {
     });
   });
 
+  describe('a stopped operator', () => {
+    const botJoinedGroup = (updateId: number): Update =>
+      ({
+        update_id: updateId,
+        my_chat_member: {
+          chat: { id: -1001234500001, type: 'supergroup', title: 'P6 staff' },
+          from: { id: 555, is_bot: false, first_name: 'Owner' },
+          date: Math.floor(Date.now() / 1000),
+          old_chat_member: { status: 'left', user: { id: 1, is_bot: true, first_name: 'Bot' } },
+          new_chat_member: { status: 'administrator', user: { id: 1, is_bot: true, first_name: 'Bot' } },
+        },
+      }) as unknown as Update;
+
+    it.each([
+      ['SUSPENDED', () => suspended],
+      ['CLOSED', () => closed],
+    ] as const)(
+      'stores and enqueues a %s operator’s my_chat_member, the one copy Telegram sends',
+      async (_status, operatorOf) => {
+        const operator = operatorOf();
+        const updateId = freshUpdateId();
+
+        await expect(
+          controller.receive(operator.pathToken, operator.secret, botJoinedGroup(updateId)),
+        ).resolves.toEqual({ ok: true });
+
+        const row = await prisma.telegramUpdate.findFirstOrThrow({
+          where: { tenantId: operator.id, updateId: BigInt(updateId) },
+          select: { kind: true, chatId: true },
+        });
+        expect(row).toEqual({ kind: 'my_chat_member', chatId: -1001234500001n });
+        expect(add).toHaveBeenCalledTimes(1);
+        expect((add.mock.calls[0] as AddCall)[1]).toMatchObject({ tenantId: operator.id });
+        // A player's message to a stopped operator is still dropped: "an operator that is not ACTIVE"
+        // below proves it, and must be the first to log that operator's status.
+      },
+    );
+  });
+
   describe('refusals', () => {
     it('refuses a wrong secret for a real token with 403 and stores nothing', async () => {
       const updateId = freshUpdateId();

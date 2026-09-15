@@ -865,6 +865,11 @@ describe('Per-operator Ichancy agents through an HTTP-level stub (integration)',
     const create = (password: string, name: string): request.Test => {
       const { token, botId } = newToken();
       telegram.accept(token, testBotInfo(botId, `p11_${name}_${RUN}_bot`));
+      // A staff group the bot administers, named on the form and verified at create: without one an
+      // operator is never activated, whatever Ichancy answers.
+      const staffGroup = -1007_000_000_000n - BigInt(botId);
+      telegram.setChat(staffGroup, { type: 'supergroup', title: `P11 ${name} staff` });
+      telegram.setBotMember(token, staffGroup, { status: 'administrator' });
       return api()
         .post('/v1/admin/tenants')
         .set('authorization', platformBearer)
@@ -876,6 +881,7 @@ describe('Per-operator Ichancy agents through an HTTP-level stub (integration)',
           ichancyPassword: password,
           ichancyBaseUrl: HOST_A,
           ichancyAgentId: '9001',
+          adminChatId: staffGroup.toString(),
         });
     };
 

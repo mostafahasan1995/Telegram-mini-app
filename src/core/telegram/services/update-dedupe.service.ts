@@ -20,9 +20,10 @@
  * accepted and never processed is invisible; an update processed twice is a double credit.
  */
 import { Injectable, Logger } from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
 import { type Update } from 'grammy/types';
 import { PrismaService } from '../../prisma/prisma.service';
-import { acrossTenants } from '../../prisma/tenant-scope.extension';
+import { getEffectiveTenantId } from '../../tenant/tenant.storage';
 import { LockService } from '../../cache/lock.service';
 import { TELEGRAM_UPDATE_DEDUPE_TTL_SECONDS, telegramUpdateDedupeKey } from '../telegram.constants';
 import { type RecordedUpdate, type TelegramUpdateKind } from '../telegram.types';
@@ -157,29 +158,41 @@ export class UpdateDedupeService {
   }
 
   /**
-   * Marks an update as handled. Called by the worker after `bot.handleUpdate()` returns.
+   * Marks an update as handled. Called by the worker after the update was handled (by grammY, or by
+   * the chat projection alone).
    *
-   * WHY `acrossTenants` on this and markFailed: the row id is the one `record()` wrote and the job
-   * carried, never a client's, and markFailed must also work for a job that arrived with no tenant
-   * at all — so there is no operator to pin it to that the id does not already identify.
+   * WHICH ROW: the id is the one `record()` wrote and the job carried, never a client's. The update
+   * processor handles a job inside that job's operator, so the write is pinned to the effective tenant,
+   * like every id-based write in this codebase. Only a job that arrived with no tenant at all runs with
+   * no context, and then the id alone identifies the row.
+   *
+   * WHY NOT `update({ where: acrossTenants({ id }) })` any more: under an operator's context that marker
+   * did not survive to the tenant-scope extension on the application's extended client, so the write
+   * was refused in tests (and silently pinned elsewhere). A filter naming the tenant needs no marker.
    */
   async markProcessed(updateRowId: string, handler?: string): Promise<void> {
-    await this.prisma.telegramUpdate.update({
-      where: acrossTenants({ id: updateRowId }),
+    await this.prisma.telegramUpdate.updateMany({
+      where: this.ownRow(updateRowId),
       data: { processedAt: new Date(), handler: handler ?? null, processingError: null },
     });
   }
 
   /**
    * Records a processing failure WITHOUT setting processedAt, so the row stays visible to whatever
-   * sweeps for stuck updates.
+   * sweeps for stuck updates. Pinned as markProcessed is.
    */
   async markFailed(updateRowId: string, error: unknown): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
-    await this.prisma.telegramUpdate.update({
-      where: acrossTenants({ id: updateRowId }),
+    await this.prisma.telegramUpdate.updateMany({
+      where: this.ownRow(updateRowId),
       // Truncated: a Postgres error can carry a whole query, and this column is read in a UI.
       data: { processingError: message.slice(0, 2_000) },
     });
+  }
+
+  /** The row `record()` wrote, pinned to the operator the caller runs as whenever there is one. */
+  private ownRow(updateRowId: string): Prisma.TelegramUpdateWhereInput {
+    const tenantId = getEffectiveTenantId();
+    return tenantId === undefined ? { id: updateRowId } : { id: updateRowId, tenantId };
   }
 }

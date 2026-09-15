@@ -12,7 +12,18 @@ import { getEffectiveTenantId } from '@core/tenant/tenant.storage';
 
 import type { TenantViewRow } from '../views/tenant.view';
 
+import type { VerifiedChat } from '@core/telegram/utils/chat-verification.util';
+
 import { TenantAdminService } from './tenant-admin.service';
+import type { TenantTelegramChatsService } from './tenant-telegram-chats.service';
+
+const STAFF_GROUP: VerifiedChat = {
+  chatId: -1009999999999n,
+  chatType: 'SUPERGROUP',
+  title: 'Northern staff',
+  username: null,
+  facts: { status: 'ADMINISTRATOR', isAdministrator: true, isPresent: true, canPost: true },
+};
 
 const OPERATOR_ID = '11111111-1111-4111-8111-111111111111';
 const ACTOR_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-000000000006';
@@ -76,6 +87,10 @@ function harness(current: TenantViewRow | null, options: HarnessOptions = {}) {
   const registry = { invalidate: jest.fn().mockResolvedValue(undefined) };
   const bots = { invalidate: jest.fn().mockResolvedValue(undefined) };
   const initData = { invalidate: jest.fn() };
+  const chats = {
+    verifyForBinding: jest.fn().mockResolvedValue(STAFF_GROUP),
+    commitVerified: jest.fn().mockResolvedValue(undefined),
+  };
 
   const service = new TenantAdminService(
     prisma as unknown as PrismaService,
@@ -84,9 +99,10 @@ function harness(current: TenantViewRow | null, options: HarnessOptions = {}) {
     bots as unknown as TenantBotRegistry,
     initData as unknown as InitDataService,
     { ichancy: { fake: options.ichancyFake ?? false } } as unknown as AppConfigService,
+    chats as unknown as TenantTelegramChatsService,
   );
 
-  return { service, tx, prisma, audits, registry, bots, initData };
+  return { service, tx, prisma, audits, registry, bots, initData, chats };
 }
 
 describe('TenantAdminService views and ICHANCY_FAKE', () => {
@@ -244,6 +260,64 @@ describe('TenantAdminService.update', () => {
     expect(h.tx.tenant.update).not.toHaveBeenCalled();
     expect(h.audits).toHaveLength(0);
     expect(h.registry.invalidate).not.toHaveBeenCalled();
+    // The form re-sends the stored chat on every save: that must never ask Telegram anything.
+    expect(h.chats.verifyForBinding).not.toHaveBeenCalled();
+  });
+
+  it('verifies a changed staff group with Telegram before the transaction, then binds it', async () => {
+    const h = harness(operatorRow());
+
+    await h.service.update(ACTOR_ID, OPERATOR_ID, {
+      displayName: 'Northern branch',
+      adminChatId: '-1009999999999',
+    });
+
+    expect(h.chats.verifyForBinding).toHaveBeenCalledWith(
+      ACTOR_ID,
+      OPERATOR_ID,
+      'STAFF',
+      -1009999999999n,
+      'adminChatId',
+      'patch',
+    );
+    const verifiedAt = h.chats.verifyForBinding.mock.invocationCallOrder[0] ?? 0;
+    const transactionAt = h.prisma.runInTransaction.mock.invocationCallOrder[0] ?? 0;
+    expect(verifiedAt).toBeLessThan(transactionAt);
+    expect(h.chats.commitVerified).toHaveBeenCalledWith(
+      ACTOR_ID,
+      OPERATOR_ID,
+      'STAFF',
+      STAFF_GROUP,
+      'patch',
+    );
+    // The chat is not written as a plain column edit: the bind path writes and audits it.
+    expect(h.tx.tenant.update).not.toHaveBeenCalled();
+    expect(h.audits).toHaveLength(0);
+  });
+
+  it('saves nothing at all when Telegram refuses a changed chat', async () => {
+    const h = harness(operatorRow());
+    const refusal = new Error('TELEGRAM_CHAT_REJECTED');
+    h.chats.verifyForBinding.mockRejectedValue(refusal);
+
+    await expect(
+      h.service.update(ACTOR_ID, OPERATOR_ID, {
+        displayName: 'Renamed at the same time',
+        feedChatId: '-1008888888888',
+      }),
+    ).rejects.toBe(refusal);
+
+    expect(h.prisma.runInTransaction).not.toHaveBeenCalled();
+    expect(h.chats.commitVerified).not.toHaveBeenCalled();
+  });
+
+  it('refuses 0 as a chat id instead of unbinding through PATCH', async () => {
+    const h = harness(operatorRow());
+
+    await expect(
+      h.service.update(ACTOR_ID, OPERATOR_ID, { adminChatId: '0' }),
+    ).rejects.toMatchObject({ httpStatus: 400, errorCode: 'VALIDATION_FAILED' });
+    expect(h.chats.verifyForBinding).not.toHaveBeenCalled();
   });
 
   it('answers 404 for an unknown operator', async () => {

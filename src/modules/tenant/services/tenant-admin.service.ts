@@ -50,7 +50,7 @@
  * what is already recorded", which the dialog promises a suspension will not do.
  */
 import { Injectable } from '@nestjs/common';
-import { TenantStatus, type Prisma } from '@prisma/client';
+import { TelegramChatPurpose, TenantStatus, type Prisma } from '@prisma/client';
 
 import { BusinessRuleError, ValidationError } from '@common/exceptions/app.exception';
 import { adminActor } from '@common/types/actor.type';
@@ -60,6 +60,8 @@ import { AppConfigService } from '@core/config/config.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { acrossTenants } from '@core/prisma/tenant-scope.extension';
 import { TenantBotRegistry } from '@core/telegram/services/tenant-bot-registry.service';
+import { UNBOUND_CHAT_ID } from '@core/telegram/utils/chat-membership.util';
+import type { VerifiedChat } from '@core/telegram/utils/chat-verification.util';
 import { TenantRegistryService } from '@core/tenant/services/tenant-registry.service';
 import { TenantErrorCodes } from '@core/tenant/tenant-error-codes';
 import { TENANT_ZERO_ID } from '@core/tenant/tenant.constants';
@@ -78,6 +80,8 @@ import {
   type TenantViewRow,
 } from '../views/tenant.view';
 
+import { TenantTelegramChatsService } from './tenant-telegram-chats.service';
+
 /** The audit subject of every row this service writes. */
 const TENANT_SUBJECT = 'Tenant';
 
@@ -90,6 +94,7 @@ export class TenantAdminService {
     private readonly bots: TenantBotRegistry,
     private readonly initData: InitDataService,
     private readonly config: AppConfigService,
+    private readonly chats: TenantTelegramChatsService,
   ) {}
 
   /** Every view this service answers, with the deployment's fake-mode flag (see TenantView). */
@@ -137,6 +142,14 @@ export class TenantAdminService {
     return this.view(row, await this.countsOf(id));
   }
 
+  /**
+   * PATCH /:id. A changed staff or feed group is a BIND, not a column edit: it is verified with
+   * Telegram first, before and outside the transaction, and only when it really differs from what is
+   * stored (the console's edit form sends the chat on every save, and an unrelated edit must not fail
+   * because the bot has since left the group). Nothing is written when any verification refuses. The
+   * other fields are then written and audited as before, and each verified chat is committed through
+   * the same path as the chat routes, audited as `tenant.telegramChat.bound`.
+   */
   async update(actorAdminId: string, id: string, dto: UpdateTenantDto): Promise<TenantView> {
     const frozen = immutableFieldsIn(dto);
     if (frozen.length > 0) {
@@ -147,7 +160,8 @@ export class TenantAdminService {
       );
     }
 
-    const edits = tenantEditsFromDto(dto);
+    const { adminChatId, feedChatId, ...edits } = tenantEditsFromDto(dto);
+    const verifiedChats = await this.verifyChatEdits(actorAdminId, id, { adminChatId, feedChatId });
 
     const { row, changed } = await this.prisma.runInTransaction(async (tx) => {
       const current = await tx.tenant.findUnique({ where: { id }, select: TENANT_VIEW_SELECT });
@@ -179,7 +193,63 @@ export class TenantAdminService {
     // .chatsOf), so nothing else holds a copy of what a PATCH can change.
     if (changed) await this.registry.invalidate(id);
 
+    for (const verified of verifiedChats) {
+      await this.chats.commitVerified(actorAdminId, id, verified.purpose, verified.chat, 'patch');
+    }
+    if (verifiedChats.length > 0) return this.get(id);
+
     return this.view(row, await this.countsOf(id));
+  }
+
+  /** The staff and feed chats a PATCH really changes, each verified with Telegram. See `update`. */
+  private async verifyChatEdits(
+    actorAdminId: string,
+    id: string,
+    edits: { adminChatId?: bigint; feedChatId?: bigint | null },
+  ): Promise<{ purpose: TelegramChatPurpose; chat: VerifiedChat }[]> {
+    if (edits.adminChatId === undefined && edits.feedChatId === undefined) return [];
+
+    const current = await this.prisma.tenant.findUnique({
+      where: { id },
+      select: { adminChatId: true, feedChatId: true },
+    });
+    if (current === null) throw tenantNotFound();
+
+    const requested = [
+      {
+        purpose: TelegramChatPurpose.STAFF,
+        field: 'adminChatId',
+        next: edits.adminChatId,
+        stored: current.adminChatId,
+      },
+      {
+        purpose: TelegramChatPurpose.FEED,
+        field: 'feedChatId',
+        next: edits.feedChatId,
+        stored: current.feedChatId,
+      },
+    ];
+
+    const pending: { purpose: TelegramChatPurpose; field: string; chatId: bigint }[] = [];
+    for (const { purpose, field, next, stored } of requested) {
+      if (next === undefined || next === null || next === stored) continue;
+      if (next === UNBOUND_CHAT_ID) {
+        throw new ValidationError(undefined, {
+          fields: [
+            `${field} must be a real Telegram chat id: 0 is no chat. Remove a group with ` +
+              `DELETE /v1/admin/tenants/:id/telegram/chats/${purpose}`,
+          ],
+        });
+      }
+      pending.push({ purpose, field, chatId: next });
+    }
+
+    const verified: { purpose: TelegramChatPurpose; chat: VerifiedChat }[] = [];
+    for (const { purpose, field, chatId } of pending) {
+      const chat = await this.chats.verifyForBinding(actorAdminId, id, purpose, chatId, field, 'patch');
+      verified.push({ purpose, chat });
+    }
+    return verified;
   }
 
   async suspend(actorAdminId: string, id: string): Promise<TenantView> {

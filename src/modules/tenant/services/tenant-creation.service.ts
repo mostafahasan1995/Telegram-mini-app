@@ -3,8 +3,9 @@
  *
  * THE ORDER, and why nothing reaches Telegram or the database before the request is known to be good
  * (dashboard docs/TENANT-OPERATIONS.md §1 and API-CONTRACT.md "Tenants"):
- *  1. Resolve the defaults (utils/create-defaults.ts). A missing agent id or an unresolvable admin
- *     chat is a 400 naming the field, before any other work.
+ *  1. Resolve the defaults (utils/create-defaults.ts). A missing agent id is a 400 naming the field,
+ *     before any other work. No staff group is needed: an operator is created without one and stays
+ *     SUSPENDED until one is bound (owner decision, 2026-09-15).
  *  2. Check the currency exists and is active: it is a foreign key, and an unchecked one would fail
  *     as a 500 at insert.
  *  3. A slug the caller CHOSE that is taken is 409 DUPLICATE_RESOURCE `fields: ['slug']`. A derived
@@ -13,7 +14,8 @@
  *     recorded from Telegram's answer. A bot another operator already holds is 409
  *     DUPLICATE_RESOURCE naming botToken: provisioning's setWebhook would otherwise repoint that
  *     operator's live bot at this one. `bot_id` is unique, so a double submit loses at the insert
- *     with the same 409, before any Telegram call changes anything.
+ *     with the same 409, before any Telegram call changes anything. A staff or feed chat named on the
+ *     form is then verified with the same token (400 TELEGRAM_CHAT_REJECTED when Telegram says no).
  *  5. Seal the bot token and the Ichancy password; generate a 32-byte path token and a 24-byte
  *     secret, sealed.
  *  6. Insert the row SUSPENDED, with no staff, and audit it in the new operator's own log, in one
@@ -41,6 +43,7 @@ import { adminActor } from '@common/types/actor.type';
 import { AuditService } from '@core/audit/audit.service';
 import { isUniqueConstraintError, mapPrismaError } from '@core/prisma/prisma-errors';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { boundChatOf } from '@core/telegram/utils/chat-membership.util';
 import { TenantRegistryService } from '@core/tenant/services/tenant-registry.service';
 import {
   TenantSecretService,
@@ -110,7 +113,6 @@ export class TenantCreationService {
       dto,
       platformDefaults: defaults,
       tenantZeroAgentId: tenantZero?.ichancyAgentId ?? null,
-      creatorTelegramUserId: creator.telegramUserId,
     });
     if (!resolved.ok) throw new ValidationError(undefined, { fields: resolved.fields });
 
@@ -122,12 +124,17 @@ export class TenantCreationService {
 
     const botInfo = await this.telegram.verifyNewBotToken(dto.botToken);
     await this.telegram.assertBotUnattached(botInfo.id, null);
+    // A staff or feed chat named on the form is bound only if Telegram verifies it, like every bind.
+    const chats = await this.telegram.verifyChatsForNewBot(dto.botToken, botInfo.id, {
+      adminChatId: resolved.values.adminChatId,
+      feedChatId: resolved.values.feedChatId,
+    });
     const credentials = this.sealCredentials(dto);
 
     const created = await this.insert({
       actorAdminId: creator.adminUserId,
       chosenSlug: dto.slug,
-      values: resolved.values,
+      values: { ...resolved.values, ...chats },
       defaulted: resolved.defaulted,
       botInfo,
       credentials,
@@ -243,8 +250,8 @@ function auditSnapshot(
     status: TenantStatus.SUSPENDED,
     botUsername: botInfo.username,
     hasWebhookPath: true,
-    adminChatId: values.adminChatId.toString(),
-    feedChatId: values.feedChatId === null ? null : values.feedChatId.toString(),
+    adminChatId: boundChatOf(values.adminChatId)?.toString() ?? null,
+    feedChatId: boundChatOf(values.feedChatId)?.toString() ?? null,
     ichancyBaseUrl: values.ichancyBaseUrl,
     ichancyUsername: values.ichancyUsername,
     ichancyAgentId: values.ichancyAgentId,

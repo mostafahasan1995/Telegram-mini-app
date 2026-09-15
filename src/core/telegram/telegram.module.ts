@@ -32,6 +32,8 @@ import { SetWebhookCommand } from './commands/set-webhook.command';
 import { SetupBotCommand } from './commands/setup-bot.command';
 import { BotService } from './services/bot.service';
 import { TelegramHandlerRegistrar } from './services/handler-registrar.service';
+import { TelegramChatDiscoveryService } from './services/telegram-chat-discovery.service';
+import { TelegramChatMigrationService } from './services/telegram-chat-migration.service';
 import { TenantBotRegistry } from './services/tenant-bot-registry.service';
 import { TenantBotSetupService } from './services/tenant-bot-setup.service';
 import { UpdateDedupeService } from './services/update-dedupe.service';
@@ -57,11 +59,23 @@ import { TELEGRAM_UPDATE_QUEUE } from './telegram.constants';
     TenantBotSetupService,
     UpdateDedupeService,
     TelegramHandlerRegistrar,
+    // Prisma and audit only, so they resolve in every graph that loads this module, the CLI's
+    // included. The binding flow that also needs the queues lives in TelegramChatBindingModule.
+    TelegramChatMigrationService,
+    TelegramChatDiscoveryService,
     SetWebhookCommand,
     SetupBotCommand,
   ],
   // BullModule is re-exported so a feature module importing TelegramModule can inject the same
   // queue with @InjectQueue(TELEGRAM_UPDATE_QUEUE) instead of registering a second one.
-  exports: [TenantBotRegistry, BotService, TenantBotSetupService, UpdateDedupeService, BullModule],
+  exports: [
+    TenantBotRegistry,
+    BotService,
+    TenantBotSetupService,
+    UpdateDedupeService,
+    TelegramChatMigrationService,
+    TelegramChatDiscoveryService,
+    BullModule,
+  ],
 })
 export class TelegramModule {}

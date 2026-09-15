@@ -72,6 +72,19 @@ export const TenantErrorCodes = {
    */
   TENANT_ICHANCY_UNCONFIGURED: 'TENANT_ICHANCY_UNCONFIGURED',
   /**
+   * An operator with no staff group bound may not serve (owner decision, 2026-09-15): its review
+   * cards and alerts would go nowhere while it took real deposits. A 422 answered by POST /:id/activate
+   * (and so by provisioning's activation step) while `tenants.admin_chat_id` is unbound, and by
+   * DELETE /:id/telegram/chats/STAFF while the operator is ACTIVE. The fix is binding a group, or
+   * suspending the operator first.
+   *
+   * Also the 422 of starting a deposit (POST /v1/deposits and the bot's deposit buttons) for an
+   * operator that is ACTIVE with no staff group, a row that predates the rule. The player-facing
+   * message there is the same "deposits are paused" wording as TENANT_NOT_ACTIVE, with
+   * `details: { status }`.
+   */
+  TENANT_STAFF_GROUP_REQUIRED: 'TENANT_STAFF_GROUP_REQUIRED',
+  /**
    * POST /:id/import-players while another import for the same operator holds its lock. A 409; the
    * dashboard's console test answers exactly this code and sentence.
    */

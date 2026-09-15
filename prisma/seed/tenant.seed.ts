@@ -17,10 +17,17 @@
  * get placeholders (NOT NULL ones) or NULL. The Ichancy agent credentials are still repaired from
  * .env below, because per-operator Ichancy settings do not exist yet.
  *
- * WHY BOTH ARE CREATED `ACTIVE` and not the schema's SUSPENDED default: this path only runs on a
- * database with no migration rows (the integration harness builds its schema with `db push`), and
- * every fixture and test assumes it can sign into and serve through these two. Landing either
- * SUSPENDED would lock a developer's install out of itself on first boot.
+ * WHY TENANT ZERO IS CREATED `ACTIVE` and not the schema's SUSPENDED default: platform staff sign in
+ * through it, and a suspended operator's staff are refused, so landing it SUSPENDED would lock a
+ * developer's install out of itself on first boot. It never takes a deposit, so the staff-group rule
+ * below does not apply to it.
+ *
+ * WHY THE BOOTSTRAP OPERATOR IS NOT: an operator with no staff group may not serve (owner decision,
+ * 2026-09-15): its deposit review cards and alerts would go nowhere while it took real money. Nothing
+ * here can bind a group (the chat ids arrive from the dashboard, verified with Telegram), so the seed
+ * creates it SUSPENDED and switches it on only once a group is bound. The integration harness, which
+ * needs a serving operator, binds a labelled fixture group itself (test/setup/app-factory.ts) rather
+ * than this seed pretending one exists.
  *
  * WHY EVERY UPSERT HERE HAS AN EMPTY `update` (bar the narrow sentinel repair): the columns are
  * secrets, webhook routing and serving status. An operator who rotated a credential or suspended a
@@ -232,6 +239,7 @@ export async function seedTenancy(
     select: {
       id: true,
       status: true,
+      adminChatId: true,
       ichancyUsername: true,
       ichancyPasswordEnc: true,
       ichancyAgentId: true,
@@ -276,17 +284,22 @@ export async function seedTenancy(
      * Narrow on purpose, so a human's suspension is never reverted:
      *   - only FROM SUSPENDED, the value the migration wrote;
      *   - only when this run actually repaired something;
-     *   - only when the Ichancy credentials are no longer unconfigured.
+     *   - only when the Ichancy credentials are no longer unconfigured;
+     *   - only when a staff group is bound (see the header). The migration writes 0 there and this
+     *     seed never binds one, so on a fresh install this waits for the dashboard's bind, whose
+     *     activation is then a deliberate act in the console.
      * On a row whose credentials a human already set, no repair happens, so this cannot fire.
      */
     const ichancyConfigured =
       !isMigrationSentinel(nextIchancyPassword) &&
       !nextIchancyPassword.startsWith(PLACEHOLDER_PREFIX) &&
       !isMigrationSentinel(nextIchancyUsername);
+    const staffGroupBound = existingBootstrap.adminChatId !== UNCONFIGURED_CHAT_ID;
 
     if (
       Object.keys(repair).length > 0 &&
       ichancyConfigured &&
+      staffGroupBound &&
       existingBootstrap.status === TenantStatus.SUSPENDED
     ) {
       repair.status = TenantStatus.ACTIVE;
@@ -300,7 +313,8 @@ export async function seedTenancy(
       slug: TENANT_BOOTSTRAP_SLUG,
       // Cosmetic, and the one field here an operator is likely to want their own name in.
       displayName: readOptionalText(env.SEED_TENANT_DISPLAY_NAME) ?? 'Default operator',
-      status: TenantStatus.ACTIVE,
+      // SUSPENDED because adminChatId below is unbound: see the header.
+      status: TenantStatus.SUSPENDED,
       // Telegram columns: nothing from the environment — see the header. The NOT NULL ones say out
       // loud that they are unset; the nullable ones are simply absent.
       botTokenEnc: `${PLACEHOLDER_PREFIX}-TELEGRAM-BOT-TOKEN`,

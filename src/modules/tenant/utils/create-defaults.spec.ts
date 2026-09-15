@@ -3,7 +3,6 @@ import { DepositMode, WithdrawalMode } from '@prisma/client';
 import type { CreateTenantDto } from '../dtos/create-tenant.dto';
 
 import {
-  ADMIN_CHAT_UNRESOLVED_MESSAGE,
   ADMIN_CHAT_ZERO_MESSAGE,
   AGENT_ID_UNRESOLVED_MESSAGE,
   resolveCreateDefaults,
@@ -34,19 +33,19 @@ const input = (overrides: Partial<CreateDefaultsInput> = {}): CreateDefaultsInpu
   dto: fourFields(),
   platformDefaults: DEFAULTS,
   tenantZeroAgentId: 'unused',
-  creatorTelegramUserId: 912_911_246n,
   ...overrides,
 });
 
 describe('resolveCreateDefaults', () => {
-  it('fills every optional field from PlatformDefaults and the creator, and says which', () => {
+  it('fills every optional field from PlatformDefaults, and says which', () => {
     const result = resolveCreateDefaults(input());
 
     expect(result).toEqual({
       ok: true,
       values: {
         displayName: 'Northern branch',
-        adminChatId: 912_911_246n,
+        // No staff group yet: stored as 0, answered as null, and the operator cannot be activated.
+        adminChatId: 0n,
         feedChatId: null,
         ichancyBaseUrl: DEFAULTS.ichancyBaseUrl,
         ichancyUsername: 'agent_north',
@@ -59,16 +58,23 @@ describe('resolveCreateDefaults', () => {
         withdrawalMode: WithdrawalMode.MANUAL,
         miniAppUrl: null,
       },
-      defaulted: expect.arrayContaining([
+      defaulted: [
         'ichancyAgentId',
-        'adminChatId',
         'ichancyBaseUrl',
         'currencyCode',
         'dualApprovalThresholdMinor',
         'agentFloatLowWatermarkMinor',
         'depositExpiryMinutes',
-      ]),
+      ],
     });
+  });
+
+  it('creates with no staff group rather than refusing, and never defaults it to a person', () => {
+    const result = resolveCreateDefaults(input());
+    if (!result.ok) throw new Error('expected the create to resolve');
+    expect(result.values.adminChatId).toBe(0n);
+    // "No staff group" is not a value that was filled in for the admin.
+    expect(result.defaulted).not.toContain('adminChatId');
   });
 
   it('lets every supplied value win over its default, and records none of them as defaulted', () => {
@@ -124,41 +130,20 @@ describe('resolveCreateDefaults', () => {
     }
   });
 
-  it('refuses a console-only creator with no adminChatId, naming the field, and collects both refusals', () => {
-    expect(resolveCreateDefaults(input({ creatorTelegramUserId: null }))).toEqual({
+  it('refuses a supplied adminChatId of 0, and collects it beside a missing agent id', () => {
+    expect(resolveCreateDefaults(input({ dto: fourFields({ adminChatId: '0' }) }))).toEqual({
       ok: false,
-      fields: [ADMIN_CHAT_UNRESOLVED_MESSAGE],
+      fields: [ADMIN_CHAT_ZERO_MESSAGE],
     });
 
-    const both = resolveCreateDefaults(
-      input({
-        creatorTelegramUserId: null,
-        platformDefaults: { ...DEFAULTS, ichancyAgentId: null },
-      }),
-    );
-    expect(both).toEqual({
-      ok: false,
-      fields: [AGENT_ID_UNRESOLVED_MESSAGE, ADMIN_CHAT_UNRESOLVED_MESSAGE],
-    });
-    for (const message of [AGENT_ID_UNRESOLVED_MESSAGE, ADMIN_CHAT_UNRESOLVED_MESSAGE]) {
-      expect(message).toMatch(/^(ichancyAgentId|adminChatId) is required/);
-    }
-
-    // A console-only creator who names the chat is fine.
-    const named = resolveCreateDefaults(
-      input({ creatorTelegramUserId: null, dto: fourFields({ adminChatId: '-100555' }) }),
-    );
-    expect(named.ok && named.values.adminChatId).toBe(-100555n);
-  });
-
-  it('refuses a supplied adminChatId of 0, as it refuses a 0 default, even when the creator has an id', () => {
-    for (const creatorTelegramUserId of [912_911_246n, null]) {
-      expect(
-        resolveCreateDefaults(
-          input({ creatorTelegramUserId, dto: fourFields({ adminChatId: '0' }) }),
-        ),
-      ).toEqual({ ok: false, fields: [ADMIN_CHAT_ZERO_MESSAGE] });
-    }
+    expect(
+      resolveCreateDefaults(
+        input({
+          dto: fourFields({ adminChatId: '0' }),
+          platformDefaults: { ...DEFAULTS, ichancyAgentId: null },
+        }),
+      ),
+    ).toEqual({ ok: false, fields: [AGENT_ID_UNRESOLVED_MESSAGE, ADMIN_CHAT_ZERO_MESSAGE] });
   });
 });
 

@@ -19,6 +19,8 @@
  */
 import type { DepositMode, Prisma, TenantStatus, WithdrawalMode } from '@prisma/client';
 
+import { boundChatOf } from '@core/telegram/utils/chat-membership.util';
+
 export const TENANT_VIEW_SELECT = {
   id: true,
   slug: true,
@@ -56,7 +58,11 @@ export interface TenantView {
   displayName: string;
   status: TenantStatus;
   hasWebhookPath: boolean;
-  adminChatId: string;
+  /**
+   * The staff group, or null while none is bound (stored as 0). An operator with null here cannot be
+   * activated, and nothing it would send to staff (review cards, alerts, reports) reaches Telegram.
+   */
+  adminChatId: string | null;
   feedChatId: string | null;
   botUsername: string | null;
   ichancyBaseUrl: string;
@@ -96,8 +102,8 @@ export function toTenantView(row: TenantViewRow, context: TenantViewContext): Te
     // Existence only. An empty string is not a token either; nothing writes one, but a hand-edited
     // row must not read as routable.
     hasWebhookPath: row.webhookPathToken !== null && row.webhookPathToken.length > 0,
-    adminChatId: row.adminChatId.toString(),
-    feedChatId: row.feedChatId === null ? null : row.feedChatId.toString(),
+    adminChatId: boundChatOf(row.adminChatId)?.toString() ?? null,
+    feedChatId: boundChatOf(row.feedChatId)?.toString() ?? null,
     botUsername: row.botUsername,
     ichancyBaseUrl: row.ichancyBaseUrl,
     ichancyUsername: row.ichancyUsername,

@@ -55,6 +55,7 @@
 import { randomBytes } from 'node:crypto';
 
 import { Injectable, Logger } from '@nestjs/common';
+import { TelegramChatPurpose } from '@prisma/client';
 import type { Bot } from 'grammy';
 import type { UserFromGetMe } from 'grammy/types';
 
@@ -71,6 +72,7 @@ import { AuditService } from '@core/audit/audit.service';
 import { InitDataService } from '@core/auth/services/init-data.service';
 import { AppConfigService } from '@core/config/config.service';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { chatRejected } from '@core/telegram/chat-binding/chat-binding.errors';
 import { botIdFromToken } from '@core/telegram/services/bot.factory';
 import { TenantBotRegistry } from '@core/telegram/services/tenant-bot-registry.service';
 import {
@@ -78,6 +80,7 @@ import {
   type BotMenuPushResult,
 } from '@core/telegram/services/tenant-bot-setup.service';
 import { TELEGRAM_ALLOWED_UPDATES, telegramWebhookUrl } from '@core/telegram/telegram.constants';
+import { boundChatOf } from '@core/telegram/utils/chat-membership.util';
 import { TenantRegistryService } from '@core/tenant/services/tenant-registry.service';
 import {
   TenantSecretService,
@@ -214,6 +217,43 @@ export class TenantTelegramService {
       }
       if (botIdFromToken(token) === wanted) throw botAlreadyAttached();
     }
+  }
+
+  /**
+   * The staff and feed chats named on the create form, verified with the pasted token before the row
+   * is written, by the same checks every bind runs (verifyTelegramChat). A refusal is 400
+   * TELEGRAM_CHAT_REJECTED naming the field. Returns the ids to store: a group that became a
+   * supergroup is stored under its new id, never the dead one. An unnamed chat is left as it is.
+   */
+  async verifyChatsForNewBot(
+    token: string,
+    botId: number,
+    chats: { adminChatId: bigint; feedChatId: bigint | null },
+  ): Promise<{ adminChatId: bigint; feedChatId: bigint | null }> {
+    const verified = { ...chats };
+    const checks = [
+      { purpose: TelegramChatPurpose.STAFF, field: 'adminChatId', chatId: boundChatOf(chats.adminChatId) },
+      { purpose: TelegramChatPurpose.FEED, field: 'feedChatId', chatId: boundChatOf(chats.feedChatId) },
+    ] as const;
+
+    for (const { purpose, field, chatId } of checks) {
+      if (chatId === null) continue;
+      const verification = await this.call('check the chat with Telegram', () =>
+        this.bots.verifyChatWithToken(token, botId, chatId),
+      );
+      if (!verification.ok) {
+        throw chatRejected({
+          reason: verification.reason,
+          purpose,
+          field,
+          chatId: verification.chatId,
+          detail: verification.detail,
+        });
+      }
+      if (purpose === TelegramChatPurpose.STAFF) verified.adminChatId = verification.chat.chatId;
+      else verified.feedChatId = verification.chat.chatId;
+    }
+    return verified;
   }
 
   // ── Webhook ────────────────────────────────────────────────────────────────────────────────────

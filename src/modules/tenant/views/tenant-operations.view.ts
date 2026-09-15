@@ -34,6 +34,7 @@ import {
   redactWebhookPathToken,
 } from '@common/helpers/request-url-redaction.util';
 
+import type { TenantChatsHealthView } from './tenant-chats.view';
 import type { TenantView } from './tenant.view';
 
 /** POST and DELETE /webhook. `url` is null when Telegram holds no webhook for the bot. */
@@ -85,6 +86,11 @@ export interface TenantIchancyHealthView {
 export interface TenantHealthView {
   bot: TenantBotHealthView;
   ichancy: TenantIchancyHealthView;
+  /**
+   * The bound staff and feed groups with the bot's last sighting in each, so "the bot was removed from
+   * the staff group" shows here (`staff.isPresent: false`) while the binding itself is kept.
+   */
+  chats: TenantChatsHealthView;
   counts: { players: number; deposits: number };
 }
 

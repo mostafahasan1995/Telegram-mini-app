@@ -27,6 +27,7 @@ interface TenantUpsertArgs {
 interface ExistingBootstrapRow {
   id: string;
   status: TenantStatus;
+  adminChatId: bigint;
   ichancyUsername: string;
   ichancyPasswordEnc: string;
   ichancyAgentId: string;
@@ -36,6 +37,8 @@ interface ExistingBootstrapRow {
 const MIGRATED_BOOTSTRAP: ExistingBootstrapRow = {
   id: TENANT_BOOTSTRAP_ID,
   status: TenantStatus.SUSPENDED,
+  // 0 is "no staff group": the migration cannot know one.
+  adminChatId: 0n,
   ichancyUsername: 'REPLACE-ME',
   ichancyPasswordEnc: 'REPLACE-ME-ICHANCY-PASSWORD',
   ichancyAgentId: 'REPLACE-ME',
@@ -45,6 +48,13 @@ async function runSeed(
   env: NodeJS.ProcessEnv,
   existingBootstrap: ExistingBootstrapRow | null = null,
 ): Promise<TenantUpsertArgs> {
+  return (await runSeedAll(env, existingBootstrap)).bootstrap;
+}
+
+async function runSeedAll(
+  env: NodeJS.ProcessEnv,
+  existingBootstrap: ExistingBootstrapRow | null = null,
+): Promise<{ bootstrap: TenantUpsertArgs; upserts: TenantUpsertArgs[] }> {
   const upserts: TenantUpsertArgs[] = [];
   const stub = {
     tenant: {
@@ -65,7 +75,7 @@ async function runSeed(
 
   const bootstrap = upserts.find((args) => args.where.id === TENANT_BOOTSTRAP_ID);
   if (bootstrap === undefined) throw new Error('the seed never upserted the bootstrap operator');
-  return bootstrap;
+  return { bootstrap, upserts };
 }
 
 function openedPassword(stored: unknown): string {
@@ -99,14 +109,32 @@ describe('seedTenancy secrets', () => {
     expect(openedPassword(bootstrap.create['ichancyPasswordEnc'])).toBe(PASSWORD);
   });
 
-  it('repairs the migration sentinel with a value the runtime opens, and switches the row on', async () => {
+  it('repairs the migration sentinel with a value the runtime opens, and keeps the row suspended while no staff group is bound', async () => {
     const bootstrap = await runSeed(
       { JWT_SECRET: ROOT, ICHANCY_PASSWORD: PASSWORD, ICHANCY_USERNAME: 'agent@example.com' },
       MIGRATED_BOOTSTRAP,
     );
 
     expect(openedPassword(bootstrap.update['ichancyPasswordEnc'])).toBe(PASSWORD);
+    // An operator with no staff group may not serve: its review cards would go nowhere.
+    expect(bootstrap.update['status']).toBeUndefined();
+  });
+
+  it('switches a repaired row on once a staff group is bound', async () => {
+    const bootstrap = await runSeed(
+      { JWT_SECRET: ROOT, ICHANCY_PASSWORD: PASSWORD, ICHANCY_USERNAME: 'agent@example.com' },
+      { ...MIGRATED_BOOTSTRAP, adminChatId: -1001234567890n },
+    );
+
     expect(bootstrap.update['status']).toBe(TenantStatus.ACTIVE);
+  });
+
+  it('creates the bootstrap operator SUSPENDED with no staff group, and tenant zero ACTIVE', async () => {
+    const { bootstrap, upserts } = await runSeedAll({ JWT_SECRET: ROOT, ICHANCY_PASSWORD: PASSWORD });
+
+    expect(bootstrap.create).toMatchObject({ status: TenantStatus.SUSPENDED, adminChatId: 0n });
+    const platform = upserts.find((args) => args.where.id !== TENANT_BOOTSTRAP_ID);
+    expect(platform?.create['status']).toBe(TenantStatus.ACTIVE);
   });
 
   it('writes a placeholder the runtime refuses when there is no JWT_SECRET', async () => {

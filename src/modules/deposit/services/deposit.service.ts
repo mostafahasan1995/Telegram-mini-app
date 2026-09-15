@@ -56,6 +56,7 @@ import { OutboxService } from '@core/outbox/outbox.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { isUniqueConstraintError, mapPrismaError } from '@core/prisma/prisma-errors';
 import type { Tx } from '@core/prisma/tx.type';
+import { boundChatOf } from '@core/telegram/utils/chat-membership.util';
 import { requireEffectiveTenantId, TenantErrorCodes } from '@core/tenant';
 
 import { DEPOSIT_AGGREGATE, DEPOSIT_TOPICS, MAX_PROOFS_PER_DEPOSIT } from '../deposit.constants';
@@ -748,20 +749,34 @@ export class DepositService {
    * rate limited to a dozen calls a minute per player, and it sees a suspension the moment it
    * commits instead of up to 30 seconds later. It also keeps this module's dependencies to Prisma.
    * The operator is the effective tenant, which for a player is the one signed into their session.
+   *
+   * THE STAFF GROUP (owner decision, 2026-09-15): an operator with no staff group bound may not take
+   * money, because every review card and alert of the deposit it opens would go nowhere. Activation
+   * already refuses such an operator, but a row can be ACTIVE at "no group" without passing through
+   * it: one activated before the rule existed, or one a seed switched on. Suspending those in a data
+   * migration would silently stop a live operator, so they are refused here instead, at the start
+   * of new money only, exactly like a suspension. The player sees the same paused wording (what they
+   * can do about it is the same: nothing); the code tells the console and the logs the real cause.
    */
   private async assertOperatorServing(): Promise<void> {
     const operator = await this.prisma.tenant.findUnique({
       where: { id: requireEffectiveTenantId() },
-      select: { status: true },
+      select: { status: true, adminChatId: true },
     });
-    if (operator?.status === TenantStatus.ACTIVE) return;
-
-    throw new BusinessRuleError(
-      TenantErrorCodes.TENANT_NOT_ACTIVE,
+    const paused =
       'Deposits are paused for this cashier right now, so a new deposit cannot be started. ' +
-        'A deposit you have already paid for still goes through.',
-      { status: operator?.status ?? null },
-    );
+      'A deposit you have already paid for still goes through.';
+
+    if (operator?.status !== TenantStatus.ACTIVE) {
+      throw new BusinessRuleError(TenantErrorCodes.TENANT_NOT_ACTIVE, paused, {
+        status: operator?.status ?? null,
+      });
+    }
+    if (boundChatOf(operator.adminChatId) === null) {
+      throw new BusinessRuleError(TenantErrorCodes.TENANT_STAFF_GROUP_REQUIRED, paused, {
+        status: operator.status,
+      });
+    }
   }
 
   private policyGate(

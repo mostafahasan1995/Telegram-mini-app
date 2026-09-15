@@ -50,6 +50,7 @@ import {
   TenantBotUnavailableError,
   isTenantBotUnavailableError,
 } from '../tenant-bot.errors';
+import { verifyTelegramChat, type ChatVerification } from '../utils/chat-verification.util';
 import {
   botIdFromToken,
   buildTenantBot,
@@ -188,6 +189,16 @@ export class TenantBotRegistry {
         reason: error instanceof Error ? error.message : String(error),
       };
     }
+  }
+
+  /**
+   * verifyTelegramChat for a token that is not on any tenant row yet: the chats named on the create
+   * form are checked with the pasted token before anything is written. Same client options as every
+   * tenant Bot, for the reason `identifyToken` gives. Telegram failures that say nothing about the
+   * chat are thrown for the caller to map.
+   */
+  verifyChatWithToken(token: string, botId: number, chatId: bigint): Promise<ChatVerification> {
+    return verifyTelegramChat(new Api(token, this.clientOptions), botId, chatId);
   }
 
   private async load(tenantId: string): Promise<Bot> {

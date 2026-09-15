@@ -18,15 +18,23 @@
  *  - The job has no tenant. Only a job queued before ingress became per-operator can look like this.
  *    Guessing an operator for it is exactly the cross-tenant bug this pipeline exists to prevent, so
  *    the row is marked failed and the job fails without retries.
- *  - The operator is not ACTIVE, or no longer exists. The webhook already drops updates for a
- *    SUSPENDED or CLOSED operator without storing them. A job queued before the suspension landed
- *    gets the same answer here: nothing runs, the row records why, and the job completes. Retrying
- *    would only replay old taps, money actions included, the moment the operator is reactivated.
+ *  - The operator no longer exists: nothing runs, the row records why, and the job completes.
+ *  - The operator is not ACTIVE. The webhook already drops a SUSPENDED or CLOSED operator's updates
+ *    without storing them, EXCEPT the chat projection's (TelegramChatProjectionService: the bot's
+ *    membership in a group, a supergroup migration, a staff-group bind command). Those run through the
+ *    projection only and are marked processed. Anything else, such as a job queued before the
+ *    suspension landed, is not dispatched: the row records why and the job completes. Retrying would
+ *    only replay old taps, money actions included, the moment the operator is reactivated.
  *  - The operator's bot cannot be used (TenantBotUnavailableError). The row records why. A cause
  *    retrying can fix (getMe timed out) is rethrown for BullMQ's backoff. A cause it cannot fix
  *    (token unset, unreadable, or rejected by Telegram) fails the job now with UnrecoverableError.
  *    Either way it is this operator's job that fails. The worker, and every other operator's
  *    updates, carry on.
+ *
+ * THE PROJECTION RUNS FOR EVERY OPERATOR, before dispatch. For an ACTIVE operator a bind command is
+ * consumed there and never reaches grammY, whose player /start handler would otherwise register the
+ * person who added the bot as a player. A projection failure (the database, a Telegram outage during a
+ * bind check) is recorded and rethrown before anything is dispatched, so the retry is safe.
  *
  * WHY the job is acknowledged even when a handler misbehaves:
  * `TelegramHandlerRegistrar` wraps every handler and swallows its errors on purpose, because
@@ -46,6 +54,11 @@ import { ActorContextService } from '@core/actor-context/actor-context.service';
 
 import { TenantRegistryService } from '../../tenant/services/tenant-registry.service';
 import { runWithTenant } from '../../tenant/tenant.storage';
+import {
+  TelegramChatProjectionService,
+  type ChatProjectionResult,
+} from '../chat-binding/chat-projection.service';
+import { TELEGRAM_CHAT_PROJECTION_HANDLER } from '../telegram-chat.constants';
 import { TELEGRAM_UPDATE_JOB, TELEGRAM_UPDATE_QUEUE } from '../telegram.constants';
 import { isTenantBotUnavailableError } from '../tenant-bot.errors';
 import { type TelegramUpdateJobData } from '../telegram.types';
@@ -76,6 +89,7 @@ export class TelegramUpdateProcessor extends WorkerHost {
     private readonly dedupe: UpdateDedupeService,
     private readonly actorContext: ActorContextService,
     private readonly tenants: TenantRegistryService,
+    private readonly projection: TelegramChatProjectionService,
   ) {
     super();
   }
@@ -97,18 +111,8 @@ export class TelegramUpdateProcessor extends WorkerHost {
     }
 
     const tenant = await this.tenants.find(tenantId);
-    if (tenant === null || tenant.status !== TenantStatus.ACTIVE) {
-      const status = tenant?.status ?? 'NOT_FOUND';
-      await this.recordFailure(
-        updateRowId,
-        `Tenant ${tenantId} is ${status}; the update was dropped without being dispatched`,
-      );
-      this.logSkipOnce(
-        tenantId,
-        status,
-        `Dropping queued Telegram updates for tenant ${tenantId}: it is ${status}. ` +
-          'Nothing is dispatched. Logged once per status.',
-      );
+    if (tenant === null) {
+      await this.dropUndispatched(tenantId, updateRowId, 'NOT_FOUND');
       return;
     }
 
@@ -118,9 +122,53 @@ export class TelegramUpdateProcessor extends WorkerHost {
     // Tenant and update id together are stable across every retry, which makes them a useful key.
     await runWithTenant(tenantId, () =>
       this.actorContext.runAsSystem(
-        () => this.dispatch(tenantId, updateRowId, job.data),
+        () => this.handle(tenant.id, tenant.status, updateRowId, job.data),
         `tg-update-${tenantId}-${updateId}`,
       ),
+    );
+  }
+
+  /** The projection for every operator, then dispatch for a serving one. See the file header. */
+  private async handle(
+    tenantId: string,
+    status: TenantStatus,
+    updateRowId: string,
+    data: TelegramUpdateJobData,
+  ): Promise<void> {
+    let projection: ChatProjectionResult;
+    try {
+      projection = await this.projection.project(tenantId, data.update);
+    } catch (error: unknown) {
+      await this.recordFailure(updateRowId, error);
+      throw error;
+    }
+
+    if (status !== TenantStatus.ACTIVE) {
+      if (projection.relevant) {
+        await this.dedupe.markProcessed(updateRowId, TELEGRAM_CHAT_PROJECTION_HANDLER);
+        return;
+      }
+      await this.dropUndispatched(tenantId, updateRowId, status);
+      return;
+    }
+
+    if (projection.consumed) {
+      await this.dedupe.markProcessed(updateRowId, TELEGRAM_CHAT_PROJECTION_HANDLER);
+      return;
+    }
+    await this.dispatch(tenantId, updateRowId, data);
+  }
+
+  private async dropUndispatched(tenantId: string, updateRowId: string, status: string): Promise<void> {
+    await this.recordFailure(
+      updateRowId,
+      `Tenant ${tenantId} is ${status}; the update was dropped without being dispatched`,
+    );
+    this.logSkipOnce(
+      tenantId,
+      status,
+      `Dropping queued Telegram updates for tenant ${tenantId}: it is ${status}. ` +
+        'Nothing is dispatched. Logged once per status.',
     );
   }
 

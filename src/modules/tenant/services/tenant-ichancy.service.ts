@@ -21,6 +21,12 @@
  * TENANT_ICHANCY_UNCONFIGURED (the stored details cannot be used). The console shows the message
  * verbatim. See tenant-error-codes.ts for why the first is the dashboard's name but not its 502.
  *
+ * NO STAFF GROUP, NO ACTIVATION (owner decision, 2026-09-15): an operator whose staff group is not
+ * bound is refused with 422 TENANT_STAFF_GROUP_REQUIRED before any sign-in, and stays SUSPENDED. Its
+ * review cards and alerts would otherwise go nowhere while it took real deposits. The conditional
+ * update below also requires a bound staff group, so a group removed while the sign-in ran activates
+ * nothing. This is the only code that moves an operator to ACTIVE.
+ *
  * UNDER ICHANCY_FAKE the fake adapter answers the sign-in. The activation is still recorded, with
  * `adapter: 'fake'` in its audit row, so a fake verification can never be mistaken for a real one.
  * What the console reads says the same: TenantView and the import summary carry `ichancyFake`, and
@@ -90,6 +96,7 @@ import {
 } from '@core/ichancy';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { acrossTenants } from '@core/prisma/tenant-scope.extension';
+import { UNBOUND_CHAT_ID } from '@core/telegram/utils/chat-membership.util';
 import {
   TenantSecretService,
   isTenantSecretError,
@@ -111,6 +118,7 @@ import {
   IMPORT_LOCK_TTL_MS,
   PLATFORM_HAS_NO_AGENT_MESSAGE,
   SIGNIN_VERIFICATION,
+  STAFF_GROUP_REQUIRED_MESSAGE,
   TENANT_IMPORT_LIMITS,
   TenantAuditActions,
   ichancyHealthCacheKey,
@@ -163,6 +171,7 @@ const AGENT_ROW_SELECT = {
   ichancyUsername: true,
   ichancyPasswordEnc: true,
   ichancyAgentId: true,
+  adminChatId: true,
 } as const;
 
 interface AgentRow {
@@ -173,6 +182,8 @@ interface AgentRow {
   ichancyUsername: string;
   ichancyPasswordEnc: string;
   ichancyAgentId: string;
+  /** UNBOUND_CHAT_ID while no staff group is bound, which refuses an activation. */
+  adminChatId: bigint;
 }
 
 type ActivationAttempt =
@@ -266,6 +277,12 @@ export class TenantIchancyService {
     if (row.status === TenantStatus.CLOSED) return { kind: 'refused', error: tenantClosed() };
     if (row.status === TenantStatus.ACTIVE) return { kind: 'already-active' };
 
+    if (row.adminChatId === UNBOUND_CHAT_ID) {
+      const refusal = staffGroupRequired();
+      await this.recordRefusal(actorAdminId, id, refusal.errorCode);
+      return { kind: 'refused', error: refusal };
+    }
+
     const tail = 'The operator stays suspended.';
     const candidate = this.candidateFromRow(row, null);
     if (candidate.kind === 'refused') {
@@ -290,13 +307,19 @@ export class TenantIchancyService {
           ichancyUsername: row.ichancyUsername,
           ichancyPasswordEnc: row.ichancyPasswordEnc,
           ichancyAgentId: row.ichancyAgentId,
+          // A staff group removed while the sign-in ran matches no row: nothing is activated.
+          adminChatId: { not: UNBOUND_CHAT_ID },
         },
         data: { status: TenantStatus.ACTIVE },
       });
       if (claimed.count === 0) {
-        const current = await tx.tenant.findUnique({ where: { id }, select: { status: true } });
+        const current = await tx.tenant.findUnique({
+          where: { id },
+          select: { status: true, adminChatId: true },
+        });
         if (current?.status === TenantStatus.ACTIVE) return 'already-active' as const;
         if (current?.status === TenantStatus.CLOSED) return 'closed' as const;
+        if (current?.adminChatId === UNBOUND_CHAT_ID) return 'no-staff-group' as const;
         return 'changed' as const;
       }
 
@@ -321,6 +344,11 @@ export class TenantIchancyService {
 
     if (outcome === 'already-active') return { kind: 'already-active' };
     if (outcome === 'closed') return { kind: 'refused', error: tenantClosed() };
+    if (outcome === 'no-staff-group') {
+      const refusal = staffGroupRequired();
+      await this.recordRefusal(actorAdminId, id, refusal.errorCode);
+      return { kind: 'refused', error: refusal };
+    }
     if (outcome === 'changed') {
       return {
         kind: 'refused',
@@ -1125,6 +1153,13 @@ function signInRefusal(
   return new BusinessRuleError(
     TenantErrorCodes.ICHANCY_SIGNIN_FAILED,
     `Ichancy refused the sign-in with these credentials (${result.code}: ${result.message}). ${tail}`,
+  );
+}
+
+function staffGroupRequired(): BusinessRuleError {
+  return new BusinessRuleError(
+    TenantErrorCodes.TENANT_STAFF_GROUP_REQUIRED,
+    STAFF_GROUP_REQUIRED_MESSAGE,
   );
 }
 

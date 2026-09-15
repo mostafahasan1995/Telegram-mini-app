@@ -74,6 +74,8 @@ export const TENANT_SCOPED_MODELS: ReadonlySet<string> = new Set([
   'OutboxMessage',
   'IdempotencyKey',
   'TelegramUpdate',
+  'TelegramDiscoveredChat',
+  'TelegramChatBindLink',
   'IchancyCall',
   'AuditLog',
   'ReconciliationBreak',

@@ -30,6 +30,8 @@ import { type NestExpressApplication } from '@nestjs/platform-express';
 // `applyTestEnv()` has run, which is the precise ordering every dynamic import further down exists
 // to avoid. `tenant.storage` and `tenant.constants` are a plain AsyncLocalStorage and two uuids with
 // no Nest in them; the tenancy seed imports them the same way and for the same reason.
+// Type-only, so erased at file load: the service itself is imported after the environment exists.
+import type { PrismaService } from '@core/prisma/prisma.service';
 import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
 import { runWithTenant } from '@core/tenant/tenant.storage';
 
@@ -85,6 +87,32 @@ export interface TestApp {
 
 // Re-exported from its Nest-free home so existing imports keep working; see telegram-fixtures.ts.
 export { TEST_BOT_INFO } from './telegram-fixtures';
+
+/**
+ * The staff group the harness binds to the bootstrap operator. Not a real chat: nothing in the api
+ * harness posts to it (the bootstrap operator's bot token is a seed placeholder, and cards are sent
+ * by the worker), so it only has to be "bound" for the staff-group rule.
+ */
+export const TEST_BOOTSTRAP_STAFF_CHAT_ID = -1_009_999_000_001n;
+
+/**
+ * Every suite signs in to and takes deposits through the bootstrap operator. The seed no longer
+ * switches it on, because an operator with no staff group may not serve (prisma/seed/tenant.seed.ts),
+ * so the harness does what the dashboard does on a real install: bind a group, then activate. Only a
+ * row still at "no group" is bound, and only the fixture-bound row is activated, so an operator a
+ * test deliberately rebound keeps its group. A test that suspended it gets it back at `reset()`, the
+ * way every other row is reset.
+ */
+async function serveBootstrapOperator(prisma: PrismaService): Promise<void> {
+  await prisma.tenant.updateMany({
+    where: { id: TENANT_BOOTSTRAP_ID, adminChatId: 0n },
+    data: { adminChatId: TEST_BOOTSTRAP_STAFF_CHAT_ID },
+  });
+  await prisma.tenant.updateMany({
+    where: { id: TENANT_BOOTSTRAP_ID, adminChatId: TEST_BOOTSTRAP_STAFF_CHAT_ID, status: 'SUSPENDED' },
+    data: { status: 'ACTIVE' },
+  });
+}
 
 export async function createTestApp(options: CreateTestAppOptions = {}): Promise<TestApp> {
   const shouldSeed = options.seed ?? true;
@@ -143,6 +171,7 @@ export async function createTestApp(options: CreateTestAppOptions = {}): Promise
     // other seed names TENANT_BOOTSTRAP_ID explicitly in the row it writes, which the scope
     // extension never overrides.
     await seedTenancy(prisma, currency.code);
+    await serveBootstrapOperator(prisma);
     const methods = await seedPaymentMethods(prisma, currency.code);
     await seedLedgerAccounts(prisma, {
       currencyCode: currency.code,

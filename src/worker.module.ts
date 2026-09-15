@@ -36,6 +36,7 @@ import { LoggingModule } from '@core/logging/logging.module';
 import { OutboxModule } from '@core/outbox/outbox.module';
 import { PrismaModule } from '@core/prisma/prisma.module';
 import { QueueModule } from '@core/queue/queue.module';
+import { TelegramChatBindingModule } from '@core/telegram/chat-binding/chat-binding.module';
 import { TelegramModule } from '@core/telegram/telegram.module';
 import { TelegramUpdateProcessor } from '@core/telegram/processors/telegram-update.processor';
 
@@ -82,6 +83,9 @@ const depositWorkerModule = DepositModule.forWorker();
     IchancyModule,
     FileModule,
     TelegramModule,
+    // The chat projection TelegramUpdateProcessor runs on every update: the chat directory, supergroup
+    // migrations and the staff-group bind command, for operators of every status.
+    TelegramChatBindingModule,
 
     // No HTTP here, so the global guards AuthModule registers never fire. It is imported because
     // AdminIdentityService is what every Telegram callback re-resolves an admin through — a bot

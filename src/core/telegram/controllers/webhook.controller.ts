@@ -32,6 +32,11 @@
  *  - Persisting or enqueueing would run bot handlers, including money actions, for an operator
  *    that must not take money, or replay hours-old taps the moment it is reactivated.
  *  - Dropping only AFTER the secret matches means nobody without the secret learns the status.
+ * ONE EXCEPTION, the chat projection's updates (isChatProjectionUpdate): the bot's membership in a
+ * group or channel, a group becoming a supergroup, and the `/start@<bot> <nonce>` of a staff-group
+ * link. An operator stays SUSPENDED until its staff group is bound, so these arrive precisely while it
+ * is not serving, and Telegram sends each only once. They are stored and enqueued as usual; the worker
+ * runs only the projection for them (TelegramUpdateProcessor), never a handler.
  * The status is read through TenantRegistryService.find, so a suspension bites as soon as the suspend
  * path invalidates it, and within its 30 s TTL otherwise.
  *
@@ -79,6 +84,7 @@ import {
 } from '../telegram.constants';
 import { type TelegramUpdateJobData } from '../telegram.types';
 import { UpdateDedupeService } from '../services/update-dedupe.service';
+import { isChatProjectionUpdate, redactBindNonce } from '../utils/chat-membership.util';
 import { secureCompare } from '../utils/secure-compare.util';
 
 interface WebhookAck {
@@ -150,9 +156,14 @@ export class TelegramWebhookController {
   async receive(
     @Param('token') pathToken: string,
     @Headers(TELEGRAM_SECRET_HEADER) secretHeader: string | undefined,
-    @Body() update: Update,
+    @Body() body: Update,
   ): Promise<WebhookAck> {
     const tenantId = await this.authenticate(pathToken, secretHeader);
+
+    // Before anything reads or stores it: a staff-group link's nonce is replaced by its hash, so the
+    // row and the job never hold a usable credential (chat-membership.util, THE NONCE NEVER RESTS
+    // ANYWHERE). After authentication, per ORDERING IS SECURITY-RELEVANT above.
+    const update = redactBindNonce(body);
 
     const tenant = await this.tenants.find(tenantId);
     if (tenant === null) {
@@ -162,10 +173,14 @@ export class TelegramWebhookController {
     }
 
     if (tenant.status !== TenantStatus.ACTIVE) {
-      this.logInactiveOnce(tenant.id, tenant.status);
-      return { ok: true };
+      // See the header: a stopped operator keeps only what the chat projection needs.
+      if (!isChatProjectionUpdate(update)) {
+        this.logInactiveOnce(tenant.id, tenant.status);
+        return { ok: true };
+      }
+    } else {
+      this.loggedInactive.delete(tenant.id);
     }
-    this.loggedInactive.delete(tenant.id);
 
     // A body without an update_id cannot be deduplicated, so it cannot be processed safely.
     // Answering 200 keeps a malformed probe from turning into an infinite Telegram retry.

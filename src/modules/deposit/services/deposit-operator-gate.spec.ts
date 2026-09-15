@@ -26,9 +26,14 @@ const PLAYER_ID = '33333333-3333-4333-8333-333333333333';
 /** Thrown by the payment port, so reaching it proves the gate let the request through. */
 class ReachedPaymentPort extends Error {}
 
-function harness(status: TenantStatus | null) {
+/** A bound staff group, unless a case says otherwise. 0 is the stored "no staff group". */
+const STAFF_GROUP = -1001234567890n;
+
+function harness(status: TenantStatus | null, adminChatId: bigint = STAFF_GROUP) {
   const prisma = {
-    tenant: { findUnique: jest.fn().mockResolvedValue(status === null ? null : { status }) },
+    tenant: {
+      findUnique: jest.fn().mockResolvedValue(status === null ? null : { status, adminChatId }),
+    },
     runInTransaction: jest.fn(),
   };
   const payments = {
@@ -69,7 +74,7 @@ describe('DepositService.create, operator gate', () => {
       });
       expect(h.prisma.tenant.findUnique).toHaveBeenCalledWith({
         where: { id: OPERATOR_ID },
-        select: { status: true },
+        select: { status: true, adminChatId: true },
       });
       expect(h.payments.getActiveById).not.toHaveBeenCalled();
       expect(h.prisma.runInTransaction).not.toHaveBeenCalled();
@@ -80,7 +85,19 @@ describe('DepositService.create, operator gate', () => {
     await expect(harness(null).create()).rejects.toMatchObject({ errorCode: 'TENANT_NOT_ACTIVE' });
   });
 
-  it('lets an ACTIVE operator through to the payment method lookup', async () => {
+  it('refuses an ACTIVE operator with no staff group with 422 TENANT_STAFF_GROUP_REQUIRED, before resolving anything', async () => {
+    const h = harness(TenantStatus.ACTIVE, 0n);
+
+    await expect(h.create()).rejects.toMatchObject({
+      httpStatus: 422,
+      errorCode: 'TENANT_STAFF_GROUP_REQUIRED',
+      details: { status: TenantStatus.ACTIVE },
+    });
+    expect(h.payments.getActiveById).not.toHaveBeenCalled();
+    expect(h.prisma.runInTransaction).not.toHaveBeenCalled();
+  });
+
+  it('lets an ACTIVE operator with a staff group through to the payment method lookup', async () => {
     const h = harness(TenantStatus.ACTIVE);
 
     await expect(h.create()).rejects.toBeInstanceOf(ReachedPaymentPort);

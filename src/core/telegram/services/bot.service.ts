@@ -17,6 +17,10 @@
  *    error: return null and let the caller carry on.
  *  - 400 "message is not modified"             -> the edit already says what we wanted. Success.
  *  - 400 "message to edit not found"           -> the card was deleted. Return false, do not throw.
+ *  - 400 with `migrate_to_chat_id`             -> the group became a supergroup with a new id. Every
+ *    id stored for it is moved (TelegramChatMigrationService) and the call is retried ONCE against
+ *    the new id. Telegram's words for this match none of the phrases above, so without it the send
+ *    would be rethrown and retried against a dead id for as long as the job lived.
  *  - 429 / 5xx                                 -> already retried by autoRetry; if it still fails,
  *    it is a real error and IS thrown, because the caller may want to retry the whole job.
  *  - the operator has no working bot           -> TenantBotUnavailableError is thrown, like a 5xx:
@@ -26,12 +30,15 @@ import { Injectable, Logger } from '@nestjs/common';
 import { type Bot, GrammyError } from 'grammy';
 import { type Message, type ParseMode } from 'grammy/types';
 import { PrismaService } from '../../prisma/prisma.service';
+import { boundChatOf, migratedChatIdOf, numericChatId } from '../utils/chat-membership.util';
+import { verifyTelegramChat, type ChatVerification } from '../utils/chat-verification.util';
+import { TelegramChatMigrationService } from './telegram-chat-migration.service';
 import { TenantBotRegistry } from './tenant-bot-registry.service';
 
 /**
  * Where an operator's staff and its optional feed are notified, read off `tenants`. Null means "not
- * set": the column is absent (feed), or holds the 0 that migrations and the platform row write where
- * no real chat is known yet (admin). Telegram has no chat 0, so 0 is never a destination.
+ * set": the column is absent (feed), or holds the 0 an operator is created with until its staff group
+ * is bound (admin). Telegram has no chat 0, so 0 is never a destination.
  */
 export interface TenantChats {
   adminChatId: bigint | null;
@@ -39,9 +46,6 @@ export interface TenantChats {
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-const realChat = (chatId: bigint | null): bigint | null =>
-  chatId === null || chatId === 0n ? null : chatId;
 
 export interface SendOptions {
   parseMode?: ParseMode;
@@ -92,6 +96,7 @@ export class BotService {
   constructor(
     private readonly bots: TenantBotRegistry,
     private readonly prisma: PrismaService,
+    private readonly migrations: TelegramChatMigrationService,
   ) {}
 
   /**
@@ -110,7 +115,7 @@ export class BotService {
         })
       : null;
     if (row === null) return { adminChatId: null, feedChatId: null };
-    return { adminChatId: realChat(row.adminChatId), feedChatId: realChat(row.feedChatId) };
+    return { adminChatId: boundChatOf(row.adminChatId), feedChatId: boundChatOf(row.feedChatId) };
   }
 
   /**
@@ -119,6 +124,21 @@ export class BotService {
    */
   forTenant(tenantId: string): Promise<Bot> {
     return this.bots.get(tenantId);
+  }
+
+  /**
+   * Asks Telegram, through THIS operator's bot, whether `chatId` can be its staff or feed group (see
+   * verifyTelegramChat for the checks). When the group had become a supergroup, whatever was stored
+   * under the old id is moved before the answer is returned, and the answer names the new id.
+   */
+  async verifyChat(tenantId: string, chatId: bigint): Promise<ChatVerification> {
+    const bot = await this.bots.get(tenantId);
+    const verification = await verifyTelegramChat(bot.api, bot.botInfo.id, chatId);
+    if (verification.migratedFrom !== null) {
+      const movedTo = verification.ok ? verification.chat.chatId : verification.chatId;
+      await this.migrations.migrate(tenantId, verification.migratedFrom, movedTo, 'verification');
+    }
+    return verification;
   }
 
   /**
@@ -133,13 +153,15 @@ export class BotService {
   ): Promise<Message.TextMessage | null> {
     const bot = await this.bots.get(tenantId);
     try {
-      return await bot.api.sendMessage(this.toChatId(chatId), text, {
-        parse_mode: options.parseMode,
-        disable_notification: options.disableNotification,
-        message_thread_id: options.messageThreadId,
-        link_preview_options: options.linkPreview === false ? { is_disabled: true } : undefined,
-        reply_markup: options.replyMarkup as never,
-      });
+      return await this.followingMigration(tenantId, chatId, (target) =>
+        bot.api.sendMessage(target, text, {
+          parse_mode: options.parseMode,
+          disable_notification: options.disableNotification,
+          message_thread_id: options.messageThreadId,
+          link_preview_options: options.linkPreview === false ? { is_disabled: true } : undefined,
+          reply_markup: options.replyMarkup as never,
+        }),
+      );
     } catch (error: unknown) {
       if (describes(error, PERMANENTLY_UNDELIVERABLE)) {
         this.logger.warn(
@@ -167,11 +189,13 @@ export class BotService {
   ): Promise<boolean> {
     const bot = await this.bots.get(tenantId);
     try {
-      await bot.api.editMessageText(this.toChatId(chatId), messageId, text, {
-        parse_mode: options.parseMode,
-        link_preview_options: options.linkPreview === false ? { is_disabled: true } : undefined,
-        reply_markup: options.replyMarkup as never,
-      });
+      await this.followingMigration(tenantId, chatId, (target) =>
+        bot.api.editMessageText(target, messageId, text, {
+          parse_mode: options.parseMode,
+          link_preview_options: options.linkPreview === false ? { is_disabled: true } : undefined,
+          reply_markup: options.replyMarkup as never,
+        }),
+      );
       return true;
     } catch (error: unknown) {
       // The desired end state is already the actual state. Treating this as an error would fail
@@ -195,9 +219,11 @@ export class BotService {
   ): Promise<boolean> {
     const bot = await this.bots.get(tenantId);
     try {
-      await bot.api.editMessageReplyMarkup(this.toChatId(chatId), messageId, {
-        reply_markup: replyMarkup as never,
-      });
+      await this.followingMigration(tenantId, chatId, (target) =>
+        bot.api.editMessageReplyMarkup(target, messageId, {
+          reply_markup: replyMarkup as never,
+        }),
+      );
       return true;
     } catch (error: unknown) {
       if (describes(error, EDIT_IS_NOOP)) return true;
@@ -242,12 +268,14 @@ export class BotService {
   ): Promise<Message.PhotoMessage | null> {
     const bot = await this.bots.get(tenantId);
     try {
-      return await bot.api.sendPhoto(this.toChatId(chatId), photo, {
-        caption,
-        parse_mode: options.parseMode,
-        message_thread_id: options.messageThreadId,
-        reply_markup: options.replyMarkup as never,
-      });
+      return await this.followingMigration(tenantId, chatId, (target) =>
+        bot.api.sendPhoto(target, photo, {
+          caption,
+          parse_mode: options.parseMode,
+          message_thread_id: options.messageThreadId,
+          reply_markup: options.replyMarkup as never,
+        }),
+      );
     } catch (error: unknown) {
       if (describes(error, PERMANENTLY_UNDELIVERABLE)) return null;
       throw error;
@@ -344,6 +372,27 @@ export class BotService {
   ): Promise<Awaited<ReturnType<Bot['api']['getWebhookInfo']>>> {
     const bot = await this.bots.get(tenantId);
     return bot.api.getWebhookInfo();
+  }
+
+  /**
+   * Runs one Bot API call against `chatId`. When Telegram answers that the group became a supergroup,
+   * the operator's stored ids are moved and the call runs once more against the new id. Any other
+   * failure, and a failure of the retry, is the caller's to classify.
+   */
+  private async followingMigration<T>(
+    tenantId: string,
+    chatId: bigint | number | string,
+    call: (target: number | string) => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await call(this.toChatId(chatId));
+    } catch (error: unknown) {
+      const movedTo = migratedChatIdOf(error);
+      const from = numericChatId(chatId);
+      if (movedTo === null || from === null) throw error;
+      await this.migrations.migrate(tenantId, from, movedTo, 'send_error');
+      return call(movedTo.toString());
+    }
   }
 
   /**

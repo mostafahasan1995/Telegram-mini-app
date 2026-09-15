@@ -23,6 +23,7 @@ import { Module } from '@nestjs/common';
 
 import { AuthModule } from '@core/auth/auth.module';
 import { IchancyModule } from '@core/ichancy/ichancy.module';
+import { TelegramChatBindingModule } from '@core/telegram/chat-binding/chat-binding.module';
 import { TelegramModule } from '@core/telegram/telegram.module';
 
 import { PlatformDefaultsController } from './controllers/platform-defaults.controller';
@@ -33,15 +34,19 @@ import { TenantCreationService } from './services/tenant-creation.service';
 import { TenantHealthService } from './services/tenant-health.service';
 import { TenantIchancyService } from './services/tenant-ichancy.service';
 import { TenantProvisioningService } from './services/tenant-provisioning.service';
+import { TenantTelegramChatsService } from './services/tenant-telegram-chats.service';
 import { TenantTelegramService } from './services/tenant-telegram.service';
 import { DEFAULT_PLAYER_IMPORT_LIMITS, TENANT_IMPORT_LIMITS } from './tenant-admin.constants';
 
 @Module({
-  imports: [AuthModule, TelegramModule, IchancyModule],
+  // TelegramChatBindingModule: binding an operator's staff and feed groups (verify, commit, and the
+  // review cards of deposits that waited for a staff group).
+  imports: [AuthModule, TelegramModule, TelegramChatBindingModule, IchancyModule],
   controllers: [TenantAdminController, PlatformDefaultsController],
   providers: [
     // A provider only so a test can page a small agent; production always uses the defaults.
     { provide: TENANT_IMPORT_LIMITS, useValue: DEFAULT_PLAYER_IMPORT_LIMITS },
+    TenantTelegramChatsService,
     TenantAdminService,
     PlatformDefaultsService,
     TenantTelegramService,

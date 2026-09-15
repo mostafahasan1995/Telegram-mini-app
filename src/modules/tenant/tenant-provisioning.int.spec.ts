@@ -65,6 +65,8 @@ import { seedPlatformAdmin } from '../../../prisma/seed/platform-admin.seed';
 import { createTestApp, type TestApp } from '../../../test/setup/app-factory';
 import { createFakeTelegram, testBotInfo } from '../../../test/setup/telegram-fixtures';
 
+import { STAFF_GROUP_REQUIRED_MESSAGE } from './tenant-admin.constants';
+
 jest.setTimeout(180_000);
 
 // ── The console's contract, copied from manager-account-dashboard src/types/tenant.ts ──────────
@@ -75,7 +77,7 @@ const tenantSchema = z.looseObject({
   displayName: z.string(),
   status: z.enum(['ACTIVE', 'SUSPENDED', 'CLOSED']),
   hasWebhookPath: z.boolean(),
-  adminChatId: z.string(),
+  adminChatId: z.string().nullable(),
   feedChatId: z.string().nullable(),
   botUsername: z.string().nullable(),
   ichancyBaseUrl: z.string(),
@@ -123,6 +125,10 @@ const tenantHealthSchema = z.looseObject({
     floatMinor: z.string().nullable(),
     belowWatermark: z.boolean(),
     sharesAgentWith: z.array(z.string()),
+  }),
+  chats: z.looseObject({
+    staff: z.looseObject({ chatId: z.string().nullable(), isPresent: z.boolean().nullable() }),
+    feed: z.looseObject({ chatId: z.string().nullable(), isPresent: z.boolean().nullable() }),
   }),
   counts: z.looseObject({ players: z.number(), deposits: z.number() }),
 });
@@ -351,7 +357,8 @@ describe('Tenant creation and Telegram operations (integration)', () => {
       displayName: `P10 int ${RUN} north`,
       status: 'SUSPENDED',
       hasWebhookPath: true,
-      adminChatId: PLATFORM_TELEGRAM_ID.toString(),
+      // Created without a staff group, even by an admin who has a Telegram id of their own.
+      adminChatId: null,
       feedChatId: null,
       botUsername: fields.username,
       ichancyBaseUrl: defaults.ichancyBaseUrl,
@@ -370,12 +377,11 @@ describe('Tenant creation and Telegram operations (integration)', () => {
       webhookUrl: `${BASE_URL}/telegram/webhook/[REDACTED]`,
       webhookError: null,
       menusPushed: true,
-      menuScopes: ['default', 'all_private_chats', 'chat'],
+      menuScopes: ['default', 'all_private_chats'],
       menuError: null,
       activated: false,
-      activationError: expect.stringMatching(
-        /^Ichancy refused the sign-in with these credentials \(INVALID_CREDENTIALS: .*\)\. The operator stays suspended\.$/,
-      ),
+      // Refused before any sign-in: an operator with no staff group stays SUSPENDED.
+      activationError: STAFF_GROUP_REQUIRED_MESSAGE,
       paymentMethodsCreated: 4,
       paymentMethodsError: null,
       paymentMethodsNeedAccounts: true,
@@ -405,7 +411,6 @@ describe('Tenant creation and Telegram operations (integration)', () => {
     expect(telegram.callsFor(fields.token, 'setMyCommands').map((call) => call.payload['scope'])).toEqual([
       { type: 'default' },
       { type: 'all_private_chats' },
-      { type: 'chat', chat_id: PLATFORM_TELEGRAM_ID.toString() },
     ]);
 
     const methods = await prisma.paymentMethod.findMany({
@@ -576,14 +581,35 @@ describe('Tenant creation and Telegram operations (integration)', () => {
   });
 
   it('resolves the admin chat and the agent id as the contract orders, refusing by field name where nothing is left', async () => {
-    // A console-only platform admin has no Telegram id to default the admin chat to.
+    // No staff group named: created all the same, with none, even by a console-only admin.
     const orphan = fourFields('orphan');
-    const noChat = await postTenant(consoleOnlyBearer, orphan.body).expect(400);
-    expect(fieldsOf(noChat.body)).toEqual([expect.stringMatching(/^adminChatId is required/)]);
-    expect(telegram.callsFor(orphan.token)).toHaveLength(0);
+    const unbound = tenantCreatedSchema.parse(
+      ((await postTenant(consoleOnlyBearer, orphan.body).expect(201)).body as Body).data,
+    );
+    expect(unbound).toMatchObject({ status: 'SUSPENDED', adminChatId: null });
+    expect(unbound.provisioning).toMatchObject({
+      activated: false,
+      activationError: STAFF_GROUP_REQUIRED_MESSAGE,
+    });
 
-    const named = await postTenant(consoleOnlyBearer, { ...orphan.body, adminChatId: '-1001234567890' }).expect(201);
-    const namedView = tenantCreatedSchema.parse((named.body as Body).data);
+    // A staff group named on the form is verified with the pasted token before anything is written.
+    const named = fourFields('named');
+    const unverified = await postTenant(consoleOnlyBearer, {
+      ...named.body,
+      adminChatId: '-1001234567890',
+    }).expect(400);
+    expect(failure(unverified.body)).toMatchObject({
+      code: 'TELEGRAM_CHAT_REJECTED',
+      details: { reason: 'NOT_FOUND', purpose: 'STAFF', field: 'adminChatId' },
+    });
+    expect(await prisma.tenant.count({ where: { displayName: named.body['displayName'] as string } })).toBe(0);
+
+    telegram.setChat(-1001234567890n, { type: 'supergroup', title: 'P10 staff' });
+    telegram.setBotMember(named.token, -1001234567890n, { status: 'administrator' });
+    const namedView = tenantCreatedSchema.parse(
+      ((await postTenant(consoleOnlyBearer, { ...named.body, adminChatId: '-1001234567890' }).expect(201))
+        .body as Body).data,
+    );
     expect(namedView.adminChatId).toBe('-1001234567890');
     expect(namedView.provisioning.menuScopes).toEqual(['default', 'all_private_chats', 'chat_administrators']);
 
@@ -591,6 +617,8 @@ describe('Tenant creation and Telegram operations (integration)', () => {
     await prisma.platformDefaults.update({ where: { id: 1 }, data: { ichancyAgentId: null } });
     try {
       const agentless = fourFields('agentless');
+      telegram.setChat(-1009876543210n, { type: 'supergroup', title: 'P10 feed' });
+      telegram.setBotMember(agentless.token, -1009876543210n, { status: 'administrator' });
       const noAgent = await postTenant(platformBearer, agentless.body).expect(400);
       expect(fieldsOf(noAgent.body)).toEqual([
         'ichancyAgentId is required: no platform default and no tenant zero to fall back to',
@@ -763,11 +791,12 @@ describe('Tenant creation and Telegram operations (integration)', () => {
       .set('authorization', platformBearer)
       .expect(200);
 
+    // The player menus only: no staff group is bound yet, and the operator has no staff of its own.
     expect(tenantBotSetupSchema.parse((response.body as Body).data)).toEqual({
-      commandsSet: 15,
-      scopes: ['default', 'all_private_chats', 'chat'],
+      commandsSet: 10,
+      scopes: ['default', 'all_private_chats'],
     });
-    expect(telegram.callsFor(operator.token, 'setMyCommands')).toHaveLength(before + 3);
+    expect(telegram.callsFor(operator.token, 'setMyCommands')).toHaveLength(before + 2);
     expect(await auditCount(operator.id, 'tenant.bot.menusPushed')).toBe(2);
   });
 
@@ -918,7 +947,7 @@ describe('Tenant creation and Telegram operations (integration)', () => {
     const created = tenantCreatedSchema.parse(
       ((await postTenant(ownerBearer, fields.body).expect(201)).body as Body).data,
     );
-    expect(created).toMatchObject({ status: 'SUSPENDED', adminChatId: OWNER_TELEGRAM_ID.toString() });
+    expect(created).toMatchObject({ status: 'SUSPENDED', adminChatId: null });
 
     const list = tenantListSchema.parse(
       ((await api().get('/v1/admin/tenants').set('authorization', ownerBearer).expect(200)).body as Body).data,

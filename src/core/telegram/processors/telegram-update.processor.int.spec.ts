@@ -44,6 +44,7 @@ import { type PrismaService } from '../../prisma/prisma.service';
 import { TenantRegistryService } from '../../tenant/services/tenant-registry.service';
 import { TenantSecretService } from '../../tenant/services/tenant-secret.service';
 import { getEffectiveTenantId } from '../../tenant/tenant.storage';
+import { type TelegramChatProjectionService } from '../chat-binding/chat-projection.service';
 import { OnCommand } from '../decorators/handlers.decorator';
 import { fingerprintBotToken } from '../services/bot.factory';
 import { TelegramHandlerRegistrar } from '../services/handler-registrar.service';
@@ -172,6 +173,11 @@ describe('TelegramUpdateProcessor (integration)', () => {
       dedupe,
       new ActorContextService(),
       tenants,
+      // These updates are all player /start messages, which the chat projection never claims; the
+      // projection itself runs against real rows in chat-binding.int.spec.ts.
+      {
+        project: () => Promise.resolve({ relevant: false, consumed: false }),
+      } as unknown as TelegramChatProjectionService,
     );
 
   /** Records the update the way the webhook does, and returns the job the webhook would queue. */

@@ -81,6 +81,13 @@ export const SIGNIN_VERIFICATION = 'signin';
 export const PLAYERS_NOT_IMPORTED_MESSAGE =
   'Players were not imported: the operator was not activated. Import them from the operator once it is.';
 
+/**
+ * The refusal of an activation (and provisioning's `activationError`) while no staff group is bound.
+ * Checked before any Ichancy sign-in: the answer does not depend on the credentials.
+ */
+export const STAFF_GROUP_REQUIRED_MESSAGE =
+  "This operator has no staff group yet, so it cannot be activated: its deposit review cards and alerts would go nowhere. Add its bot to the staff group from the operator's page, then activate it. The operator stays suspended.";
+
 /** provisioning.activationError when something other than Ichancy's answer stopped the attempt. */
 export const ACTIVATION_FAILED_UNEXPECTEDLY_MESSAGE =
   'Activation failed: an unexpected error occurred on this server. Activate the operator from its page.';

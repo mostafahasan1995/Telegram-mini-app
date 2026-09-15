@@ -75,6 +75,12 @@ describe('toTenantView', () => {
     expect(toTenantView(row({ webhookPathToken: '' }), REAL).hasWebhookPath).toBe(false);
   });
 
+  it('answers an operator with no staff group bound (stored as 0) with a null admin chat', () => {
+    const view = toTenantView(row({ adminChatId: 0n, feedChatId: 0n }), REAL);
+    expect(view.adminChatId).toBeNull();
+    expect(view.feedChatId).toBeNull();
+  });
+
   it('keeps a channel id past what a JS number holds exactly', () => {
     const view = toTenantView(row({ feedChatId: -1009007199254740993n }), REAL);
     expect(view.feedChatId).toBe('-1009007199254740993');

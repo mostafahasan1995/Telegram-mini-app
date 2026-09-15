@@ -60,7 +60,7 @@ const tenantSchema = z.looseObject({
   displayName: z.string(),
   status: z.enum(['ACTIVE', 'SUSPENDED', 'CLOSED']),
   hasWebhookPath: z.boolean(),
-  adminChatId: z.string(),
+  adminChatId: z.string().nullable(),
   feedChatId: z.string().nullable(),
   botUsername: z.string().nullable(),
   ichancyBaseUrl: z.string(),
@@ -320,6 +320,14 @@ describe('Tenant admin surface (integration)', () => {
       api().patch(`/v1/admin/tenants/${activeId}`).send({ displayName: 'Hijacked' }),
       api().post(`/v1/admin/tenants/${activeId}/suspend`),
       api().post(`/v1/admin/tenants/${suspendedId}/activate`),
+      // Only the platform binds or changes an operator's staff and feed groups (owner decision 3).
+      api().post(`/v1/admin/tenants/${suspendedId}/telegram/bind-links`).send({ purpose: 'STAFF' }),
+      api().get(`/v1/admin/tenants/${suspendedId}/telegram/chats`),
+      api()
+        .put(`/v1/admin/tenants/${suspendedId}/telegram/chats/STAFF`)
+        .send({ chatId: '-1001234567890' }),
+      api().delete(`/v1/admin/tenants/${suspendedId}/telegram/chats/FEED`),
+      api().patch(`/v1/admin/tenants/${suspendedId}`).send({ adminChatId: '-1001234567899' }),
       api().get('/v1/admin/platform-defaults'),
       api().patch('/v1/admin/platform-defaults').send({ depositExpiryMinutes: 60 }),
     ];
@@ -340,11 +348,11 @@ describe('Tenant admin surface (integration)', () => {
   });
 
   it("PATCH writes only what changed, as strings, and audits it in that operator's own log", async () => {
-    // The body the console's edit form builds (tenant-form-dialog.tsx toUpdateBody).
+    // The body the console's edit form builds (tenant-form-dialog.tsx toUpdateBody), with the chats
+    // left out: a changed staff or feed group is verified with Telegram and bound through the chat
+    // path, which tenant-telegram-chats.int.spec.ts drives against an offline Telegram.
     const body = {
       displayName: 'P9 edited, renamed',
-      adminChatId: '-1009007199254740993',
-      feedChatId: '-1009876543210',
       dualApprovalThresholdMinor: '75000000',
       agentFloatLowWatermarkMinor: '50000000',
       depositExpiryMinutes: 45,
@@ -374,7 +382,6 @@ describe('Tenant admin surface (integration)', () => {
     );
     expect(audits[0]?.after).toMatchObject({
       displayName: 'P9 edited, renamed',
-      adminChatId: '-1009007199254740993',
       depositExpiryMinutes: 45,
     });
 
@@ -591,6 +598,11 @@ describe('Tenant admin surface (integration)', () => {
         .send({ paymentMethodId: method.id, amount: { amount: '6000.00' } });
     const shortIdOf = (body: unknown): string =>
       z.looseObject({ shortId: z.string() }).parse((body as Body).data).shortId;
+    // The harness binds a fixture staff group to this operator; restored below whatever happens.
+    const { adminChatId: boundStaffGroup } = await prisma.tenant.findUniqueOrThrow({
+      where: { id: TENANT_BOOTSTRAP_ID },
+      select: { adminChatId: true },
+    });
 
     try {
       const started = shortIdOf((await openDeposit().expect(201)).body);
@@ -622,11 +634,19 @@ describe('Tenant admin surface (integration)', () => {
       });
       await cache.del(tenantRegistryKey(TENANT_BOOTSTRAP_ID));
       expect(shortIdOf((await openDeposit().expect(201)).body)).not.toBe(started);
+
+      // ACTIVE with no staff group (a row from before the rule): still no new money, with its own code.
+      await prisma.tenant.update({
+        where: { id: TENANT_BOOTSTRAP_ID },
+        data: { adminChatId: 0n },
+      });
+      const unbound = await openDeposit().expect(422);
+      expect(failure(unbound.body).code).toBe('TENANT_STAFF_GROUP_REQUIRED');
     } finally {
       // Every other suite signs in to this operator, so it is never left suspended by a failure here.
       await prisma.tenant.update({
         where: { id: TENANT_BOOTSTRAP_ID },
-        data: { status: TenantStatus.ACTIVE },
+        data: { status: TenantStatus.ACTIVE, adminChatId: boundStaffGroup },
       });
       await cache.del(tenantRegistryKey(TENANT_BOOTSTRAP_ID));
     }

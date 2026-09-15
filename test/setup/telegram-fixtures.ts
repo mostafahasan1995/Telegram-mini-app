@@ -87,6 +87,24 @@ export interface FakeTelegram {
   webhookFor(token: string): FakeWebhookState | null;
   /** Puts a webhook in place without a setWebhook call: another deployment's, or a failing one. */
   setWebhookState(token: string, state: Partial<FakeWebhookState> & { url: string }): void;
+  /** What getChat answers for this chat id. An unknown chat is "Bad Request: chat not found". */
+  setChat(chatId: bigint | number, state: FakeChatState): void;
+  /**
+   * The bot's own membership in a chat, as getChatMember answers it for this token's bot:
+   * `{ status: 'administrator' }`, `{ status: 'member' }`, `{ status: 'left' }`, …. Unset reads as left.
+   */
+  setBotMember(token: string, chatId: bigint | number, member: Record<string, unknown>): void;
+  /**
+   * The group became a supergroup: from now on getChat and sendMessage on the old id answer 400 with
+   * `parameters.migrate_to_chat_id`, as Telegram does, and the new id answers as a supergroup.
+   */
+  migrateChat(fromChatId: bigint | number, toChatId: bigint | number): void;
+}
+
+export interface FakeChatState {
+  type: 'group' | 'supergroup' | 'channel' | 'private';
+  title?: string;
+  username?: string;
 }
 
 const BOT_API_URL = /\/bot([^/]+)\/([A-Za-z]+)$/;
@@ -103,7 +121,28 @@ export function createFakeTelegram(): FakeTelegram {
   const webhooks = new Map<number, FakeWebhookState>();
   /** token -> the description setWebhook is refused with. */
   const webhookRefusals = new Map<string, string>();
+  /** chat id (decimal string) -> what getChat answers. */
+  const chats = new Map<string, FakeChatState>();
+  /** chat id -> the supergroup it became. */
+  const migrations = new Map<string, string>();
+  /** `<bot id>:<chat id>` -> the bot's ChatMember fields in that chat. */
+  const botMembers = new Map<string, Record<string, unknown>>();
   let nextMessageId = 1;
+
+  const chatKey = (value: unknown): string =>
+    typeof value === 'number' || typeof value === 'bigint' ? value.toString() : String(value);
+
+  const migratedResponse = (chatId: string): Promise<FakeResponse> | null => {
+    const movedTo = migrations.get(chatId);
+    return movedTo === undefined
+      ? null
+      : respond({
+          ok: false,
+          error_code: 400,
+          description: 'Bad Request: group chat was upgraded to a supergroup chat',
+          parameters: { migrate_to_chat_id: Number(movedTo) },
+        });
+  };
 
   const botIdOf = (token: string): number | null => accepted.get(token)?.id ?? null;
 
@@ -171,17 +210,59 @@ export function createFakeTelegram(): FakeTelegram {
           },
         });
       }
-      case 'sendMessage':
+      case 'sendMessage': {
+        const chatId = chatKey(payload['chat_id']);
+        const moved = migratedResponse(chatId);
+        if (moved !== null) return moved;
+        const known = chats.get(chatId);
         return respond({
           ok: true,
           result: {
             message_id: nextMessageId++,
             date: Math.floor(Date.now() / 1000),
-            chat: { id: Number(payload['chat_id']), type: 'private', first_name: 'Chat' },
+            chat:
+              known === undefined || known.type === 'private'
+                ? { id: Number(chatId), type: 'private', first_name: 'Chat' }
+                : { id: Number(chatId), type: known.type, title: known.title ?? 'Chat' },
             from: botInfo,
             text: typeof payload['text'] === 'string' ? payload['text'] : '',
           },
         });
+      }
+      case 'getChat': {
+        const chatId = chatKey(payload['chat_id']);
+        const moved = migratedResponse(chatId);
+        if (moved !== null) return moved;
+        const known = chats.get(chatId);
+        if (known === undefined) {
+          return respond({ ok: false, error_code: 400, description: 'Bad Request: chat not found' });
+        }
+        return respond({
+          ok: true,
+          result:
+            known.type === 'private'
+              ? { id: Number(chatId), type: 'private', first_name: known.title ?? 'Person' }
+              : {
+                  id: Number(chatId),
+                  type: known.type,
+                  title: known.title ?? 'Chat',
+                  ...(known.username === undefined ? {} : { username: known.username }),
+                },
+        });
+      }
+      case 'getChatMember': {
+        const chatId = chatKey(payload['chat_id']);
+        const moved = migratedResponse(chatId);
+        if (moved !== null) return moved;
+        if (!chats.has(chatId)) {
+          return respond({ ok: false, error_code: 400, description: 'Bad Request: chat not found' });
+        }
+        const fields =
+          Number(payload['user_id']) === botInfo.id
+            ? (botMembers.get(`${botInfo.id}:${chatId}`) ?? { status: 'left' })
+            : { status: 'left' };
+        return respond({ ok: true, result: { user: botInfo, ...fields } });
+      }
       default:
         return respond({ ok: true, result: true });
     }
@@ -215,6 +296,25 @@ export function createFakeTelegram(): FakeTelegram {
     webhookFor: (token) => {
       const botId = botIdOf(token);
       return botId === null ? null : (webhooks.get(botId) ?? null);
+    },
+    setChat: (chatId, state) => {
+      chats.set(chatKey(chatId), state);
+    },
+    setBotMember: (token, chatId, member) => {
+      const botId = botIdOf(token);
+      if (botId === null) throw new Error('setBotMember needs a token accepted first');
+      botMembers.set(`${botId}:${chatKey(chatId)}`, member);
+    },
+    migrateChat: (fromChatId, toChatId) => {
+      const from = chatKey(fromChatId);
+      const to = chatKey(toChatId);
+      const previous = chats.get(from);
+      migrations.set(from, to);
+      chats.set(to, { ...(previous ?? { title: 'Chat' }), type: 'supergroup' });
+      for (const [key, member] of [...botMembers.entries()]) {
+        const [botId, chatId] = key.split(':');
+        if (chatId === from) botMembers.set(`${botId ?? ''}:${to}`, member);
+      }
     },
     setWebhookState: (token, state) => {
       const botId = botIdOf(token);

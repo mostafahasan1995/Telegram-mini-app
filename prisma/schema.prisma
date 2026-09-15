@@ -288,6 +288,38 @@ enum WithdrawalMode {
   @@map("withdrawal_mode")
 }
 
+/// What kind of chat the bot was seen in. There is no PRIVATE member: a one-to-one chat is never
+/// somewhere an operator's staff or feed is bound, so a private chat is never recorded at all.
+enum TelegramChatType {
+  GROUP
+  SUPERGROUP
+  CHANNEL
+
+  @@map("telegram_chat_type")
+}
+
+/// The bot's own membership in a chat, in Telegram's vocabulary. Kept whole rather than collapsed
+/// into a boolean because each value is fixed by a different person doing a different thing.
+enum TelegramBotChatStatus {
+  CREATOR
+  ADMINISTRATOR
+  MEMBER
+  RESTRICTED
+  LEFT
+  KICKED
+
+  @@map("telegram_bot_chat_status")
+}
+
+/// Which of an operator's two chats a binding is for: the staff group (`tenants.admin_chat_id`, review
+/// cards and alerts) or the feed group (`tenants.feed_chat_id`, the customer-facing mirror).
+enum TelegramChatPurpose {
+  STAFF
+  FEED
+
+  @@map("telegram_chat_purpose")
+}
+
 // =============================================================================
 // TENANCY
 // =============================================================================
@@ -326,7 +358,9 @@ model Tenant {
   webhookPathToken String? @unique @map("webhook_path_token")
   /// Telegram's X-Telegram-Bot-Api-Secret-Token for this operator, sealed.
   webhookSecretEnc String? @map("webhook_secret_enc")
-  /// Where this operator's staff are notified. Defaults to the creating PLATFORM_ADMIN's chat.
+  /// The staff group: where this operator's review cards and alerts go. 0 means no staff group is
+  /// bound yet (Telegram has no chat 0), which is how an operator is created, and such an operator
+  /// cannot be activated. Only a chat the bot has just been verified in is ever written here.
   adminChatId      BigInt  @map("admin_chat_id")
   feedChatId       BigInt? @map("feed_chat_id")
 
@@ -372,6 +406,8 @@ model Tenant {
   outboxMessages       OutboxMessage[]
   idempotencyKeys      IdempotencyKey[]
   telegramUpdates      TelegramUpdate[]
+  telegramDiscoveredChats TelegramDiscoveredChat[]
+  telegramChatBindLinks   TelegramChatBindLink[]
   ichancyCalls         IchancyCall[]
   auditLogs            AuditLog[]
   reconciliationBreaks ReconciliationBreak[]
@@ -1046,6 +1082,74 @@ model TelegramUpdate {
   @@index([tenantId, processedAt])
   @@index([tenantId])
   @@map("telegram_updates")
+}
+
+/// A group or channel an operator's bot was seen in. Telegram volunteers a private group's id only by
+/// pushing an update (my_chat_member when the bot is added, promoted, demoted or removed), and has no
+/// "list my chats" call, so every sighting is recorded here while the update is handled, for ANY
+/// operator status: a new operator is SUSPENDED exactly when its bot is being added to its groups.
+///
+/// A row is an OBSERVATION, never a permission. Binding a chat re-asks Telegram at that moment. The
+/// flags are the last sighting and may be stale; `lastSeenAt` is Telegram's own date for it, and an
+/// older update never overwrites a newer one.
+model TelegramDiscoveredChat {
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  chatId   BigInt @map("chat_id")
+
+  chatType        TelegramChatType      @map("chat_type")
+  title           String?
+  username        String?
+  status          TelegramBotChatStatus
+  isAdministrator Boolean               @map("is_administrator")
+  /// False once the bot left or was removed. Kept, not deleted: "the bot was removed" is an answer.
+  isPresent       Boolean               @map("is_present")
+  canPost         Boolean               @map("can_post")
+
+  /// Who last changed the bot's membership (my_chat_member.from). Shown so a stranger's group is
+  /// recognisable before anybody binds it.
+  lastChangedByTelegramUserId BigInt? @map("last_changed_by_telegram_user_id")
+  lastChangedByUsername       String? @map("last_changed_by_username")
+  /// Set when this group became a supergroup, which has a new id. The row it moved to is kept too.
+  migratedToChatId            BigInt? @map("migrated_to_chat_id")
+
+  firstSeenAt DateTime @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  lastSeenAt  DateTime @map("last_seen_at") @db.Timestamptz(6)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, chatId])
+  @@index([tenantId, lastSeenAt])
+  @@index([tenantId])
+  @@map("telegram_discovered_chats")
+}
+
+/// A one-time "Add bot to staff group" link issued by a PLATFORM_ADMIN. The link carries a random
+/// nonce as its startgroup payload; Telegram hands it back as `/start@<bot> <nonce>` in the group the
+/// bot was added to, and that is what binds the group to this operator and purpose.
+///
+/// ONLY A HASH OF THE NONCE IS STORED: the nonce is a bearer credential for binding a chat, and a
+/// database read must not be enough to use one. One use (`usedAt`), a short expiry, and issuing a new
+/// link for the same purpose revokes the previous one, so at most one is live per purpose.
+model TelegramChatBindLink {
+  id              String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId        String              @map("tenant_id") @db.Uuid
+  purpose         TelegramChatPurpose
+  /// sha256 of the nonce, hex.
+  nonceHash       String              @unique @map("nonce_hash") @db.VarChar(64)
+  /// The tenant-zero PLATFORM_ADMIN who issued it; the bind it leads to is audited as theirs.
+  issuedByAdminId String              @map("issued_by_admin_id") @db.Uuid
+  expiresAt       DateTime            @map("expires_at") @db.Timestamptz(6)
+  usedAt          DateTime?           @map("used_at") @db.Timestamptz(6)
+  usedChatId      BigInt?             @map("used_chat_id")
+  revokedAt       DateTime?           @map("revoked_at") @db.Timestamptz(6)
+  createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, purpose, createdAt])
+  @@index([tenantId])
+  @@map("telegram_chat_bind_links")
 }
 
 model IchancyCall {
