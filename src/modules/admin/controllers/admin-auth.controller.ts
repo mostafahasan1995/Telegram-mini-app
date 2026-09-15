@@ -34,4 +34,17 @@ export class AdminAuthController {
   signIn(@Body() dto: AdminCredentialsDto): Promise<AdminSessionView> {
     return this.credentials.signIn(dto);
   }
+
+  /**
+   * POST /v1/admin/auth/ichancy — the operator's Ichancy agent username and password for its
+   * SUPER_ADMIN session (§2b). Same body, same response, same throttle rule as /credentials. Kept as
+   * its own door because the contract publishes it and the Flutter console posts to it; the web
+   * console reaches the same logic through /credentials.
+   */
+  @Public()
+  @Post('ichancy')
+  @HttpCode(HttpStatus.OK)
+  signInWithAgent(@Body() dto: AdminCredentialsDto): Promise<AdminSessionView> {
+    return this.credentials.signInWithAgent(dto);
+  }
 }

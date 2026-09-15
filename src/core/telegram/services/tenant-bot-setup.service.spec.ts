@@ -65,6 +65,8 @@ describe('TenantBotSetupService', () => {
       { telegramUserId: 777n },
       { telegramUserId: 777n },
       { telegramUserId: null },
+      // An operator's agent principal carries the reserved id 0; a chat scope of 0 is not a person.
+      { telegramUserId: 0n },
     ]);
 
     const result = await h.service.pushMenus(TENANT_ID);
@@ -78,7 +80,7 @@ describe('TenantBotSetupService', () => {
     expect(result.scopes).toEqual(['default', 'all_private_chats', 'chat_administrators', 'chat']);
     expect(h.contexts).toEqual([TENANT_ID]);
     expect(h.prisma.adminUser.findMany.mock.calls[0]?.[0]).toMatchObject({
-      where: { tenantId: TENANT_ID, isActive: true },
+      where: { tenantId: TENANT_ID, isActive: true, telegramUserId: { gt: 0n } },
     });
   });
 

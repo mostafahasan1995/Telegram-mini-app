@@ -45,6 +45,7 @@ import { AdminUserController } from './controllers/admin-user.controller';
 import { AdminApprovalLimitRepository } from './repositories/admin-approval-limit.repository';
 import { AdminUserRepository } from './repositories/admin-user.repository';
 import { ActivityReportService } from './services/activity-report.service';
+import { AdminAgentCredentialsService } from './services/admin-agent-credentials.service';
 import { AdminApprovalLimitService } from './services/admin-approval-limit.service';
 import { AdminCredentialsService } from './services/admin-credentials.service';
 import { AdminUserService } from './services/admin-user.service';
@@ -62,6 +63,9 @@ import { APPROVAL_LIMIT_PORT } from './approval-limit.port';
     AdminApprovalLimitService,
     // The console sign-in. Uses PasswordHasherService and SessionService from AuthModule.
     AdminCredentialsService,
+    // Its second credential, the operator's agent account. Opens the sealed password through the
+    // @Global TenantModule's TenantSecretService; never calls Ichancy.
+    AdminAgentCredentialsService,
     ActivityReportService,
     ReportScheduleCron,
     AdminTelegramHandlers,

@@ -1,12 +1,49 @@
+import { createHash } from 'node:crypto';
+
+import type { ExecutionContext } from '@nestjs/common';
+
 import { REQUEST_ADMIN_KEY, REQUEST_PLAYER_KEY } from '@common/decorators/auth.types';
 
 import {
   findUnmatchedRules,
   matchRule,
   normalizePath,
+  throttleKey,
   throttleTracker,
   THROTTLE_RULES,
 } from './throttle-routes';
+
+/** Two controller classes and handlers, as the guard would see them for two different routes. */
+class AdminAuthController {
+  signIn(this: void): void {}
+  signInWithAgent(this: void): void {}
+}
+class DepositController {
+  create(this: void): void {}
+  uploadProof(this: void): void {}
+}
+
+function httpContext(
+  method: string,
+  url: string,
+  classRef: new () => object,
+  handler: () => void,
+): ExecutionContext {
+  const context = {
+    getType: () => 'http',
+    switchToHttp: () => ({ getRequest: () => ({ method, originalUrl: url }) }),
+    getClass: () => classRef,
+    getHandler: () => handler,
+  };
+  return context as unknown as ExecutionContext;
+}
+
+/** @nestjs/throttler 6's own ThrottlerGuard.generateKey, restated so a change there is noticed here. */
+function libraryDefaultKey(context: ExecutionContext, tracker: string, name: string): string {
+  return createHash('sha256')
+    .update(`${context.getClass().name}-${context.getHandler().name}-${name}-${tracker}`)
+    .digest('hex');
+}
 
 describe('throttle rules', () => {
   describe('matchRule', () => {
@@ -71,6 +108,67 @@ describe('throttle rules', () => {
       expect(matchRule(undefined, '/v1/deposits')).toBeUndefined();
       expect(matchRule('POST', undefined)).toBeUndefined();
       expect(matchRule('POST', '')).toBeUndefined();
+    });
+  });
+
+  describe('throttleKey', () => {
+    const tracker = 'ip:203.0.113.7';
+
+    it('puts both admin sign-in doors in ONE bucket per caller', () => {
+      const credentials = httpContext(
+        'POST',
+        '/v1/admin/auth/credentials',
+        AdminAuthController,
+        AdminAuthController.prototype.signIn,
+      );
+      const ichancy = httpContext(
+        'POST',
+        '/v1/admin/auth/ichancy',
+        AdminAuthController,
+        AdminAuthController.prototype.signInWithAgent,
+      );
+
+      expect(throttleKey(credentials, tracker, 'default')).toBe(
+        throttleKey(ichancy, tracker, 'default'),
+      );
+      // Still one bucket per caller, and not the per-route key the library would have used.
+      expect(throttleKey(credentials, 'ip:198.51.100.1', 'default')).not.toBe(
+        throttleKey(credentials, tracker, 'default'),
+      );
+      expect(throttleKey(credentials, tracker, 'default')).not.toBe(
+        libraryDefaultKey(credentials, tracker, 'default'),
+      );
+    });
+
+    it("keeps every other rule's per-route bucket, byte-identical to the library default", () => {
+      const create = httpContext(
+        'POST',
+        '/v1/deposits',
+        DepositController,
+        DepositController.prototype.create,
+      );
+      const proof = httpContext(
+        'POST',
+        '/v1/deposits/01ARZ3NDEK/proof',
+        DepositController,
+        DepositController.prototype.uploadProof,
+      );
+
+      expect(throttleKey(create, tracker, 'default')).toBe(
+        libraryDefaultKey(create, tracker, 'default'),
+      );
+      expect(throttleKey(proof, tracker, 'default')).toBe(
+        libraryDefaultKey(proof, tracker, 'default'),
+      );
+      expect(throttleKey(create, tracker, 'default')).not.toBe(
+        throttleKey(proof, tracker, 'default'),
+      );
+    });
+
+    it('only the admin sign-in rule shares a bucket', () => {
+      expect(
+        THROTTLE_RULES.filter((rule) => rule.sharedAcrossRoutes === true).map((rule) => rule.name),
+      ).toEqual(['admin-sign-in']);
     });
   });
 

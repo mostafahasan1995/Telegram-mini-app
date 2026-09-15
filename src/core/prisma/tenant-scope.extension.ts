@@ -1,12 +1,16 @@
 /**
  * Defense in depth against cross-tenant reads. This is the SECOND line, not the first.
  *
- * ══ WHY THE TYPE SYSTEM ALREADY COVERS THE DANGEROUS HALF ═══════════════════════════════════
- * Every tenant-scoped model's unique constraints are composite — `@@unique([tenantId, code])`,
- * `@@unique([tenantId, telegramUserId])` and so on. So `findUnique`, `update` and `delete` CANNOT
- * BE CALLED without naming a tenant: the generated `WhereUniqueInput` demands it and the build
- * fails otherwise. Single-row access, which is where a cross-tenant mistake is most damaging, is
- * settled at compile time and needs nothing from this file.
+ * ══ WHAT THIS FILE DOES NOT COVER: UNIQUE SELECTORS ═════════════════════════════════════════
+ * `findUnique`, `update` and `delete` are NOT rewritten here. The business unique keys are
+ * composite — `@@unique([tenantId, code])`, `@@unique([tenantId, telegramUserId])` — so a lookup
+ * through one of those has to name a tenant to compile. But every scoped model's PRIMARY KEY is a
+ * bare uuid `id`, and `findUnique({ where: { id } })` / `update({ where: { id } })` compile
+ * without one and reach every operator's rows. The compiler does not save you there. A lookup by
+ * id must name the tenant itself — `findFirst({ where: { tenantId, id } })`, or `{ id, tenantId }`
+ * in the unique selector — or compare `row.tenantId` before trusting the row
+ * (AdminIdentityService.resolveById). A bare by-id lookup in the admin directory let one
+ * operator's SUPER_ADMIN reset another operator's passwords; treat each one as a security bug.
  *
  * ══ WHAT IS LEFT, AND WHY IT NEEDS A RUNTIME GUARD ══════════════════════════════════════════
  * List and aggregate operations take a plain filter. `prisma.player.findMany({ where: { status }})`

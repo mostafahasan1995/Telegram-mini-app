@@ -36,6 +36,7 @@ import { AuditService } from '@core/audit/audit.service';
 import { holdsAnyRole, isPlatformStaff } from '@core/auth/admin-authority';
 import { isUniqueConstraintError } from '@core/prisma/prisma-errors';
 import type { Tx } from '@core/prisma/tx.type';
+import { requireEffectiveTenantId } from '@core/tenant';
 import { formatMinorToDecimal, sumMinor } from '@common/helpers/money.util';
 import { adminActor } from '@common/types/actor.type';
 import { ConflictError, NotFoundError, ValidationError } from '@common/exceptions/app.exception';
@@ -289,7 +290,9 @@ export class AdminApprovalLimitService {
 
     this.assertCoherent(maxSingleApprovalMinor, maxDailyApprovalMinor, secondApprovalAboveMinor);
 
-    const admin = await this.admins.findById(adminUserId);
+    // Bound to the effective operator: a manager may set ceilings only for their own staff. Raising
+    // another operator's approver's ceiling would quietly weaken that operator's four-eyes rule.
+    const admin = await this.admins.findByIdInTenant(requireEffectiveTenantId(), adminUserId);
     if (admin === null) {
       throw new NotFoundError(AdminErrorCodes.ADMIN_NOT_FOUND, 'Administrator not found.');
     }
@@ -360,9 +363,11 @@ export class AdminApprovalLimitService {
    */
   async endLimit(actorAdminId: string, limitId: string): Promise<ApprovalLimitView> {
     const at = new Date();
+    // Another operator's limit is "not found": ending it would deny that operator's approvals.
+    const tenantId = requireEffectiveTenantId();
 
     return this.prisma.runInTransaction(async (tx) => {
-      const existing = await this.limits.findById(limitId, tx);
+      const existing = await this.limits.findByIdInTenant(tenantId, limitId, tx);
       if (existing === null) {
         throw new NotFoundError(
           AdminErrorCodes.APPROVAL_LIMIT_NOT_FOUND,
@@ -376,7 +381,7 @@ export class AdminApprovalLimitService {
         );
       }
 
-      const closed = await this.limits.close(limitId, at, tx);
+      const closed = await this.limits.close(tenantId, limitId, at, tx);
 
       await this.audit.write(tx, {
         action: 'admin.limit.ended',

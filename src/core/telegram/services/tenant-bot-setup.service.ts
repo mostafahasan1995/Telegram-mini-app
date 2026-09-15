@@ -192,16 +192,18 @@ export class TenantBotSetupService {
 
     // 3 — each of THIS operator's active admins in their private chat. The tenant is named in the
     // filter AND the query runs in the operator's context, so no other operator's staff can appear.
-    // Console-only admins (no Telegram id) have no private chat with the bot and are skipped.
+    // Console-only admins (no Telegram id) have no private chat with the bot and are skipped. So is
+    // an operator's agent principal, which carries the reserved id 0: Telegram numbers users from 1,
+    // so a chat scope of 0 is a Bot API error, not a person.
     const admins = await runWithTenant(tenantId, () =>
       this.prisma.adminUser.findMany({
-        where: { tenantId, isActive: true, telegramUserId: { not: null } },
+        where: { tenantId, isActive: true, telegramUserId: { gt: 0n } },
         select: { telegramUserId: true },
         orderBy: { displayName: 'asc' },
       }),
     );
     for (const admin of admins) {
-      if (admin.telegramUserId === null) continue;
+      if (admin.telegramUserId === null || admin.telegramUserId <= 0n) continue;
       const chatId = admin.telegramUserId.toString();
       if (pushedChats.has(chatId)) continue;
       pushedChats.add(chatId);

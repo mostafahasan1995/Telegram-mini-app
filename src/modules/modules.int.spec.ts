@@ -455,12 +455,23 @@ describe('feature modules (integration)', () => {
   describe('admin approval limits against a real database', () => {
     let adminId: string;
 
+    /** The principal a guarded request would carry: a SUPER_ADMIN of the bootstrap operator. */
+    const actor: Parameters<AdminUserService['create']>[0] = {
+      adminUserId: '00000000-0000-4000-8000-0000000000aa',
+      telegramUserId: null,
+      tenantId: TENANT_BOOTSTRAP_ID,
+      role: 'SUPER_ADMIN',
+      displayName: 'Int actor',
+    };
+
     itInTenant('creates an admin and evaluates real ceilings inside a transaction', async () => {
       const admins = moduleRef.get(AdminUserService);
       const limits = moduleRef.get(AdminApprovalLimitService);
 
-      const created = await admins.create('00000000-0000-4000-8000-0000000000aa', {
-        telegramUserId: (TG_BASE + 1n).toString(),
+      // A staff account is a username and a password (contract, 2026-09-05); TG_BASE keeps it unique.
+      const created = await admins.create(actor, {
+        username: `int-finance-${(TG_BASE + 1n).toString()}`,
+        password: 'Int-Finance-Pass-1',
         displayName: `Int Finance ${SUFFIX}`,
         role: 'FINANCE_ADMIN',
       });
@@ -529,8 +540,9 @@ describe('feature modules (integration)', () => {
     itInTenant('refuses to deactivate the last active SUPER_ADMIN', async () => {
       const admins = moduleRef.get(AdminUserService);
 
-      const superAdmin = await admins.create('00000000-0000-4000-8000-0000000000aa', {
-        telegramUserId: (TG_BASE + 2n).toString(),
+      const superAdmin = await admins.create(actor, {
+        username: `int-super-${(TG_BASE + 2n).toString()}`,
+        password: 'Int-Super-Pass-1',
         displayName: `Int Super ${SUFFIX}`,
         role: 'SUPER_ADMIN',
       });
@@ -541,20 +553,21 @@ describe('feature modules (integration)', () => {
       });
 
       if (otherActiveSuperAdmins === 0) {
-        await expect(
-          admins.deactivate('00000000-0000-4000-8000-0000000000aa', superAdmin.id),
-        ).rejects.toMatchObject({ errorCode: 'ADMIN_LAST_SUPER_ADMIN' });
+        await expect(admins.deactivate(actor, superAdmin.id)).rejects.toMatchObject({
+          errorCode: 'ADMIN_LAST_SUPER_ADMIN',
+        });
       } else {
         // Another SUPER_ADMIN exists in this database, so the guard correctly permits it.
-        await expect(
-          admins.deactivate('00000000-0000-4000-8000-0000000000aa', superAdmin.id),
-        ).resolves.toMatchObject({ isActive: false });
+        await expect(admins.deactivate(actor, superAdmin.id)).resolves.toMatchObject({
+          isActive: false,
+        });
       }
     });
 
     itInTenant('refuses self-demotion', async () => {
       const admins = moduleRef.get(AdminUserService);
-      await expect(admins.update(adminId, adminId, { role: 'VIEWER' })).rejects.toMatchObject({
+      const self = { ...actor, adminUserId: adminId };
+      await expect(admins.update(self, adminId, { role: 'VIEWER' })).rejects.toMatchObject({
         errorCode: 'ADMIN_SELF_MODIFICATION',
       });
     });

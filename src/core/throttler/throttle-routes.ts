@@ -19,6 +19,8 @@
  * rules are keyed on the authenticated player instead (see `throttleTracker`), so they can afford to
  * be strict — they are protecting against one looping client, not a crowd.
  */
+import { createHash } from 'node:crypto';
+
 import type { ExecutionContext } from '@nestjs/common';
 
 import { REQUEST_ADMIN_KEY, REQUEST_PLAYER_KEY } from '@common/decorators/auth.types';
@@ -27,8 +29,17 @@ const SECOND = 1_000;
 const MINUTE = 60 * SECOND;
 
 export interface ThrottleRule {
-  /** Appears in logs and in the boot-time self-check; not part of the storage key. */
+  /**
+   * Appears in logs and in the boot-time self-check. Part of the storage key only for a rule that
+   * sets `sharedAcrossRoutes`.
+   */
   readonly name: string;
+  /**
+   * When true, every route this rule matches counts against ONE bucket per caller, keyed by the rule
+   * name. Otherwise each route has its own bucket, keyed by controller and handler (the library's
+   * default). See `throttleKey`.
+   */
+  readonly sharedAcrossRoutes?: boolean;
   readonly method: string;
   readonly pattern: RegExp;
   /** Requests allowed per window. */
@@ -80,10 +91,14 @@ export const THROTTLE_RULES: readonly ThrottleRule[] = Object.freeze([
     // WHY BLOCKED FOR 15 MINUTES: a password, unlike a bot code, does not expire on its own. A
     // five-minute block only makes a patient guessing loop slow; fifteen makes it hopeless.
     //
-    // `ichancy` is in the pattern before its route exists on purpose: a second door onto the same
-    // secret must not ship unthrottled because somebody forgot this file. The boot self-check only
-    // needs the pattern to match ONE registered route, which /credentials does.
+    // ONE BUDGET FOR BOTH DOORS: they open the same sessions, and /credentials also tries the agent
+    // account, so the sealed agent password can be guessed through either. Matching both paths in
+    // one rule is not enough on its own, because the library keys a bucket by controller and handler
+    // and these are two handlers; `sharedAcrossRoutes` keys the bucket by the rule instead, so ten
+    // misses on one door block the other as well. The boot self-check needs the pattern to match one
+    // registered route; both are registered.
     pattern: /^\/v1\/admin\/auth\/(credentials|ichancy)$/,
+    sharedAcrossRoutes: true,
     limit: 10,
     ttlMs: MINUTE,
     blockMs: 15 * MINUTE,
@@ -140,6 +155,27 @@ export function ruleForContext(context: ExecutionContext): ThrottleRule | undefi
   if (context.getType() !== 'http') return undefined;
   const request = context.switchToHttp().getRequest<PathBearingRequest>();
   return matchRule(request.method, request.originalUrl ?? request.url);
+}
+
+/**
+ * The storage key a hit is counted under: which bucket this request fills.
+ *
+ * WHY NOT THE LIBRARY DEFAULT EVERYWHERE: @nestjs/throttler keys a bucket by controller class,
+ * handler name, throttler name and tracker. That is right for almost every rule, and every rule that
+ * does not ask otherwise gets exactly that key (the same string, hashed the same way), so no existing
+ * counter moves. It is wrong for a rule whose routes guard ONE secret behind two handlers: each
+ * handler would get its own budget and its own block, and a guessing loop would simply alternate. A
+ * rule marked `sharedAcrossRoutes` is therefore keyed by its NAME, never by the handler.
+ *
+ * The two shapes cannot collide: the shared one starts with `rule:`, which a class name cannot.
+ */
+export function throttleKey(context: ExecutionContext, tracker: string, throttlerName: string): string {
+  const rule = ruleForContext(context);
+  const scope =
+    rule?.sharedAcrossRoutes === true
+      ? `rule:${rule.name}`
+      : `${context.getClass().name}-${context.getHandler().name}`;
+  return createHash('sha256').update(`${scope}-${throttlerName}-${tracker}`).digest('hex');
 }
 
 /**

@@ -7,8 +7,9 @@
  * ThrottlerGuard evaluates every configured throttler on every request, so three named throttlers
  * would mean a deposit POST is counted against the auth bucket and the proof bucket as well as its
  * own. One throttler that resolves its numbers from the matched rule gives per-route limits with
- * per-route buckets (the default key generator already includes the controller and handler names),
- * and `skipIf` makes every unmatched route free.
+ * per-route buckets (`throttleKey` includes the controller and handler names, as the library's default
+ * does), and `skipIf` makes every unmatched route free. The one exception is a rule marked
+ * `sharedAcrossRoutes`, whose routes share a bucket keyed by the rule name.
  *
  * The guard is registered here, with the module that configures it, for the same reason AuthModule
  * registers its own: a composition that imports the configuration but forgets the guard is a
@@ -21,7 +22,7 @@ import { ThrottlerGuard, ThrottlerModule, type ThrottlerModuleOptions } from '@n
 import { RedisService } from '@core/cache/redis.service';
 
 import { RedisThrottlerStorage } from './redis-throttler.storage';
-import { ruleForContext, throttleTracker } from './throttle-routes';
+import { ruleForContext, throttleKey, throttleTracker } from './throttle-routes';
 
 /**
  * Used only for the routes we do not throttle, which `skipIf` has already excluded. They exist
@@ -38,6 +39,11 @@ const UNUSED_TTL_MS = 60_000;
         storage: new RedisThrottlerStorage(redis),
 
         getTracker: (request: Record<string, unknown>) => throttleTracker(request),
+
+        // Per-route buckets, except for a rule that shares one across its routes (the two admin
+        // sign-in doors). See `throttleKey`.
+        generateKey: (context, tracker, throttlerName) =>
+          throttleKey(context, tracker, throttlerName),
 
         // The whole policy in one line: if no rule matches this request, do not count it at all.
         skipIf: (context) => ruleForContext(context) === undefined,

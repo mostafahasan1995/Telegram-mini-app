@@ -9,6 +9,11 @@ import { TENANT_ZERO_ID, TENANT_ZERO_SLUG } from '@core/tenant/tenant.constants'
 import { getEffectiveTenantId } from '@core/tenant/tenant.storage';
 
 import { AdminErrorCodes } from '../admin.constants';
+import type {
+  AdminAgentCredentialsService,
+  AgentPrincipal,
+  ProvenAgent,
+} from './admin-agent-credentials.service';
 import {
   AdminCredentialsService,
   resolveOperator,
@@ -104,9 +109,17 @@ function harness(rows: CandidateRow[]) {
     .mockResolvedValue({ accessToken: 'signed.access.token', accessTokenExpiresAt: EXPIRES_AT });
   const sessions = { issueAdminAccessToken } as unknown as SessionService;
 
-  const service = new AdminCredentialsService(prisma, hasher, sessions, audit);
+  // The agent account is a miss unless a test says otherwise, so every console-password test above
+  // the agent block runs exactly as it did before the second credential existed.
+  const prove = jest.fn().mockResolvedValue([]);
+  const resolvePrincipal = jest.fn();
+  const agents = { prove, resolvePrincipal } as unknown as AdminAgentCredentialsService;
+
+  const service = new AdminCredentialsService(prisma, hasher, sessions, audit, agents);
   return {
     service,
+    prove,
+    resolvePrincipal,
     hasher,
     verify,
     findMany,
@@ -359,6 +372,136 @@ describe('AdminCredentialsService.signIn', () => {
     const error = await refusal(h.service.signIn({ username: 'owner', password: PASSWORD }));
 
     expect(error.errorCode).toBe(AdminErrorCodes.ADMIN_CREDENTIALS_INVALID);
+    expect(h.write).not.toHaveBeenCalled();
+    expect(h.issueAdminAccessToken).not.toHaveBeenCalled();
+  });
+});
+
+describe('AdminCredentialsService — the operator agent account (§2a second credential, §2b)', () => {
+  const PRINCIPAL_ID = 'bbbbbbbb-bbbb-4bbb-8bbb-000000000001';
+  const agentOf = (operator: OperatorRef): ProvenAgent => ({ operator, agentLogin: 'Agent_One' });
+  const principalOf = (operator: OperatorRef): AgentPrincipal => ({
+    adminUserId: PRINCIPAL_ID,
+    telegramUserId: 0n,
+    role: 'SUPER_ADMIN',
+    displayName: operator.displayName,
+    operator,
+  });
+
+  let hash: string;
+
+  beforeAll(async () => {
+    hash = await new PasswordHasherService(TEST_COST).hash(PASSWORD);
+  });
+
+  it('falls back to the agent account after a console miss, carrying the slug, and answers the same session', async () => {
+    const h = harness([]);
+    h.prove.mockResolvedValueOnce([agentOf(ALPHA)]);
+    h.resolvePrincipal.mockResolvedValueOnce(principalOf(ALPHA));
+
+    const session = await h.service.signIn({
+      username: ' Agent_One ',
+      password: PASSWORD,
+      operatorSlug: ' Alpha ',
+    });
+
+    // The console miss still paid its full derivation before the agent account was tried.
+    expect(h.verify).toHaveBeenCalledWith(PASSWORD, null);
+    expect(h.prove).toHaveBeenCalledWith(' Agent_One ', PASSWORD, 'alpha');
+    expect(h.resolvePrincipal).toHaveBeenCalledWith(agentOf(ALPHA));
+    expect(session).toEqual({
+      accessToken: 'signed.access.token',
+      expiresAt: EXPIRES_AT.toISOString(),
+      admin: { id: PRINCIPAL_ID, telegramUserId: '0', role: 'SUPER_ADMIN', displayName: 'Alpha' },
+      tenantId: ALPHA.tenantId,
+      tenantSlug: 'alpha',
+    });
+
+    // The stamp re-asserts the SUPER_ADMIN the agent door promises, in the operator's context.
+    expect(h.transactionTenants).toEqual([ALPHA.tenantId]);
+    expect(h.updateMany).toHaveBeenCalledWith({
+      where: { id: PRINCIPAL_ID, tenantId: ALPHA.tenantId, isActive: true, role: 'SUPER_ADMIN' },
+      data: { lastLoginAt: expect.any(Date) },
+    });
+    expect(h.write).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: 'admin.login',
+        actor: { type: 'ADMIN', id: PRINCIPAL_ID },
+        after: expect.objectContaining({ method: 'ichancy-agent' }) as unknown,
+      }),
+    );
+    expect(everythingPassedTo(h.write, h.updateMany, h.issueAdminAccessToken)).not.toContain(
+      PASSWORD,
+    );
+  });
+
+  it('never tries the agent account when the console password answered', async () => {
+    const h = harness([candidate(ALPHA, hash)]);
+    await h.service.signIn({ username: 'owner', password: PASSWORD });
+    expect(h.prove).not.toHaveBeenCalled();
+  });
+
+  it('answers a miss on both credentials with the one console sentence, naming no credential', async () => {
+    const h = harness([candidate(ALPHA, hash)]);
+    const error = await refusal(h.service.signIn({ username: 'owner', password: WRONG_PASSWORD }));
+
+    expect(h.prove).toHaveBeenCalledTimes(1);
+    expect(error.httpStatus).toBe(401);
+    expect(error.toJSON()).toEqual(
+      (await refusal(harness([]).service.signIn({ username: 'nobody', password: PASSWORD }))).toJSON(),
+    );
+    expect(error.details).toBeUndefined();
+  });
+
+  it('keeps the AGENT_ codes for what is said after the agent account matched, and resolves no principal', async () => {
+    const ambiguous = harness([]);
+    ambiguous.prove.mockResolvedValueOnce([agentOf(ALPHA), agentOf(BETA)]);
+    const question = await refusal(ambiguous.service.signIn({ username: 'agent', password: PASSWORD }));
+    expect(question.httpStatus).toBe(409);
+    expect(question.errorCode).toBe(AdminErrorCodes.AGENT_OPERATOR_AMBIGUOUS);
+    expect(question.details).toEqual({
+      operators: [
+        { slug: 'alpha', displayName: 'Alpha' },
+        { slug: 'beta', displayName: 'Beta' },
+      ],
+    });
+    expect(ambiguous.resolvePrincipal).not.toHaveBeenCalled();
+
+    const suspended = harness([]);
+    suspended.prove.mockResolvedValueOnce([agentOf(SUSPENDED)]);
+    const refused = await refusal(suspended.service.signIn({ username: 'agent', password: PASSWORD }));
+    expect(refused.httpStatus).toBe(403);
+    expect(refused.errorCode).toBe(AdminErrorCodes.AGENT_OPERATOR_NOT_ACTIVE);
+    expect(refused.details).toEqual({ operators: [{ slug: 'gamma', displayName: 'Gamma' }] });
+    expect(suspended.resolvePrincipal).not.toHaveBeenCalled();
+    expect(suspended.issueAdminAccessToken).not.toHaveBeenCalled();
+  });
+
+  it('answers /ichancy misses with 401 AGENT_CREDENTIALS_INVALID and nothing more, without a console lookup', async () => {
+    const h = harness([]);
+    const error = await refusal(
+      h.service.signInWithAgent({ username: 'agent', password: PASSWORD, operatorSlug: ' Beta ' }),
+    );
+
+    expect(error.httpStatus).toBe(401);
+    expect(error.errorCode).toBe(AdminErrorCodes.AGENT_CREDENTIALS_INVALID);
+    expect(error.details).toBeUndefined();
+    expect(h.prove).toHaveBeenCalledWith('agent', PASSWORD, 'beta');
+    expect(h.findMany).not.toHaveBeenCalled();
+    expect(h.verify).not.toHaveBeenCalled();
+  });
+
+  it('issues no token when the principal was deactivated or demoted between resolution and the stamp', async () => {
+    const h = harness([]);
+    h.prove.mockResolvedValueOnce([agentOf(ALPHA)]);
+    h.resolvePrincipal.mockResolvedValueOnce(principalOf(ALPHA));
+    h.updateMany.mockResolvedValueOnce({ count: 0 });
+
+    const error = await refusal(h.service.signInWithAgent({ username: 'agent', password: PASSWORD }));
+
+    expect(error.httpStatus).toBe(403);
+    expect(error.errorCode).toBe(AdminErrorCodes.AGENT_OPERATOR_HAS_NO_OWNER);
     expect(h.write).not.toHaveBeenCalled();
     expect(h.issueAdminAccessToken).not.toHaveBeenCalled();
   });

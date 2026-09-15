@@ -29,8 +29,9 @@ export class AdminCredentialsDto {
   password: string;
 
   /**
-   * Absent on the first attempt. Sent only after a 409 ADMIN_OPERATOR_AMBIGUOUS, with the slug the
-   * person picked from `details.operators`.
+   * Absent on the first attempt. Sent only after a 409 ADMIN_OPERATOR_AMBIGUOUS or
+   * AGENT_OPERATOR_AMBIGUOUS, with the slug the person picked from `details.operators`. The same body
+   * serves POST /v1/admin/auth/ichancy, where username and password are the operator's agent account.
    */
   @IsOptional()
   @IsString()

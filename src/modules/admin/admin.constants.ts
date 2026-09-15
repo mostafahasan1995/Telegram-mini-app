@@ -32,7 +32,43 @@ export const AdminErrorCodes = {
   ADMIN_OPERATOR_AMBIGUOUS: 'ADMIN_OPERATOR_AMBIGUOUS',
   /** 403. Right password, but every operator it opens is SUSPENDED. `details.operators`. */
   ADMIN_OPERATOR_NOT_ACTIVE: 'ADMIN_OPERATOR_NOT_ACTIVE',
+
+  // ── The operator's Ichancy agent account (API-CONTRACT.md §2b). Also answered by /credentials
+  //    once the agent account, not the console password, is what matched (§2a). ───────────────
+
+  /** 401, /ichancy only. No non-CLOSED operator holds that username and password. Says no more. */
+  AGENT_CREDENTIALS_INVALID: 'AGENT_CREDENTIALS_INVALID',
+  /** 409. Right agent credentials, several active operators. `details.operators`; retry with slug. */
+  AGENT_OPERATOR_AMBIGUOUS: 'AGENT_OPERATOR_AMBIGUOUS',
+  /** 403. Right agent credentials, but the operator is SUSPENDED. */
+  AGENT_OPERATOR_NOT_ACTIVE: 'AGENT_OPERATOR_NOT_ACTIVE',
+  /**
+   * 403. Right agent credentials, but the operator has staff and none of them is an active
+   * SUPER_ADMIN: its agent principal was deactivated or demoted. "No staff at all" is not this — that
+   * case creates the principal instead.
+   */
+  AGENT_OPERATOR_HAS_NO_OWNER: 'AGENT_OPERATOR_HAS_NO_OWNER',
+
+  /**
+   * 403. The actor may write staff but may not hand out this role (API-CONTRACT.md §3, `mayGrantRole`):
+   * PLATFORM_ADMIN is granted only by platform staff working in tenant zero with no X-Tenant-Id.
+   */
+  ADMIN_ROLE_NOT_GRANTABLE: 'ADMIN_ROLE_NOT_GRANTABLE',
 } as const;
+
+/**
+ * The Telegram id every operator's agent principal carries (API-CONTRACT.md §2b: "the reserved
+ * `telegram_user_id = 0`").
+ *
+ * WHY 0 AND NOT NULL, now that the column is nullable: the contract names 0, and the console's
+ * `AdminUserView` says a non-null id marks "admins made before [2026-09-05] plus each operator's agent
+ * principal". Two practical reasons agree with it. `@@unique([tenantId, telegramUserId])` then settles
+ * a race between two first sign-ins a second time, independently of the username index (NULLs are
+ * distinct and would not). And it can never resolve to a person: Telegram numbers users from 1, so no
+ * bot update carries `from.id = 0`. Code that DMs or scopes a menu to an admin's Telegram id must
+ * therefore skip ids that are not positive (TenantBotSetupService does).
+ */
+export const AGENT_PRINCIPAL_TELEGRAM_USER_ID = 0n;
 
 export type AdminErrorCode = (typeof AdminErrorCodes)[keyof typeof AdminErrorCodes];
 
