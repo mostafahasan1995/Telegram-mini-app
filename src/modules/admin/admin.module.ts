@@ -38,6 +38,7 @@ import { Module } from '@nestjs/common';
 import { AuthModule } from '@core/auth/auth.module';
 import { IchancyModule } from '@core/ichancy/ichancy.module';
 import { TelegramModule } from '@core/telegram/telegram.module';
+import { StaffTelegramLinkModule } from '@core/telegram/staff-link/staff-telegram-link.module';
 
 import { AdminApprovalLimitController } from './controllers/admin-approval-limit.controller';
 import { AdminAuthController } from './controllers/admin-auth.controller';
@@ -48,18 +49,22 @@ import { ActivityReportService } from './services/activity-report.service';
 import { AdminAgentCredentialsService } from './services/admin-agent-credentials.service';
 import { AdminApprovalLimitService } from './services/admin-approval-limit.service';
 import { AdminCredentialsService } from './services/admin-credentials.service';
+import { AdminTelegramLinkService } from './services/admin-telegram-link.service';
 import { AdminUserService } from './services/admin-user.service';
 import { ReportScheduleCron } from './services/report-schedule.cron';
 import { AdminTelegramHandlers } from './telegram/admin.handlers';
 import { APPROVAL_LIMIT_PORT } from './approval-limit.port';
 
 @Module({
-  imports: [AuthModule, IchancyModule, TelegramModule],
+  // StaffTelegramLinkModule: the mechanics of linking a staff account to Telegram, whose routes are on
+  // the staff directory (AdminTelegramLinkService). The worker redeems the same codes.
+  imports: [AuthModule, IchancyModule, TelegramModule, StaffTelegramLinkModule],
   controllers: [AdminUserController, AdminApprovalLimitController, AdminAuthController],
   providers: [
     AdminUserRepository,
     AdminApprovalLimitRepository,
     AdminUserService,
+    AdminTelegramLinkService,
     AdminApprovalLimitService,
     // The console sign-in. Uses PasswordHasherService and SessionService from AuthModule.
     AdminCredentialsService,

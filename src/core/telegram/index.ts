@@ -12,6 +12,8 @@ export * from './services/telegram-chat-migration.service';
 export * from './telegram-chat.constants';
 export * from './utils/chat-membership.util';
 export * from './utils/chat-verification.util';
+export * from './utils/staff-link-code.util';
+export * from './staff-link/staff-link.constants';
 export * from './services/handler-registrar.service';
 export * from './controllers/webhook.controller';
 export * from './commands/set-webhook.command';

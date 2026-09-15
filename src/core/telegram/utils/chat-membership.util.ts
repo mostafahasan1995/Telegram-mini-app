@@ -177,9 +177,26 @@ export function bindCommandOf(message: Message | undefined): BindCommand | null 
  * payload after `/start@bot ` changes.
  */
 export function redactBindNonce(update: Update): Update {
-  const message = (update as Partial<Update> | null | undefined)?.message;
+  const body = update as Partial<Update> | null | undefined;
+  if (body === null || body === undefined || typeof body !== 'object') return update;
+  let redacted: Update = update;
+  // An edited message is stored and queued like a sent one (the webhook subscribes to both), so a nonce
+  // typed into an edit must not rest there either. The worker binds only from `message`, so an edit
+  // never binds; it is redacted all the same.
+  for (const field of ['message', 'edited_message'] as const) {
+    const message = body[field];
+    const text = redactedBindText(message);
+    if (message !== undefined && text !== null) {
+      redacted = { ...redacted, [field]: { ...message, text } };
+    }
+  }
+  return redacted;
+}
+
+/** The text a group `/start` message may be stored with, or null when it needs no change. */
+function redactedBindText(message: Message | undefined): string | null {
   const command = groupStartCommandOf(message);
-  if (message === undefined || command === null) return update;
+  if (command === null) return null;
 
   let payload: string;
   if (BIND_NONCE_PATTERN.test(command.payload)) {
@@ -187,10 +204,10 @@ export function redactBindNonce(update: Update): Update {
   } else if (REDACTED_BIND_PAYLOAD.test(command.payload)) {
     payload = NEUTRALISED_PAYLOAD;
   } else {
-    return update;
+    return null;
   }
   const head = command.mention === null ? '/start' : `/start@${command.mention}`;
-  return { ...update, message: { ...message, text: `${head} ${payload}` } };
+  return `${head} ${payload}`;
 }
 
 /**

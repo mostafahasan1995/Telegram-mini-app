@@ -210,6 +210,7 @@ describe('throttle rules', () => {
         { method: 'post', path: '/v1/auth/refresh' },
         { method: 'post', path: '/v1/auth/bot-code' },
         { method: 'post', path: '/v1/admin/auth/credentials' },
+        { method: 'post', path: '/v1/admin/admins/{id}/telegram-link-code' },
         { method: 'post', path: '/v1/deposits' },
         { method: 'post', path: '/v1/deposits/{shortId}/proof' },
       ];
@@ -221,10 +222,19 @@ describe('throttle rules', () => {
         { method: 'post', path: '/v1/auth/telegram' },
         { method: 'post', path: '/v1/auth/bot-code' },
         { method: 'post', path: '/v1/admin/auth/credentials' },
+        { method: 'post', path: '/v1/admin/admins/:id/telegram-link-code' },
         { method: 'post', path: '/v1/deposits' },
         { method: 'post', path: '/v1/deposits/:shortId/proof' },
       ];
       expect(findUnmatchedRules(routes)).toEqual([]);
+    });
+
+    it('limits staff Telegram link codes per admin, on that route and nothing deeper', () => {
+      const rule = matchRule('POST', '/v1/admin/admins/5b0c/telegram-link-code');
+      expect(rule).toMatchObject({ name: 'staff-telegram-link-code', limit: 10, blockMs: 5 * 60_000 });
+      expect(rule?.sharedAcrossRoutes).toBeUndefined();
+      expect(matchRule('POST', '/v1/admin/admins/5b0c/telegram-link-code/extra')).toBeUndefined();
+      expect(matchRule('DELETE', '/v1/admin/admins/5b0c/telegram-link')).toBeUndefined();
     });
 
     it('catches a renamed route — the silent failure this exists for', () => {
@@ -232,6 +242,7 @@ describe('throttle rules', () => {
         { method: 'post', path: '/v1/auth/telegram' },
         { method: 'post', path: '/v1/auth/bot-code' },
         { method: 'post', path: '/v1/admin/auth/credentials' },
+        { method: 'post', path: '/v1/admin/admins/{id}/telegram-link-code' },
         { method: 'post', path: '/v1/deposits' },
         // proof moved to /v1/deposits/{shortId}/receipt and nobody updated the rule
         { method: 'post', path: '/v1/deposits/{shortId}/receipt' },
@@ -244,6 +255,7 @@ describe('throttle rules', () => {
         { method: 'post', path: '/v1/auth/telegram' },
         { method: 'post', path: '/v1/auth/bot-code' },
         { method: 'post', path: '/v1/admin/auth/bot-code' },
+        { method: 'post', path: '/v1/admin/admins/{id}/telegram-link-code' },
         { method: 'post', path: '/v1/deposits' },
         { method: 'post', path: '/v1/deposits/{shortId}/proof' },
       ];

@@ -275,6 +275,76 @@ describe('TelegramWebhookController', () => {
     });
   });
 
+  describe('staff link codes', () => {
+    const privateChat = { id: 42, type: 'private', first_name: 'Staff' };
+    const linkMessage = (updateId: number, text: string, chat: object = privateChat): Update =>
+      ({
+        update_id: updateId,
+        message: {
+          message_id: 1,
+          date: 1_700_000_000,
+          chat,
+          from: { id: 42, is_bot: false, first_name: 'Staff' },
+          text,
+        },
+      }) as unknown as Update;
+
+    beforeEach(() => {
+      findByWebhookPathToken.mockResolvedValue(route(secrets.sealWebhookSecret(SECRET)));
+    });
+
+    it("stores and queues /link with the code replaced by this operator's keyed digest, never the code", async () => {
+      await controller.receive(PATH_TOKEN, SECRET, linkMessage(40, '/link abcd-efgh'));
+
+      const digest = secrets.staffLinkCodeDigest(TENANT_ID, 'ABCDEFGH');
+      expect((record.mock.calls[0]?.[1] as Update).message?.text).toBe(`/link digest:${digest}`);
+      expect(JSON.stringify(record.mock.calls)).not.toMatch(/abcd-?efgh/i);
+      expect(JSON.stringify(add.mock.calls)).not.toMatch(/abcd-?efgh/i);
+      // Keyed: neither a plain hash of the code nor another operator's digest.
+      expect(digest).not.toBe(createHash('sha256').update('ABCDEFGH').digest('hex'));
+      expect(digest).not.toBe(secrets.staffLinkCodeDigest('22222222-2222-4222-8222-222222222222', 'ABCDEFGH'));
+    });
+
+    it('keeps a SUSPENDED operator’s /link, in a private chat or a group, and drops a CLOSED one’s', async () => {
+      find.mockResolvedValue(summary(TenantStatus.SUSPENDED));
+      await controller.receive(PATH_TOKEN, SECRET, linkMessage(50, '/link ABCD-EFGH'));
+      await controller.receive(
+        PATH_TOKEN,
+        SECRET,
+        linkMessage(51, '/link ABCD-EFGH', { id: -100, type: 'supergroup', title: 'Staff' }),
+      );
+      expect(record).toHaveBeenCalledTimes(2);
+      expect(add).toHaveBeenCalledTimes(2);
+
+      find.mockResolvedValue(summary(TenantStatus.CLOSED));
+      await controller.receive(PATH_TOKEN, SECRET, linkMessage(52, '/link ABCD-EFGH'));
+      expect(record).toHaveBeenCalledTimes(2);
+    });
+
+    it('neutralises a typed digest before it is stored', async () => {
+      await controller.receive(PATH_TOKEN, SECRET, linkMessage(60, `/link digest:${'b'.repeat(64)}`));
+      expect((record.mock.calls[0]?.[1] as Update).message?.text).toBe('/link [not-a-link-code]');
+    });
+
+    it('stores and queues an edited /link with the code replaced by the digest too, and keeps it while SUSPENDED', async () => {
+      const edited = (updateId: number, text: string): Update => {
+        const { message } = linkMessage(updateId, text) as { message: object };
+        return { update_id: updateId, edited_message: { ...message, edit_date: 1_700_000_001 } } as unknown as Update;
+      };
+
+      await controller.receive(PATH_TOKEN, SECRET, edited(70, '/link abcd-efgh'));
+      const digest = secrets.staffLinkCodeDigest(TENANT_ID, 'ABCDEFGH');
+      expect((record.mock.calls[0]?.[1] as Update).edited_message?.text).toBe(`/link digest:${digest}`);
+      expect(JSON.stringify(record.mock.calls)).not.toMatch(/abcd-?efgh/i);
+      expect(JSON.stringify(add.mock.calls)).not.toMatch(/abcd-?efgh/i);
+
+      find.mockResolvedValue(summary(TenantStatus.SUSPENDED));
+      await controller.receive(PATH_TOKEN, SECRET, edited(71, '/link ABCD-EFGH'));
+      expect(record).toHaveBeenCalledTimes(2);
+      expect(JSON.stringify(record.mock.calls)).not.toMatch(/abcd-?efgh/i);
+    });
+  });
+
   describe('enqueue', () => {
     beforeEach(() => {
       findByWebhookPathToken.mockResolvedValue(route(secrets.sealWebhookSecret(SECRET)));

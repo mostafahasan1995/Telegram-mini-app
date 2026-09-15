@@ -408,6 +408,7 @@ model Tenant {
   telegramUpdates      TelegramUpdate[]
   telegramDiscoveredChats TelegramDiscoveredChat[]
   telegramChatBindLinks   TelegramChatBindLink[]
+  adminTelegramLinkCodes  AdminTelegramLinkCode[]
   ichancyCalls         IchancyCall[]
   auditLogs            AuditLog[]
   reconciliationBreaks ReconciliationBreak[]
@@ -671,6 +672,7 @@ model AdminUser {
   assignedBreaks         ReconciliationBreak[] @relation("BreakAssignee")
   resolvedBreaks         ReconciliationBreak[] @relation("BreakResolver")
   revokedSelfExclusions  SelfExclusion[]       @relation("SelfExclusionRevoker")
+  telegramLinkCodes      AdminTelegramLinkCode[]
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
@@ -1150,6 +1152,40 @@ model TelegramChatBindLink {
   @@index([tenantId, purpose, createdAt])
   @@index([tenantId])
   @@map("telegram_chat_bind_links")
+}
+
+/// A one-time code that links a staff account to a Telegram account (owner decision 4, 2026-09-15).
+/// The console shows the code; the staff member sends `/link <code>` to the operator's bot in a
+/// private chat, and the Telegram id of that update's sender becomes the account's `telegramUserId`.
+/// That is the only way the column is set: the staff directory still refuses it on create and update.
+///
+/// ONLY A KEYED DIGEST OF THE CODE IS STORED: HMAC-SHA256 under a key derived from JWT_SECRET, over
+/// the operator id and the code. The code is short enough to type, so a plain hash would fall to a
+/// brute force from a database dump inside its lifetime; without the key a dump holds nothing usable.
+/// The operator is inside the digest, so a code only exists for the operator that issued it.
+/// One use (`usedAt`), a short expiry, and issuing a new code for an account revokes the previous one,
+/// so at most one is live per staff account.
+model AdminTelegramLinkCode {
+  id                   String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId             String    @map("tenant_id") @db.Uuid
+  /// The staff account the code links.
+  adminUserId          String    @map("admin_user_id") @db.Uuid
+  /// HMAC-SHA256 hex, see the model comment.
+  codeDigest           String    @unique @map("code_digest") @db.VarChar(64)
+  /// Who asked the console for it: the staff member, or a platform admin on their behalf.
+  issuedByAdminId      String    @map("issued_by_admin_id") @db.Uuid
+  expiresAt            DateTime  @map("expires_at") @db.Timestamptz(6)
+  usedAt               DateTime? @map("used_at") @db.Timestamptz(6)
+  usedByTelegramUserId BigInt?   @map("used_by_telegram_user_id")
+  revokedAt            DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  adminUser AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, adminUserId, createdAt])
+  @@index([tenantId])
+  @@map("admin_telegram_link_codes")
 }
 
 model IchancyCall {

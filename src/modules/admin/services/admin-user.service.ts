@@ -72,6 +72,7 @@ export function toAdminUserView(admin: AdminUser): AdminUserView {
   return {
     id: admin.id,
     telegramUserId: admin.telegramUserId === null ? null : admin.telegramUserId.toString(),
+    telegramLinked: admin.telegramUserId !== null && admin.telegramUserId > 0n,
     username: admin.username,
     // Whether a console password is set — never the hash, not even its format.
     hasPassword: admin.passwordHash !== null,

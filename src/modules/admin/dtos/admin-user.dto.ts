@@ -160,6 +160,11 @@ export class ListAdminUsersQueryDto {
 export interface AdminUserView {
   id: string;
   telegramUserId: string | null;
+  /**
+   * Whether a person's Telegram account is linked, so taps in the staff group are theirs. False for
+   * null AND for the agent principal's reserved "0", which is not a person.
+   */
+  telegramLinked: boolean;
   username: string | null;
   hasPassword: boolean;
   displayName: string;

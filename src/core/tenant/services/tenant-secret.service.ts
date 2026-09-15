@@ -26,6 +26,8 @@
  * NOTHING HERE LOGS, and no error carries a stored, submitted or opened value. The message names the
  * field and the tenant id, which is enough to fix it from the dashboard.
  */
+import { createHmac } from 'node:crypto';
+
 import type { Tenant } from '@prisma/client';
 
 import { SecretBoxError, deriveKey, openSecret, sealSecret } from '../../crypto/secret-box.util';
@@ -98,9 +100,17 @@ export function isTenantSecretSentinel(value: string): boolean {
   return TENANT_SECRET_SENTINEL_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
 
+/**
+ * HKDF label of the staff Telegram link-code digest key. Changing it only voids the codes live at that
+ * moment (each lives minutes), but it must still never be edited by accident.
+ */
+export const STAFF_LINK_CODE_DIGEST_INFO = 'staff-telegram-link-code-digest:v1';
+
 export class TenantSecretService {
   /** Derived once: it depends only on the root secret, and HKDF is not free. */
   private readonly key: Buffer;
+  /** A separate key for the link-code digest, so it shares nothing with the sealing key. */
+  private readonly linkCodeKey: Buffer;
 
   constructor(rootSecret: string) {
     // Trimmed because the seed has always derived from the trimmed JWT_SECRET, and rows it sealed
@@ -116,6 +126,21 @@ export class TenantSecretService {
       );
     }
     this.key = deriveKey(root, TENANT_SECRET_INFO);
+    this.linkCodeKey = deriveKey(root, STAFF_LINK_CODE_DIGEST_INFO);
+  }
+
+  /**
+   * The stored and queued form of a staff Telegram link code: HMAC-SHA256 hex over the operator and
+   * the normalized code. Keyed because the code is short enough to type: a plain hash in a database
+   * dump or a queued update could be walked back to a live code within its lifetime. The operator is
+   * part of the message, so the same code typed at another operator's bot is a different digest.
+   * Lives here because this class owns the keys derived from the deployment's root secret, and the
+   * webhook, which redacts the code before storing anything, already holds it.
+   */
+  staffLinkCodeDigest(tenantId: string, normalizedCode: string): string {
+    return createHmac('sha256', this.linkCodeKey)
+      .update(`${tenantId}:${normalizedCode}`, 'utf8')
+      .digest('hex');
   }
 
   sealBotToken(plaintext: string): string {

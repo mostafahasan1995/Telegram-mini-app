@@ -43,6 +43,7 @@ import { PrismaService } from '@core/prisma/prisma.service';
 import { QUEUE_NAMES } from '@core/queue/queue.constants';
 import { TASKS } from '@core/queue/queue.types';
 import { TelegramChatProjectionService } from '@core/telegram/chat-binding/chat-projection.service';
+import { StaffTelegramLinkService } from '@core/telegram/staff-link/staff-telegram-link.service';
 import { TelegramUpdateProcessor } from '@core/telegram/processors/telegram-update.processor';
 import { BotService } from '@core/telegram/services/bot.service';
 import { TelegramHandlerRegistrar } from '@core/telegram/services/handler-registrar.service';
@@ -411,6 +412,7 @@ describe('Staff and feed groups (integration)', () => {
       ctx.app.get(ActorContextService),
       ctx.app.get(TenantRegistryService),
       ctx.app.get(TelegramChatProjectionService),
+      ctx.app.get(StaffTelegramLinkService),
     );
 
     await ctx.reset();

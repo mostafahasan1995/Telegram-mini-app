@@ -105,6 +105,18 @@ export const THROTTLE_RULES: readonly ThrottleRule[] = Object.freeze([
     samplePath: '/v1/admin/auth/credentials',
   },
   {
+    name: 'staff-telegram-link-code',
+    method: 'POST',
+    // A one-time code that links a staff account to Telegram (owner decision 4). Each call revokes
+    // the previous code and writes an audit row, so a looping console or a scripted session is
+    // throttled here, keyed by the signed-in admin. A person asks once or twice.
+    pattern: /^\/v1\/admin\/admins\/[^/]+\/telegram-link-code$/,
+    limit: 10,
+    ttlMs: MINUTE,
+    blockMs: 5 * MINUTE,
+    samplePath: '/v1/admin/admins/0123456789/telegram-link-code',
+  },
+  {
     name: 'deposit-create',
     method: 'POST',
     pattern: /^\/v1\/deposits$/,

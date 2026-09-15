@@ -54,6 +54,22 @@ export const AdminErrorCodes = {
    * PLATFORM_ADMIN is granted only by platform staff working in tenant zero with no X-Tenant-Id.
    */
   ADMIN_ROLE_NOT_GRANTABLE: 'ADMIN_ROLE_NOT_GRANTABLE',
+
+  // ── Linking a staff account to Telegram with a one-time code (owner decision 4, 2026-09-15). ──
+
+  /**
+   * 403. A code may be asked for only by the staff member for their own account, or by a platform
+   * admin; a link may be removed by the staff member, a SUPER_ADMIN of the operator, or a platform admin.
+   */
+  ADMIN_TELEGRAM_LINK_FORBIDDEN: 'ADMIN_TELEGRAM_LINK_FORBIDDEN',
+  /** 409. The account is already linked. Remove the link first; a code never replaces one silently. */
+  ADMIN_TELEGRAM_ALREADY_LINKED: 'ADMIN_TELEGRAM_ALREADY_LINKED',
+  /**
+   * 422. The account cannot be linked at all. `details.reason`: `PLATFORM` (tenant zero has no bot),
+   * `OPERATOR_CLOSED`, `AGENT_PRINCIPAL` (the reserved Telegram id 0 is how its sign-in finds it) or
+   * `INACTIVE`.
+   */
+  ADMIN_TELEGRAM_LINK_NOT_ALLOWED: 'ADMIN_TELEGRAM_LINK_NOT_ALLOWED',
 } as const;
 
 /**

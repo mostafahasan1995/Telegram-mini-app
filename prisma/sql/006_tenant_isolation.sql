@@ -102,6 +102,9 @@ BEGIN
       ('ledger_entries',          'ledger_account_id',       'ledger_accounts',     'RESTRICT'),
       ('ledger_accounts',         'player_id',               'players',             'RESTRICT'),
       ('admin_approval_limits',   'admin_user_id',           'admin_users',         'CASCADE'),
+      -- A staff Telegram link code (migration 20260916120000) belongs to a staff account of its own
+      -- operator: redeeming one writes that account's Telegram id, so it must never cross operators.
+      ('admin_telegram_link_codes','admin_user_id',          'admin_users',         'CASCADE'),
       ('player_sessions',         'player_id',               'players',             'CASCADE'),
       ('player_limits',           'player_id',               'players',             'CASCADE'),
       ('self_exclusions',         'player_id',               'players',             'RESTRICT')

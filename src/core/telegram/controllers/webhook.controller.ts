@@ -37,6 +37,15 @@
  * link. An operator stays SUSPENDED until its staff group is bound, so these arrive precisely while it
  * is not serving, and Telegram sends each only once. They are stored and enqueued as usual; the worker
  * runs only the projection for them (TelegramUpdateProcessor), never a handler.
+ * A SECOND EXCEPTION, for a SUSPENDED operator only: a staff member's `/link <code>`, sent or edited
+ * (staff-link-code util). Staff link their Telegram account while the operator is being set up, before
+ * it serves, and the link flow takes no money. The worker runs only StaffTelegramLinkService for it,
+ * never a handler; an edit is only answered, never redeemed.
+ * A CLOSED operator keeps no `/link`: a closed operator's staff have nothing left to act on.
+ *
+ * THE LINK CODE IS REDACTED TOO: a `/link` code is replaced by its keyed digest before the update is
+ * stored or queued (redactStaffLinkCode, THE CODE NEVER RESTS ANYWHERE), for every operator status, in
+ * `message` and `edited_message` alike. The bind nonce is redacted in both as well.
  * The status is read through TenantRegistryService.find, so a suspension bites as soon as the suspend
  * path invalidates it, and within its 30 s TTL otherwise.
  *
@@ -85,6 +94,7 @@ import {
 import { type TelegramUpdateJobData } from '../telegram.types';
 import { UpdateDedupeService } from '../services/update-dedupe.service';
 import { isChatProjectionUpdate, redactBindNonce } from '../utils/chat-membership.util';
+import { isStaffLinkUpdate, redactStaffLinkCode } from '../utils/staff-link-code.util';
 import { secureCompare } from '../utils/secure-compare.util';
 
 interface WebhookAck {
@@ -163,7 +173,11 @@ export class TelegramWebhookController {
     // Before anything reads or stores it: a staff-group link's nonce is replaced by its hash, so the
     // row and the job never hold a usable credential (chat-membership.util, THE NONCE NEVER RESTS
     // ANYWHERE). After authentication, per ORDERING IS SECURITY-RELEVANT above.
-    const update = redactBindNonce(body);
+    // A staff link code likewise becomes its keyed digest (staff-link-code.util, THE CODE NEVER RESTS
+    // ANYWHERE), keyed to THIS operator.
+    const update = redactStaffLinkCode(redactBindNonce(body), (code) =>
+      this.secrets.staffLinkCodeDigest(tenantId, code),
+    );
 
     const tenant = await this.tenants.find(tenantId);
     if (tenant === null) {
@@ -173,8 +187,11 @@ export class TelegramWebhookController {
     }
 
     if (tenant.status !== TenantStatus.ACTIVE) {
-      // See the header: a stopped operator keeps only what the chat projection needs.
-      if (!isChatProjectionUpdate(update)) {
+      // See the header: a stopped operator keeps only what the chat projection needs, and a SUSPENDED
+      // one also its staff's `/link`.
+      const keptWhileSuspended =
+        tenant.status === TenantStatus.SUSPENDED && isStaffLinkUpdate(update);
+      if (!isChatProjectionUpdate(update) && !keptWhileSuspended) {
         this.logInactiveOnce(tenant.id, tenant.status);
         return { ok: true };
       }

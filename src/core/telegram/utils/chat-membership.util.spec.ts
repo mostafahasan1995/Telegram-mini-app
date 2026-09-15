@@ -176,6 +176,20 @@ describe('redactBindNonce', () => {
     expect(isChatProjectionUpdate(typed)).toBe(false);
   });
 
+  it('redacts a nonce typed into an edited group message too, which never binds', () => {
+    const original = {
+      update_id: 10,
+      edited_message: { ...groupMessage(`/start@cashier_bot ${NONCE}`), edit_date: 2 },
+    } as unknown as Update;
+    const redacted = redactBindNonce(original);
+
+    expect(redacted.edited_message?.text).toBe(`/start@cashier_bot sha256:${hashBindNonce(NONCE)}`);
+    expect(JSON.stringify(redacted)).not.toContain(NONCE);
+    expect(original.edited_message?.text).toBe(`/start@cashier_bot ${NONCE}`);
+    // Only a sent message is a bind command or a projection update.
+    expect(isChatProjectionUpdate(redacted)).toBe(false);
+  });
+
   it('returns every other update as the same object, a malformed body included', () => {
     const plain = inGroup('hello');
     const referral = inGroup('/start ref_12345');

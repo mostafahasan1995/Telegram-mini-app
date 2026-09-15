@@ -31,6 +31,10 @@
  *    Either way it is this operator's job that fails. The worker, and every other operator's
  *    updates, carry on.
  *
+ * THE STAFF LINK RUNS NEXT, for an ACTIVE or SUSPENDED operator: a `/link <code>` is handed to
+ * StaffTelegramLinkService and never reaches grammY, so no handler of a stopped operator runs and no
+ * handler of a serving one sees a code. A CLOSED operator's `/link` is dropped like the rest.
+ *
  * THE PROJECTION RUNS FOR EVERY OPERATOR, before dispatch. For an ACTIVE operator a bind command is
  * consumed there and never reaches grammY, whose player /start handler would otherwise register the
  * person who added the bot as a player. A projection failure (the database, a Telegram outage during a
@@ -59,6 +63,8 @@ import {
   type ChatProjectionResult,
 } from '../chat-binding/chat-projection.service';
 import { TELEGRAM_CHAT_PROJECTION_HANDLER } from '../telegram-chat.constants';
+import { STAFF_TELEGRAM_LINK_HANDLER } from '../staff-link/staff-link.constants';
+import { StaffTelegramLinkService } from '../staff-link/staff-telegram-link.service';
 import { TELEGRAM_UPDATE_JOB, TELEGRAM_UPDATE_QUEUE } from '../telegram.constants';
 import { isTenantBotUnavailableError } from '../tenant-bot.errors';
 import { type TelegramUpdateJobData } from '../telegram.types';
@@ -90,6 +96,7 @@ export class TelegramUpdateProcessor extends WorkerHost {
     private readonly actorContext: ActorContextService,
     private readonly tenants: TenantRegistryService,
     private readonly projection: TelegramChatProjectionService,
+    private readonly staffLinks: StaffTelegramLinkService,
   ) {
     super();
   }
@@ -148,6 +155,9 @@ export class TelegramUpdateProcessor extends WorkerHost {
         await this.dedupe.markProcessed(updateRowId, TELEGRAM_CHAT_PROJECTION_HANDLER);
         return;
       }
+      if (status === TenantStatus.SUSPENDED && (await this.handledAsStaffLink(tenantId, updateRowId, data))) {
+        return;
+      }
       await this.dropUndispatched(tenantId, updateRowId, status);
       return;
     }
@@ -156,7 +166,28 @@ export class TelegramUpdateProcessor extends WorkerHost {
       await this.dedupe.markProcessed(updateRowId, TELEGRAM_CHAT_PROJECTION_HANDLER);
       return;
     }
+    if (await this.handledAsStaffLink(tenantId, updateRowId, data)) return;
     await this.dispatch(tenantId, updateRowId, data);
+  }
+
+  /**
+   * True when the update was a `/link` for this bot and the link flow handled it (see the header). A
+   * database failure is recorded and rethrown before anything is dispatched, like a projection failure.
+   */
+  private async handledAsStaffLink(
+    tenantId: string,
+    updateRowId: string,
+    data: TelegramUpdateJobData,
+  ): Promise<boolean> {
+    let consumed: boolean;
+    try {
+      consumed = (await this.staffLinks.handleUpdate(tenantId, data.update)).consumed;
+    } catch (error: unknown) {
+      await this.recordFailure(updateRowId, error);
+      throw error;
+    }
+    if (consumed) await this.dedupe.markProcessed(updateRowId, STAFF_TELEGRAM_LINK_HANDLER);
+    return consumed;
   }
 
   private async dropUndispatched(tenantId: string, updateRowId: string, status: string): Promise<void> {

@@ -20,6 +20,11 @@ import {
   type ChatProjectionResult,
   type TelegramChatProjectionService,
 } from '../chat-binding/chat-projection.service';
+import {
+  type StaffLinkUpdateResult,
+  type StaffTelegramLinkService,
+} from '../staff-link/staff-telegram-link.service';
+import { STAFF_TELEGRAM_LINK_HANDLER } from '../staff-link/staff-link.constants';
 import { type TenantBotRegistry } from '../services/tenant-bot-registry.service';
 import { type UpdateDedupeService } from '../services/update-dedupe.service';
 import { TELEGRAM_UPDATE_JOB } from '../telegram.constants';
@@ -66,6 +71,8 @@ describe('TelegramUpdateProcessor', () => {
   let projection: ChatProjectionResult;
   /** The tenant context each projection ran in. */
   let projected: Array<string | undefined>;
+  let linkHandle: jest.Mock<Promise<StaffLinkUpdateResult>, [string, Update]>;
+  let linkResult: StaffLinkUpdateResult;
 
   const botFor = (label: string): Bot =>
     ({
@@ -97,6 +104,10 @@ describe('TelegramUpdateProcessor', () => {
     });
     projected = [];
     projection = { relevant: false, consumed: false };
+    linkResult = { consumed: false, result: null };
+    linkHandle = jest.fn<Promise<StaffLinkUpdateResult>, [string, Update]>(() =>
+      Promise.resolve(linkResult),
+    );
 
     processor = new TelegramUpdateProcessor(
       { get } as unknown as TenantBotRegistry,
@@ -109,6 +120,7 @@ describe('TelegramUpdateProcessor', () => {
         },
       } as unknown as TenantRegistryService,
       { project } as unknown as TelegramChatProjectionService,
+      { handleUpdate: linkHandle } as unknown as StaffTelegramLinkService,
     );
   });
 
@@ -191,6 +203,51 @@ describe('TelegramUpdateProcessor', () => {
     expect(project).toHaveBeenCalledTimes(1);
     expect(seen).toEqual([{ tenantId: TENANT_A, actor: `${TENANT_A}:SYSTEM` }]);
     expect(markProcessed).toHaveBeenCalledWith('row-1', TelegramUpdateProcessor.name);
+  });
+
+  it('gives a /link the link flow consumed to no handler, for an ACTIVE operator', async () => {
+    linkResult = { consumed: true, result: 'LINKED' };
+
+    await processor.process(jobOf({}));
+
+    expect(linkHandle).toHaveBeenCalledWith(TENANT_A, expect.anything());
+    expect(get).not.toHaveBeenCalled();
+    expect(markProcessed).toHaveBeenCalledWith('row-1', STAFF_TELEGRAM_LINK_HANDLER);
+  });
+
+  it('runs the link flow for a SUSPENDED operator, and drops what it does not consume', async () => {
+    statuses.set(TENANT_A, TenantStatus.SUSPENDED);
+    linkResult = { consumed: true, result: 'CODE_UNKNOWN' };
+
+    await processor.process(jobOf({}));
+    expect(get).not.toHaveBeenCalled();
+    expect(markProcessed).toHaveBeenCalledWith('row-1', STAFF_TELEGRAM_LINK_HANDLER);
+
+    linkResult = { consumed: false, result: null };
+    await processor.process(jobOf({ updateRowId: 'row-2' }));
+    expect(get).not.toHaveBeenCalled();
+    expect(markFailed).toHaveBeenCalledWith('row-2', expect.stringContaining('SUSPENDED'));
+  });
+
+  it('never runs the link flow for a CLOSED operator, or for an update the projection consumed', async () => {
+    statuses.set(TENANT_A, TenantStatus.CLOSED);
+    await processor.process(jobOf({}));
+
+    statuses.set(TENANT_A, TenantStatus.ACTIVE);
+    projection = { relevant: true, consumed: true };
+    await processor.process(jobOf({ updateRowId: 'row-2' }));
+
+    expect(linkHandle).not.toHaveBeenCalled();
+  });
+
+  it('records a link failure and rethrows it before anything is dispatched', async () => {
+    const boom = new Error('database is down');
+    linkHandle.mockRejectedValueOnce(boom);
+
+    await expect(processor.process(jobOf({}))).rejects.toBe(boom);
+
+    expect(get).not.toHaveBeenCalled();
+    expect(markFailed).toHaveBeenCalledWith('row-1', boom);
   });
 
   it('records a projection failure and rethrows it before anything is dispatched', async () => {

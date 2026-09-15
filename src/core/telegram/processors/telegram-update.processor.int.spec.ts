@@ -45,6 +45,7 @@ import { TenantRegistryService } from '../../tenant/services/tenant-registry.ser
 import { TenantSecretService } from '../../tenant/services/tenant-secret.service';
 import { getEffectiveTenantId } from '../../tenant/tenant.storage';
 import { type TelegramChatProjectionService } from '../chat-binding/chat-projection.service';
+import { type StaffTelegramLinkService } from '../staff-link/staff-telegram-link.service';
 import { OnCommand } from '../decorators/handlers.decorator';
 import { fingerprintBotToken } from '../services/bot.factory';
 import { TelegramHandlerRegistrar } from '../services/handler-registrar.service';
@@ -178,6 +179,10 @@ describe('TelegramUpdateProcessor (integration)', () => {
       {
         project: () => Promise.resolve({ relevant: false, consumed: false }),
       } as unknown as TelegramChatProjectionService,
+      // Nor is any of them a `/link`; the link flow runs against real rows in admin-telegram-link.int.spec.ts.
+      {
+        handleUpdate: () => Promise.resolve({ consumed: false, result: null }),
+      } as unknown as StaffTelegramLinkService,
     );
 
   /** Records the update the way the webhook does, and returns the job the webhook would queue. */

@@ -14,7 +14,19 @@
  * decided, with onDelete: Restrict. A real delete would either fail or destroy the audit trail, so
  * DELETE deactivates — and says so in its own name at the service layer.
  */
-import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Header,
+  HttpCode,
+  HttpStatus,
+  Param,
+  Patch,
+  Post,
+  Query,
+} from '@nestjs/common';
 
 import { AdminAuth } from '@common/decorators/auth.decorator';
 import type { AuthenticatedAdmin } from '@common/decorators/auth.types';
@@ -29,11 +41,16 @@ import {
   UpdateAdminUserDto,
   type AdminUserView,
 } from '../dtos/admin-user.dto';
+import type { StaffTelegramLinkCodeView } from '../dtos/admin-telegram-link.dto';
+import { AdminTelegramLinkService } from '../services/admin-telegram-link.service';
 import { AdminUserService } from '../services/admin-user.service';
 
 @Controller('v1/admin/admins')
 export class AdminUserController {
-  constructor(private readonly admins: AdminUserService) {}
+  constructor(
+    private readonly admins: AdminUserService,
+    private readonly telegramLinks: AdminTelegramLinkService,
+  ) {}
 
   @AdminAuth(...ADMIN_READER_ROLES)
   @Get()
@@ -74,5 +91,33 @@ export class AdminUserController {
     @Param() params: IdParamDto,
   ): Promise<AdminUserView> {
     return this.admins.deactivate(actor, params.id);
+  }
+
+  /**
+   * A one-time code that links this staff account to the Telegram account that sends it to the
+   * operator's bot. `@AdminAuth()` with no roles on purpose: every staff member may link their own
+   * account, and AdminTelegramLinkService decides who else may ask (platform staff only). The code is
+   * in this body and nowhere else, so the response must not be cached. Throttled per admin
+   * (throttle-routes.ts `staff-telegram-link-code`).
+   */
+  @AdminAuth()
+  @Post(':id/telegram-link-code')
+  @HttpCode(HttpStatus.OK)
+  @Header('Cache-Control', 'no-store')
+  issueTelegramLinkCode(
+    @CurrentAdmin() actor: AuthenticatedAdmin,
+    @Param() params: IdParamDto,
+  ): Promise<StaffTelegramLinkCodeView> {
+    return this.telegramLinks.issueCode(actor, params.id);
+  }
+
+  /** Removes the account's Telegram link. Same reasoning for `@AdminAuth()` as above. */
+  @AdminAuth()
+  @Delete(':id/telegram-link')
+  unlinkTelegram(
+    @CurrentAdmin() actor: AuthenticatedAdmin,
+    @Param() params: IdParamDto,
+  ): Promise<AdminUserView> {
+    return this.telegramLinks.unlink(actor, params.id);
   }
 }
