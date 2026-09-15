@@ -46,6 +46,7 @@ import { DepositModule } from '@modules/deposit/deposit.module';
 import { PaymentMethodModule } from '@modules/payment-method/payment-method.module';
 import { PlayerModule } from '@modules/player/player.module';
 import { ReconciliationModule } from '@modules/reconciliation/reconciliation.module';
+import { TenantAdminModule } from '@modules/tenant/tenant-admin.module';
 import { WalletModule } from '@modules/wallet/wallet.module';
 
 import { FeaturePortsModule } from './feature-ports.module';
@@ -95,6 +96,8 @@ import { FeaturePortsModule } from './feature-ports.module';
     DepositModule,
     WalletModule,
     ReconciliationModule,
+    // The platform surface (operators, platform defaults). API only: the worker serves no HTTP.
+    TenantAdminModule,
   ],
 })
 export class AppModule {}

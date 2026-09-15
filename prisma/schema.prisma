@@ -382,6 +382,11 @@ model PlatformDefaults {
   agentFloatLowWatermarkMinor BigInt @map("agent_float_low_watermark_minor")
   depositExpiryMinutes        Int    @map("deposit_expiry_minutes")
 
+  /// When PlatformDefaultsService copied this deployment's env values over the migration's
+  /// literals. NULL means "never seeded": the first read seeds and stamps it, exactly once, so an
+  /// existing deployment keeps the values its .env already had without anybody running a script.
+  seededFromEnvAt DateTime? @map("seeded_from_env_at") @db.Timestamptz(6)
+
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   @@map("platform_defaults")

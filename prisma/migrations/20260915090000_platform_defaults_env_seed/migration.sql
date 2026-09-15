@@ -1,0 +1,11 @@
+-- PlatformDefaults are seeded from the deployment's env on FIRST READ, by PlatformDefaultsService,
+-- not by a script (dashboard docs/API-CONTRACT.md, "Platform defaults"). The multi-tenant migration
+-- already inserted row id=1 holding literals, so the service needs a way to tell "never seeded"
+-- from "seeded, and somebody chose these values". Guessing from the literals would re-seed a row a
+-- platform admin had deliberately set to them.
+--
+-- Safe on a populated database: one nullable column, no default, no rewrite, no backfill. Every
+-- existing row reads as never seeded, which is exactly the state it is in: before this release no
+-- code path wrote platform_defaults except the migration's INSERT and the dev seed's create branch
+-- (which copies the same env values the first read will copy again).
+ALTER TABLE "platform_defaults" ADD COLUMN IF NOT EXISTS "seeded_from_env_at" TIMESTAMPTZ(6);

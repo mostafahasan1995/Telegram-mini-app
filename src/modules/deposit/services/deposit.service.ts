@@ -26,6 +26,7 @@ import {
   DepositStatus,
   PaymentRail,
   ProofSource,
+  TenantStatus,
   type DepositRequest,
   type PaymentDestination,
   type PaymentMethod,
@@ -55,7 +56,7 @@ import { OutboxService } from '@core/outbox/outbox.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { isUniqueConstraintError, mapPrismaError } from '@core/prisma/prisma-errors';
 import type { Tx } from '@core/prisma/tx.type';
-import { requireEffectiveTenantId } from '@core/tenant';
+import { requireEffectiveTenantId, TenantErrorCodes } from '@core/tenant';
 
 import { DEPOSIT_AGGREGATE, DEPOSIT_TOPICS, MAX_PROOFS_PER_DEPOSIT } from '../deposit.constants';
 import {
@@ -222,6 +223,10 @@ export class DepositService {
    * where two concurrent requests each see a compliant total.
    */
   async create(actor: Actor, input: CreateDepositInput): Promise<CreatedDeposit> {
+    // First, before anything else is resolved: a suspended operator's player is told the one thing
+    // that is actually wrong, not a rail or limit error that would send them trying another amount.
+    await this.assertOperatorServing();
+
     // Method resolution, destination rotation and the rail's own field rules all belong to the
     // payment-method module and are reached through PAYMENT_METHOD_PORT (see ../ports). Duplicating
     // any of them here would mean two answers to "is this amount allowed on this rail?".
@@ -722,6 +727,36 @@ export class DepositService {
         { externalReference: args.reference },
       );
     }
+  }
+
+  /**
+   * "No new deposit can be started" is what the console's suspend dialog promises a suspension does
+   * (manager-account-dashboard src/features/tenants/messages.ts, tenants.suspend.confirmBody), so it
+   * is enforced here, where every path that opens a deposit meets it: the mini app's POST and the
+   * bot's buttons alike.
+   *
+   * ONLY the start of new money is gated. Proof upload, cancel, review and crediting stay open,
+   * because the same dialog promises that "credits already in flight still land", and a player who
+   * has already paid must still be able to attach the receipt.
+   *
+   * WHY A DIRECT READ AND NOT TenantRegistryService: it is one primary-key lookup on a route that is
+   * rate limited to a dozen calls a minute per player, and it sees a suspension the moment it
+   * commits instead of up to 30 seconds later. It also keeps this module's dependencies to Prisma.
+   * The operator is the effective tenant, which for a player is the one signed into their session.
+   */
+  private async assertOperatorServing(): Promise<void> {
+    const operator = await this.prisma.tenant.findUnique({
+      where: { id: requireEffectiveTenantId() },
+      select: { status: true },
+    });
+    if (operator?.status === TenantStatus.ACTIVE) return;
+
+    throw new BusinessRuleError(
+      TenantErrorCodes.TENANT_NOT_ACTIVE,
+      'Deposits are paused for this cashier right now, so a new deposit cannot be started. ' +
+        'A deposit you have already paid for still goes through.',
+      { status: operator?.status ?? null },
+    );
   }
 
   private policyGate(
