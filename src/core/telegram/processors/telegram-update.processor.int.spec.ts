@@ -13,8 +13,9 @@
  *    next operator's update is still handled;
  *  - a SUSPENDED operator's queued update reaches no bot and no handler.
  *
- * Run with the escape hatch:
- *   POSTGRES_TEST_URL=... REDIS_TEST_URL=... TEST_REDIS_URL=... npx jest --config jest-int.config.cjs \
+ * Postgres and Redis come from the shared harness (test/setup): throwaway containers under
+ * `npm run test:int`, or the escape hatch when both variables are set:
+ *   POSTGRES_TEST_URL=... REDIS_TEST_URL=... npx jest --config jest-int.config.cjs \
  *     --runInBand src/core/telegram/processors/telegram-update.processor.int.spec.ts
  */
 import { randomBytes } from 'node:crypto';
@@ -31,6 +32,8 @@ import { Redis } from 'ioredis';
 
 import { ActorContextService } from '@core/actor-context/actor-context.service';
 
+import { startPostgres, stopPostgres } from '../../../../test/setup/postgres-container';
+import { startRedis, stopRedis } from '../../../../test/setup/redis-container';
 import {
   createFakeTelegram,
   testBotInfo,
@@ -55,12 +58,6 @@ import { TELEGRAM_UPDATE_JOB, telegramBotInfoCacheKey } from '../telegram.consta
 import { TenantBotErrorCodes } from '../tenant-bot.errors';
 import { type TelegramUpdateJobData } from '../telegram.types';
 import { TelegramUpdateProcessor } from './telegram-update.processor';
-
-const REDIS_URL = process.env.TEST_REDIS_URL ?? process.env.REDIS_TEST_URL ?? '';
-const DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.POSTGRES_TEST_URL ?? '';
-if (REDIS_URL === '' || DATABASE_URL === '') {
-  throw new Error('Set POSTGRES_TEST_URL and REDIS_TEST_URL to a THROWAWAY database and Redis.');
-}
 
 const RUN = Date.now().toString(36);
 const SLUG_PREFIX = 'p7-bots-';
@@ -212,8 +209,9 @@ describe('TelegramUpdateProcessor (integration)', () => {
     });
 
   beforeAll(async () => {
-    prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: DATABASE_URL }) });
-    redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
+    const [postgres, redisHandle] = await Promise.all([startPostgres(), startRedis()]);
+    prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: postgres.url }) });
+    redis = new Redis(redisHandle.url, { maxRetriesPerRequest: null });
     await redis.ping();
 
     const redisService = redis as unknown as RedisService;
@@ -266,6 +264,7 @@ describe('TelegramUpdateProcessor (integration)', () => {
     await moduleRef.close();
     await prisma.$disconnect();
     await redis.quit();
+    await Promise.all([stopPostgres(), stopRedis()]);
   });
 
   it('dispatches an update through the bot of the operator that received it, in its tenant context', async () => {

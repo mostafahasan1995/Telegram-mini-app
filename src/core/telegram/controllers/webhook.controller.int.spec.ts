@@ -11,7 +11,8 @@
  *  - a SUSPENDED or CLOSED operator is answered 200 and nothing is stored or enqueued;
  *  - no Redis key carries a path token.
  *
- * Run with the escape hatch:
+ * Postgres and Redis come from the shared harness (test/setup): throwaway containers under
+ * `npm run test:int`, or the escape hatch when both variables are set:
  *   POSTGRES_TEST_URL=... REDIS_TEST_URL=... npx jest --config jest-int.config.cjs --runInBand \
  *     src/core/telegram/controllers/webhook.controller.int.spec.ts
  */
@@ -27,6 +28,8 @@ import { Redis } from 'ioredis';
 import { AppException } from '@common/exceptions/app.exception';
 import { CommonErrorCodes } from '@common/exceptions/error-codes';
 
+import { startPostgres, stopPostgres } from '../../../../test/setup/postgres-container';
+import { startRedis, stopRedis } from '../../../../test/setup/redis-container';
 import { CacheService } from '../../cache/cache.service';
 import { LockService } from '../../cache/lock.service';
 import { type RedisService } from '../../cache/redis.service';
@@ -37,12 +40,6 @@ import { UpdateDedupeService } from '../services/update-dedupe.service';
 import { TELEGRAM_UPDATE_JOB } from '../telegram.constants';
 import { type TelegramUpdateJobData } from '../telegram.types';
 import { TelegramWebhookController } from './webhook.controller';
-
-const REDIS_URL = process.env.TEST_REDIS_URL ?? process.env.REDIS_TEST_URL ?? '';
-const DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.POSTGRES_TEST_URL ?? '';
-if (REDIS_URL === '' || DATABASE_URL === '') {
-  throw new Error('Set POSTGRES_TEST_URL and REDIS_TEST_URL to a THROWAWAY database and Redis.');
-}
 
 const RUN = Date.now().toString(36);
 const SLUG_PREFIX = 'p6-webhook-';
@@ -145,8 +142,9 @@ describe('TelegramWebhookController (integration)', () => {
   };
 
   beforeAll(async () => {
-    prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: DATABASE_URL }) });
-    redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
+    const [postgres, redisHandle] = await Promise.all([startPostgres(), startRedis()]);
+    prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: postgres.url }) });
+    redis = new Redis(redisHandle.url, { maxRetriesPerRequest: null });
     await redis.ping();
 
     const redisService = redis as unknown as RedisService;
@@ -182,6 +180,7 @@ describe('TelegramWebhookController (integration)', () => {
     await removeSuiteOperators();
     await prisma.$disconnect();
     await redis.quit();
+    await Promise.all([stopPostgres(), stopRedis()]);
   });
 
   describe('a genuine delivery', () => {

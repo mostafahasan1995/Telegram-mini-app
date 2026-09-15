@@ -13,9 +13,11 @@
  * The suite creates its own two operators (run-unique slugs under a fixed prefix) and deletes them
  * in afterAll; their `telegram_updates` rows go with them by cascade.
  *
- * Run with:  POSTGRES_TEST_URL=... REDIS_TEST_URL=... npx jest --config jest-int.config.cjs \
- *              --runInBand src/core/telegram/services/update-dedupe.service.int.spec.ts
- * against a THROWAWAY database and Redis.
+ * Postgres and Redis come from the shared harness (test/setup): throwaway containers under
+ * `npm run test:int`, with the schema, prisma/sql and the baseline tenancy applied. The escape hatch
+ * points it at a THROWAWAY database and Redis that already have the schema; no address is guessed:
+ *   POSTGRES_TEST_URL=... REDIS_TEST_URL=... npx jest --config jest-int.config.cjs \
+ *     --runInBand src/core/telegram/services/update-dedupe.service.int.spec.ts
  */
 import { randomUUID } from 'node:crypto';
 
@@ -23,19 +25,14 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient, TenantStatus } from '@prisma/client';
 import { Redis } from 'ioredis';
 import { type Update } from 'grammy/types';
+
+import { startPostgres, stopPostgres } from '../../../../test/setup/postgres-container';
+import { startRedis, stopRedis } from '../../../../test/setup/redis-container';
 import { LockService } from '../../cache/lock.service';
 import { type RedisService } from '../../cache/redis.service';
 import { type PrismaService } from '../../prisma/prisma.service';
 import { telegramUpdateDedupeKey } from '../telegram.constants';
 import { UpdateDedupeService } from './update-dedupe.service';
-
-// No guessed default: localhost:55432 is also where a live cashier stack publishes Postgres on a
-// developer machine. The harness-wide escape hatch is honoured next to this suite's own names.
-const REDIS_URL = process.env.TEST_REDIS_URL ?? process.env.REDIS_TEST_URL ?? '';
-const DATABASE_URL = process.env.TEST_DATABASE_URL ?? process.env.POSTGRES_TEST_URL ?? '';
-if (REDIS_URL === '' || DATABASE_URL === '') {
-  throw new Error('Set POSTGRES_TEST_URL and REDIS_TEST_URL to a THROWAWAY database and Redis.');
-}
 
 const RUN = Date.now().toString(36);
 /** Every operator this suite creates starts with it, so a crashed run's leftovers are found. */
@@ -109,8 +106,9 @@ describe('UpdateDedupeService (integration, tenant-keyed)', () => {
     prisma.telegramUpdate.count({ where: { tenantId, updateId: BigInt(updateId) } });
 
   beforeAll(async () => {
-    prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: DATABASE_URL }) });
-    redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
+    const [postgres, redisHandle] = await Promise.all([startPostgres(), startRedis()]);
+    prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: postgres.url }) });
+    redis = new Redis(redisHandle.url, { maxRetriesPerRequest: null });
     await redis.ping();
 
     const locks = new LockService(redis as unknown as RedisService);
@@ -129,6 +127,7 @@ describe('UpdateDedupeService (integration, tenant-keyed)', () => {
     await removeSuiteOperators();
     await prisma.$disconnect();
     await redis.quit();
+    await Promise.all([stopPostgres(), stopRedis()]);
   });
 
   describe('tenant keying', () => {
