@@ -23,16 +23,19 @@
  * a one-minute cron would post twelve times an hour for the whole outage, which is how operators
  * learn to skim past alarms.
  *
- * ══ WHO IS TOLD ═══════════════════════════════════════════════════════════════════════════════
- * Every ACTIVE operator, in its own admin group, through its own bot. The agent API is shared today
- * (one session, one set of credentials), so its outage stops every operator's registrations and
- * credits at once, and the people who field the players' complaints are each operator's staff. The
- * dashboard's own notification model agrees: SYSTEM_ALERT is a category an OPERATOR's destinations
- * subscribe to (API-CONTRACT.md, "Telegram destinations"); there is no platform chat and no platform
- * bot. Each operator gets its own claim marker, so one whose bot or chat is broken is retried on the
- * next tick without re-alerting the operators that already heard, and the recovery is retired only
- * once no operator is still owed it. The pending-player counts in the recovery message are computed
- * inside each operator's context, so an operator sees its own players and nobody else's.
+ * ══ WHO IS TOLD, AND ABOUT WHAT ═══════════════════════════════════════════════════════════════
+ * Each ACTIVE operator, in its own admin group, through its own bot, about ITS OWN agent. Every
+ * operator calls Ichancy with its own agent, and IchancyHealthService keeps one breaker per operator,
+ * so this cron reads each operator's breaker and tells that operator only. With one shared breaker,
+ * one operator's failing agent sent its endpoint and error text to every other operator's staff, and
+ * told them their registrations had stopped when they had not. The dashboard's notification model
+ * agrees: SYSTEM_ALERT is a category an OPERATOR's destinations subscribe to (API-CONTRACT.md,
+ * "Telegram destinations"); there is no platform chat and no platform bot. Each operator has its own
+ * claim marker and its own recovery to retire, so one whose bot or chat is broken is retried on the
+ * next tick without touching anyone else. The pending-player counts in the recovery message are
+ * computed inside the operator's context, so an operator sees its own players and nobody else's.
+ *
+ * The steady state costs one HGETALL per ACTIVE operator per tick, and nothing else.
  *
  * ══ AN UNSET ADMIN CHAT IS NOT A FAILED SEND ══════════════════════════════════════════════════
  * `admin_chat_id = 0` is how the seed and the multi-tenant migration create an operator, and it can
@@ -142,43 +145,37 @@ export class IchancyHealthAlertCron {
 
   /** Exposed for the admin endpoint and for tests. */
   async announceIfChanged(): Promise<'posted' | 'quiet'> {
-    const snapshot = await this.health.snapshot();
-
-    // A steady UP with nothing ever having failed is the overwhelmingly common case; leave without
-    // touching Redis or Telegram.
-    if (snapshot.state === 'UP' && snapshot.recoveredAt === null) return 'quiet';
-
-    const anchor = snapshot.state === 'DOWN' ? snapshot.since : snapshot.recoveredAt;
-    if (anchor === null) return 'quiet';
-
+    // Only operators that are serving: a suspended operator's breaker is left pending, so it still
+    // hears about a transition that is current when it is activated again.
     const operators = await this.tenants.listActiveOperators();
-    if (operators.length === 0) {
-      // Nobody is taking money, so nobody is waiting on the agent API. Not an error, and the
-      // recovery is left pending, so an operator activated before it is retired still hears it.
-      this.logger.debug(`Ichancy is ${snapshot.state}, but there is no ACTIVE operator to tell`);
-      return 'quiet';
-    }
 
     let posted = 0;
-    let owed = 0;
     for (const operator of operators) {
+      const snapshot = await this.health.snapshot(operator.id);
+
+      // A steady UP with nothing ever having failed is the overwhelmingly common case; move on
+      // without touching Telegram or the markers.
+      if (snapshot.state === 'UP' && snapshot.recoveredAt === null) continue;
+
+      const anchor = snapshot.state === 'DOWN' ? snapshot.since : snapshot.recoveredAt;
+      if (anchor === null) continue;
+
       const outcome = await this.announceTo(operator.id, snapshot, anchor);
       if (outcome === 'posted') posted += 1;
-      if (outcome === 'owed') owed += 1;
-    }
 
-    if (snapshot.state === 'UP' && snapshot.recoveredAt !== null && owed === 0) {
-      // Retire the transition now that every operator with an admin chat has actually received it.
-      // The markers only stop a BURST — they expire after a day, while `recoveredAt` lived in the
-      // hash forever, so without this the same recovery was re-announced every 24 hours until the
-      // next outage. Deliberately AFTER the sends: an operator whose chat is unreachable, or whose
-      // message another replica is still sending, leaves it pending so the next tick looks again.
-      // An operator with no chat at all does not hold it up (see the header).
-      await this.health.acknowledgeRecovery(snapshot.recoveredAt);
+      if (snapshot.state === 'UP' && snapshot.recoveredAt !== null && outcome !== 'owed') {
+        // Retire this operator's transition now that its staff have actually received it. The
+        // markers only stop a BURST — they expire after a day, while `recoveredAt` lived in the
+        // hash forever, so without this the same recovery was re-announced every 24 hours until the
+        // next outage. Deliberately AFTER the send: an unreachable chat, or a message another
+        // replica is still sending, leaves it pending so the next tick looks again. An operator
+        // with no chat at all does not keep it pending (see the header).
+        await this.health.acknowledgeRecovery(operator.id, snapshot.recoveredAt);
+      }
     }
 
     if (posted === 0) return 'quiet';
-    this.logger.warn(`announced Ichancy ${snapshot.state} to ${posted} operator admin group(s)`);
+    this.logger.warn(`announced an Ichancy state change to ${posted} operator admin group(s)`);
     return 'posted';
   }
 

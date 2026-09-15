@@ -609,7 +609,9 @@ describe('feature modules (integration)', () => {
     });
 
     itInTenant('persists the link and encrypts the password at rest', async () => {
-      const row = await prisma.player.findUniqueOrThrow({ where: { id: playerId } });
+      const row = await prisma.player.findUniqueOrThrow({
+        where: { id: playerId, tenantId: TENANT_BOOTSTRAP_ID },
+      });
 
       expect(row.ichancyPlayerId).toBeTruthy();
       // The Telegram id is the readable half so the agent can find the row in their own panel; the
@@ -648,7 +650,9 @@ describe('feature modules (integration)', () => {
         fakeIchancy.setMode('ok');
 
         // Nothing half-written: an unknown outcome must leave the row untouched.
-        const row = await prisma.player.findUniqueOrThrow({ where: { id: other } });
+        const row = await prisma.player.findUniqueOrThrow({
+          where: { id: other, tenantId: TENANT_BOOTSTRAP_ID },
+        });
         expect(row.ichancyPlayerId).toBeNull();
         expect(row.ichancyPasswordEnc).toBeNull();
       },
@@ -660,7 +664,9 @@ describe('feature modules (integration)', () => {
 
       // The exclusion belongs to the same operator as the player it excludes; taking the tenant off
       // the row rather than naming a constant keeps the fixture honest if the sign-in tenant moves.
-      const { tenantId } = await prisma.player.findUniqueOrThrow({ where: { id: playerId } });
+      const { tenantId } = await prisma.player.findUniqueOrThrow({
+        where: { id: playerId, tenantId: TENANT_BOOTSTRAP_ID },
+      });
       const exclusion = await prisma.selfExclusion.create({
         data: {
           tenantId,
@@ -678,7 +684,7 @@ describe('feature modules (integration)', () => {
         reason: 'PLAYER_SELF_EXCLUDED',
       });
 
-      await prisma.selfExclusion.delete({ where: { id: exclusion.id } });
+      await prisma.selfExclusion.delete({ where: { id: exclusion.id, tenantId } });
     });
   });
 

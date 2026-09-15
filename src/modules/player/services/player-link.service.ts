@@ -78,7 +78,7 @@ export class PlayerLinkService implements PlayerLinkPort {
 
   /** Fast path for callers that only want to know, without ever creating anything. */
   async findIchancyPlayerId(playerId: string): Promise<string | null> {
-    const player = await this.players.findById(playerId);
+    const player = await this.players.findByIdInTenant(requireEffectiveTenantId(), playerId);
     return player?.ichancyPlayerId ?? null;
   }
 
@@ -86,7 +86,9 @@ export class PlayerLinkService implements PlayerLinkPort {
     playerId: string,
     correlationId?: string | null,
   ): Promise<LinkedIchancyAccount> {
-    const player = await this.players.findById(playerId);
+    // In the operator in context — the one whose agent would register the account. Another
+    // operator's player is PLAYER_NOT_FOUND here, before a lock is taken or anything is sent.
+    const player = await this.players.findByIdInTenant(requireEffectiveTenantId(), playerId);
     if (player === null) {
       throw new NotFoundError(PlayerErrorCodes.PLAYER_NOT_FOUND, 'Player not found.');
     }
@@ -110,7 +112,7 @@ export class PlayerLinkService implements PlayerLinkPort {
 
     try {
       // Re-read INSIDE the lock: the holder we queued behind has very likely just linked us.
-      const fresh = await this.players.findById(playerId);
+      const fresh = await this.players.findByIdInTenant(player.tenantId, playerId);
       if (fresh === null) {
         throw new NotFoundError(PlayerErrorCodes.PLAYER_NOT_FOUND, 'Player not found.');
       }
@@ -260,7 +262,7 @@ export class PlayerLinkService implements PlayerLinkPort {
     this.logger.warn(
       `Player ${player.id} was linked concurrently; keeping the stored Ichancy id over ${ichancyPlayerId}`,
     );
-    const winner = await this.players.findById(player.id);
+    const winner = await this.players.findByIdInTenant(player.tenantId, player.id);
     const linked = winner === null ? null : this.asLinked(winner, false);
     if (linked === null) {
       throw new ServiceUnavailableError(

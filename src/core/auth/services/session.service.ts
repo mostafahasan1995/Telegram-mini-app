@@ -29,6 +29,7 @@ import { CommonErrorCodes } from '@common/exceptions/error-codes';
 import { type AuthenticatedAdmin } from '@common/decorators/auth.types';
 import { AppConfigService } from '../../config/config.service';
 import { PrismaService } from '../../prisma/prisma.service';
+import { acrossTenants } from '../../prisma/tenant-scope.extension';
 import { LockService } from '../../cache/lock.service';
 import { RedisService } from '../../cache/redis.service';
 import {
@@ -159,7 +160,10 @@ export class SessionService {
 
     const presentedHash = sha256Hex(rawRefreshToken);
     const existing = await this.prisma.playerSession.findUnique({
-      where: { refreshTokenHash: presentedHash },
+      // Before any operator is known, deliberately: a refresh arrives with no access token, so no
+      // tenant context exists, and the hash of a 256-bit secret is what identifies the session. The
+      // row's own tenantId is what the new token is then signed with.
+      where: acrossTenants({ refreshTokenHash: presentedHash }),
       select: {
         id: true,
         tenantId: true,

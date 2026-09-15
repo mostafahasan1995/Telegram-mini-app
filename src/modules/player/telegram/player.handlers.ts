@@ -543,7 +543,7 @@ export class PlayerTelegramHandlers {
    * strings nobody can retype from memory.
    */
   private async credentialLines(playerId: string): Promise<string[]> {
-    const player = await this.playerRepo.findById(playerId);
+    const player = await this.playerRepo.findByIdInTenant(botTenantId(), playerId);
     if (player === null) return [];
 
     let credentials: { login: string; password: string };

@@ -57,7 +57,7 @@ const HANDLE = {
 
 interface Harness {
   readonly service: PlayerLinkService;
-  readonly findById: jest.Mock;
+  readonly findByIdInTenant: jest.Mock;
   readonly linkIchancyAccount: jest.Mock;
   readonly ensurePlayer: jest.Mock;
   readonly acquire: jest.Mock;
@@ -67,7 +67,7 @@ interface Harness {
 
 function build(
   options: {
-    /** Successive findById answers, in call order. The LAST one repeats. */
+    /** Successive findByIdInTenant answers, in call order. The LAST one repeats. */
     rows?: Record<string, unknown>[];
     lockHeldByAnotherCaller?: boolean;
     linkWins?: boolean;
@@ -77,14 +77,16 @@ function build(
 ): Harness {
   const rows = options.rows ?? [playerRow()];
   let call = 0;
-  const findById = jest.fn(() => {
+  // Honours the tenant the way the real `{ id, tenantId }` selector does: another operator's player
+  // is simply not there.
+  const findByIdInTenant = jest.fn((tenantId: string) => {
     const row = rows[Math.min(call, rows.length - 1)];
     call += 1;
-    return Promise.resolve(row ?? null);
+    return Promise.resolve(row !== undefined && row['tenantId'] === tenantId ? row : null);
   });
 
   const linkIchancyAccount = jest.fn().mockResolvedValue(options.linkWins ?? true);
-  const players = { findById, linkIchancyAccount } as unknown as PlayerRepository;
+  const players = { findByIdInTenant, linkIchancyAccount } as unknown as PlayerRepository;
 
   const prisma = {
     runInTransaction: jest.fn((fn: (tx: unknown) => Promise<unknown>) => fn({})),
@@ -114,7 +116,7 @@ function build(
   const raw = service.ensureLinked.bind(service);
   service.ensureLinked = (playerId, correlationId) =>
     runWithTenant(options.tenantInContext ?? TENANT_ID, () => raw(playerId, correlationId));
-  return { service, findById, linkIchancyAccount, ensurePlayer, acquire, release, auditWrite };
+  return { service, findByIdInTenant, linkIchancyAccount, ensurePlayer, acquire, release, auditWrite };
 }
 
 describe('PlayerLinkService — the lock around a non-idempotent registration', () => {
@@ -154,7 +156,8 @@ describe('PlayerLinkService — the lock around a non-idempotent registration', 
     expect(h.ensurePlayer).not.toHaveBeenCalled();
     expect(link.ichancyPlayerId).toBe(ICHANCY_ID);
     // Two reads: one before the lock, one after taking it. The second is the load-bearing one.
-    expect(h.findById).toHaveBeenCalledTimes(2);
+    expect(h.findByIdInTenant).toHaveBeenCalledTimes(2);
+    expect(h.findByIdInTenant.mock.calls.map((args) => args[0] as string)).toEqual([TENANT_ID, TENANT_ID]);
     expect(h.release).toHaveBeenCalledTimes(1);
   });
 
@@ -287,20 +290,28 @@ describe('PlayerLinkService — what gets persisted, and when', () => {
 describe("PlayerLinkService — only ever under the player's own operator", () => {
   it("sends NOTHING when the operator in context is not the player's", async () => {
     // The port registers under the agent of the operator in context. A player of operator A linked
-    // while operator B is in context would be minted under B's agent, with no way to delete it.
+    // while operator B is in context would be minted under B's agent, with no way to delete it. The
+    // lookup itself is pinned to the operator in context, so that player is not found at all —
+    // before a lock is taken or anything is sent.
     const h = build({ tenantInContext: OTHER_TENANT_ID });
 
-    await expect(h.service.ensureLinked(PLAYER_ID)).rejects.toThrow(/never registered under another operator/);
+    await expect(h.service.ensureLinked(PLAYER_ID)).rejects.toMatchObject({
+      errorCode: PlayerErrorCodes.PLAYER_NOT_FOUND,
+    });
+    expect(h.findByIdInTenant).toHaveBeenCalledWith(OTHER_TENANT_ID, PLAYER_ID);
+    expect(h.acquire).not.toHaveBeenCalled();
     expect(h.ensurePlayer).not.toHaveBeenCalled();
     expect(h.linkIchancyAccount).not.toHaveBeenCalled();
-    expect(h.release).toHaveBeenCalledWith(HANDLE);
   });
 
   it('sends NOTHING with no operator in context at all', async () => {
     const h = build();
     const service = new PlayerLinkService(
       { runInTransaction: jest.fn() } as unknown as PrismaService,
-      { findById: h.findById, linkIchancyAccount: h.linkIchancyAccount } as unknown as PlayerRepository,
+      {
+        findByIdInTenant: h.findByIdInTenant,
+        linkIchancyAccount: h.linkIchancyAccount,
+      } as unknown as PlayerRepository,
       { acquire: h.acquire, release: h.release } as unknown as LockService,
       { write: h.auditWrite } as unknown as AuditService,
       {

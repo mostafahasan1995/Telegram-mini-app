@@ -22,6 +22,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { type Update } from 'grammy/types';
 import { PrismaService } from '../../prisma/prisma.service';
+import { acrossTenants } from '../../prisma/tenant-scope.extension';
 import { LockService } from '../../cache/lock.service';
 import { TELEGRAM_UPDATE_DEDUPE_TTL_SECONDS, telegramUpdateDedupeKey } from '../telegram.constants';
 import { type RecordedUpdate, type TelegramUpdateKind } from '../telegram.types';
@@ -155,10 +156,16 @@ export class UpdateDedupeService {
       .catch(() => undefined);
   }
 
-  /** Marks an update as handled. Called by the worker after `bot.handleUpdate()` returns. */
+  /**
+   * Marks an update as handled. Called by the worker after `bot.handleUpdate()` returns.
+   *
+   * WHY `acrossTenants` on this and markFailed: the row id is the one `record()` wrote and the job
+   * carried, never a client's, and markFailed must also work for a job that arrived with no tenant
+   * at all — so there is no operator to pin it to that the id does not already identify.
+   */
   async markProcessed(updateRowId: string, handler?: string): Promise<void> {
     await this.prisma.telegramUpdate.update({
-      where: { id: updateRowId },
+      where: acrossTenants({ id: updateRowId }),
       data: { processedAt: new Date(), handler: handler ?? null, processingError: null },
     });
   }
@@ -170,7 +177,7 @@ export class UpdateDedupeService {
   async markFailed(updateRowId: string, error: unknown): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     await this.prisma.telegramUpdate.update({
-      where: { id: updateRowId },
+      where: acrossTenants({ id: updateRowId }),
       // Truncated: a Postgres error can carry a whole query, and this column is read in a UI.
       data: { processingError: message.slice(0, 2_000) },
     });

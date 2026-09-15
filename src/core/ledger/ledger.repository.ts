@@ -219,7 +219,8 @@ export class LedgerRepository {
     const cachedAt = new Date();
     for (const [accountId, balance] of finalBalances) {
       await tx.ledgerAccount.update({
-        where: { id: accountId },
+        // The posting's own tenant: computeBalances resolved every account in it.
+        where: { id: accountId, tenantId: created.tenantId },
         data: { cachedBalanceMinor: balance, cachedAt },
       });
     }
@@ -319,7 +320,9 @@ export class LedgerRepository {
     }
 
     const original = await tx.ledgerTransaction.findUnique({
-      where: { id: existing.resultRef },
+      // The same operator the idempotency key was found in: a replay can only ever return a
+      // transaction of the operator that posted it.
+      where: { id: existing.resultRef, tenantId },
       select: {
         id: true,
         kind: true,

@@ -160,7 +160,7 @@ describe('IchancyHealthAlertCron', () => {
     await cron.tick();
 
     expect(notifyAdmins).toHaveBeenCalledTimes(2);
-    expect(acknowledgeRecovery).toHaveBeenCalledWith(RECOVERED_AT);
+    expect(acknowledgeRecovery).toHaveBeenCalledWith(OPERATOR_A.id, RECOVERED_AT);
   });
 
   it('says nothing at all in the steady state', async () => {
@@ -237,6 +237,25 @@ describe('IchancyHealthAlertCron', () => {
   });
 
   describe('every ACTIVE operator', () => {
+    it("reads each operator's own breaker and tells only the operator whose state changed", async () => {
+      // One shared breaker sent operator A's failing endpoint and error text to operator B's staff,
+      // and told them their registrations had stopped when they had not.
+      const { cron, snapshot, notifyAdmins } = build({ operators: [OPERATOR_A, OPERATOR_B] });
+      snapshot.mockImplementation((tenantId: string) =>
+        Promise.resolve(tenantId === OPERATOR_A.id ? DOWN : STEADY_UP),
+      );
+
+      await cron.tick();
+
+      expect((snapshot.mock.calls as unknown[][]).map((call) => call[0])).toEqual([
+        OPERATOR_A.id,
+        OPERATOR_B.id,
+      ]);
+      expect((notifyAdmins.mock.calls as unknown[][]).map((call) => call[0])).toEqual([
+        OPERATOR_A.id,
+      ]);
+    });
+
     it('tells each operator once, through its own bot', async () => {
       const { cron, snapshot, notifyAdmins } = build({ operators: [OPERATOR_A, OPERATOR_B] });
       snapshot.mockResolvedValue(DOWN);
@@ -287,7 +306,7 @@ describe('IchancyHealthAlertCron', () => {
       );
     });
 
-    it('retires the recovery only once no operator is still owed it', async () => {
+    it("retires each operator's recovery only once that operator has been told", async () => {
       const { cron, snapshot, notifyAdmins, acknowledgeRecovery } = build({
         operators: [OPERATOR_A, OPERATOR_B],
       });
@@ -299,10 +318,11 @@ describe('IchancyHealthAlertCron', () => {
       );
 
       await cron.tick();
-      expect(acknowledgeRecovery).not.toHaveBeenCalled();
+      expect(acknowledgeRecovery).toHaveBeenCalledWith(OPERATOR_A.id, RECOVERED_AT);
+      expect(acknowledgeRecovery).not.toHaveBeenCalledWith(OPERATOR_B.id, RECOVERED_AT);
 
       await cron.tick();
-      expect(acknowledgeRecovery).toHaveBeenCalledTimes(1);
+      expect(acknowledgeRecovery).toHaveBeenCalledWith(OPERATOR_B.id, RECOVERED_AT);
     });
 
     it('counts pending players inside each operator’s own context', async () => {
@@ -364,7 +384,7 @@ describe('IchancyHealthAlertCron', () => {
       expect((notifyAdmins.mock.calls as unknown[][]).map((call) => call[0])).toEqual([
         OPERATOR_B.id,
       ]);
-      expect(acknowledgeRecovery).toHaveBeenCalledWith(RECOVERED_AT);
+      expect(acknowledgeRecovery).toHaveBeenCalledWith(OPERATOR_B.id, RECOVERED_AT);
       expect(redis.keys.has(markerOf(OPERATOR_A, RECOVERED))).toBe(false);
     });
 
@@ -435,7 +455,7 @@ describe('IchancyHealthAlertCron', () => {
       redis.keys.set(markerOf(OPERATOR_A, RECOVERED), 'sent');
       await cron.tick();
       expect(notifyAdmins).not.toHaveBeenCalled();
-      expect(acknowledgeRecovery).toHaveBeenCalledWith(RECOVERED_AT);
+      expect(acknowledgeRecovery).toHaveBeenCalledWith(OPERATOR_A.id, RECOVERED_AT);
     });
 
     it('tells the operator itself when the other replica’s send failed and released the claim', async () => {

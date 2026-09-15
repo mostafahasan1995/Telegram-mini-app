@@ -48,6 +48,9 @@ const TIMED_OUT: IchancyClassification = {
 
 const OK: IchancyClassification = { outcome: 'ok' };
 
+/** The one operator whose agent the simulated calls are made as, and whose admin group is told. */
+const OPERATOR = '11111111-1111-4111-8111-111111111111';
+
 /**
  * Hashes and strings, with EXPIRY, because the 24-hour re-announce defect is only visible once a
  * marker is allowed to die. Time is the caller's `now()`, so a test can skip a day in one line.
@@ -159,9 +162,7 @@ function build(): Harness {
     redis as unknown as RedisService,
     { player: { count: jest.fn().mockResolvedValue(0) } } as unknown as PrismaService,
     {
-      listActiveOperators: jest
-        .fn()
-        .mockResolvedValue([{ id: '11111111-1111-4111-8111-111111111111', slug: 'alpha' }]),
+      listActiveOperators: jest.fn().mockResolvedValue([{ id: OPERATOR, slug: 'alpha' }]),
     } as unknown as TenantRegistryService,
     config,
   );
@@ -173,7 +174,7 @@ function build(): Harness {
       jest.setSystemTime(Date.now() + ms);
     },
     call: (classification: IchancyClassification): Promise<void> =>
-      health.record('registerPlayer', classification),
+      health.record(OPERATOR, 'registerPlayer', classification),
     tick: (): Promise<void> => cron.tick(),
   };
 }
@@ -287,7 +288,7 @@ describe('Ichancy outage lifecycle (real breaker + real alarm)', () => {
 
     expect(h.posts).toHaveLength(1);
     // The breaker never re-closed on its own: only an ANSWERED call may do that.
-    expect(await h.health.isDown()).toBe(true);
+    expect(await h.health.isDown(OPERATOR)).toBe(true);
   });
 
   it('names the CURRENT failure kind even though the alarm was raised for the previous one', async () => {
@@ -297,7 +298,7 @@ describe('Ichancy outage lifecycle (real breaker + real alarm)', () => {
     await h.tick();
     await h.call(TIMED_OUT);
 
-    const snapshot = await h.health.snapshot();
+    const snapshot = await h.health.snapshot(OPERATOR);
     expect(snapshot.state).toBe('DOWN');
     expect(snapshot.kind).toBe('TIMEOUT');
   });

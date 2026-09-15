@@ -22,6 +22,7 @@ import { AuditService } from '@core/audit/audit.service';
 import { holdsAnyRole } from '@core/auth/admin-authority';
 import { OutboxService } from '@core/outbox/outbox.service';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 import { DEPOSIT_AGGREGATE, DEPOSIT_TOPICS } from '../deposit.constants';
 import { DepositStateMachine } from '../deposit-state.machine';
@@ -62,7 +63,13 @@ export class DepositRetryService {
     }
 
     return this.prisma.runInTransaction(async (tx) => {
-      const deposit = await this.deposits.findById(tx, input.depositRequestId);
+      // Pinned BEFORE the status and amount checks below: their errors carry the status, and another
+      // operator's deposit must answer like a missing one rather than describe itself.
+      const deposit = await this.deposits.findByIdInTenant(
+        tx,
+        requireEffectiveTenantId(),
+        input.depositRequestId,
+      );
       if (deposit === null) {
         throw new NotFoundError(DepositErrorCodes.DEPOSIT_NOT_FOUND, 'Deposit not found.');
       }

@@ -13,6 +13,7 @@ import type { Prisma } from '@prisma/client';
 import { PrismaService } from '@core/prisma/prisma.service';
 import type { Tx } from '@core/prisma/tx.type';
 import { AuditService } from '@core/audit/audit.service';
+import { requireEffectiveTenantId } from '@core/tenant/tenant.storage';
 import { BusinessRuleError, NotFoundError } from '@common/exceptions/app.exception';
 import { paginate, type PaginatedResult } from '@common/dtos/paginated.dto';
 
@@ -55,7 +56,7 @@ export class PlayerService {
   }
 
   async getOwnView(playerId: string): Promise<PlayerView> {
-    const player = await this.players.findById(playerId);
+    const player = await this.players.findByIdInTenant(requireEffectiveTenantId(), playerId);
     if (player === null) {
       throw new NotFoundError(PlayerErrorCodes.PLAYER_NOT_FOUND, 'Player not found.');
     }
@@ -142,7 +143,8 @@ export class PlayerService {
     const client: Tx = tx ?? this.prisma;
 
     const player = await client.player.findUnique({
-      where: { id: playerId },
+      // The operator being served (the player's session, or the bot the update came through).
+      where: { id: playerId, tenantId: requireEffectiveTenantId() },
       select: { status: true },
     });
     if (player === null) {

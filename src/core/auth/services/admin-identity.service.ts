@@ -122,10 +122,10 @@ export class AdminIdentityService {
       adminIdentityByIdKey(tenantId, adminUserId),
       ADMIN_IDENTITY_TTL_SECONDS,
       async () => {
-        // findUnique by primary key is not rewritten by the tenant-scope extension, so the tenant
-        // is compared here explicitly rather than trusted to an ambient filter.
+        // The HOME tenant is in the selector, so a token whose `sub` belongs to another operator
+        // finds nothing; the comparison below is kept as a second check on the row itself.
         const row = await this.prisma.adminUser.findUnique({
-          where: { id: adminUserId },
+          where: { id: adminUserId, tenantId },
           select: IDENTITY_SELECT,
         });
         return toCached(row !== null && row.tenantId === tenantId ? row : null);

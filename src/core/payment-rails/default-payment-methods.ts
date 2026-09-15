@@ -210,6 +210,9 @@ export async function ensurePaymentMethods(
 
     await db.paymentDestination.upsert({
       where: {
+        // The key below is not tenant-scoped on its own; naming the tenant keeps this upsert from
+        // ever matching a row of another operator.
+        tenantId,
         paymentMethodId_accountIdentifier: {
           paymentMethodId: method.id,
           accountIdentifier: spec.destination.accountIdentifier,

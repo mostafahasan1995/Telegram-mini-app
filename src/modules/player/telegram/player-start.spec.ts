@@ -90,7 +90,7 @@ function harness(
   const handlers = new PlayerTelegramHandlers(
     prisma as never,
     { upsertFromTelegram } as never,
-    { findById: jest.fn().mockResolvedValue({ id: PLAYER_ID }) } as never,
+    { findByIdInTenant: jest.fn().mockResolvedValue({ id: PLAYER_ID }) } as never,
     { ensureLinked, credentialsFor } as never,
     {
       bindFromStartPayload: jest.fn().mockResolvedValue({ outcome: 'IGNORED_NO_PAYLOAD' }),
@@ -324,7 +324,7 @@ describe('👤 حسابي shows an existing account its sign-in details', () => 
       } as never,
       {
         findByTelegramUserId: jest.fn().mockResolvedValue(player),
-        findById: jest.fn().mockResolvedValue(player),
+        findByIdInTenant: jest.fn().mockResolvedValue(player),
       } as never,
       {
         credentialsFor: jest.fn().mockReturnValue({

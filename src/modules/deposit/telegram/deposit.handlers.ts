@@ -292,7 +292,14 @@ export class DepositTelegramHandlers {
     const message = ctx.callbackQuery?.message;
     if (message === undefined) return;
 
-    const deposit = await this.deposits.findByIdWithContext(this.prisma, depositRequestId);
+    // The operator whose bot received the tap. A button naming another operator's deposit — an
+    // operator owns its bot token and can post any callback data it likes — finds nothing here and
+    // the card is left alone, rather than being redrawn with that operator's deposit on it.
+    const deposit = await this.deposits.findByIdWithContextInTenant(
+      this.prisma,
+      requireEffectiveTenantId(),
+      depositRequestId,
+    );
     if (deposit === null) return;
 
     const riskFlags = await this.depositService.riskFlagsFor(this.prisma, deposit.id);
@@ -300,7 +307,7 @@ export class DepositTelegramHandlers {
       deposit.decidedByAdminId === null
         ? null
         : await this.prisma.adminUser.findUnique({
-            where: { id: deposit.decidedByAdminId },
+            where: { id: deposit.decidedByAdminId, tenantId: deposit.tenantId },
             select: { displayName: true },
           });
 
@@ -325,7 +332,7 @@ export class DepositTelegramHandlers {
     // Keep the stored coordinates fresh: an admin may be acting on a card posted before a restart,
     // or on one the notifier has never seen (a manually forwarded message).
     if (deposit.adminMessageId === null) {
-      await this.deposits.recordAdminCard(this.prisma, deposit.id, {
+      await this.deposits.recordAdminCard(this.prisma, deposit.tenantId, deposit.id, {
         chatId: BigInt(message.chat.id),
         messageId: BigInt(message.message_id),
         threadId: null,

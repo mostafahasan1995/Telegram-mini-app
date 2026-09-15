@@ -80,14 +80,17 @@ export class ProofIngestService {
   ) {}
 
   async ingest(depositProofId: string): Promise<IngestOutcome> {
-    const proof = await this.deposits.findProof(this.prisma, depositProofId);
+    // The one lookup that cannot name a tenant: the job carries a proof id our own outbox wrote and
+    // nothing else, and this row is what says whose it is. See findProofForWorker.
+    const proof = await this.deposits.findProofForWorker(this.prisma, depositProofId);
     if (proof === null) {
       this.logger.warn(`proof ${depositProofId} vanished before ingestion`);
       return { proofId: depositProofId, status: 'missing', riskFlags: [] };
     }
 
     const deposit = await this.prisma.depositRequest.findUniqueOrThrow({
-      where: { id: proof.depositRequestId },
+      // The proof's own tenant, so a proof row can only ever lead to a deposit of its operator.
+      where: { id: proof.depositRequestId, tenantId: proof.tenantId },
       select: { id: true, tenantId: true, playerId: true, shortId: true },
     });
 
@@ -127,6 +130,7 @@ export class ProofIngestService {
 
     const riskFlags = await this.prisma.runInTransaction(async (tx) => {
       const report = await this.duplicates.findDuplicates(tx, {
+        tenantId: deposit.tenantId,
         proofId: proof.id,
         depositRequestId: deposit.id,
         playerId: deposit.playerId,
@@ -162,7 +166,7 @@ export class ProofIngestService {
           fromStatus: null,
           toStatus: (
             await tx.depositRequest.findUniqueOrThrow({
-              where: { id: deposit.id },
+              where: { id: deposit.id, tenantId: deposit.tenantId },
               select: { status: true },
             })
           ).status,
@@ -200,6 +204,7 @@ export class ProofIngestService {
     });
 
     await this.duplicates.index({
+      tenantId: deposit.tenantId,
       proofId: proof.id,
       depositRequestId: deposit.id,
       playerId: deposit.playerId,
@@ -239,14 +244,14 @@ export class ProofIngestService {
     },
   ): Promise<void> {
     try {
-      await this.deposits.updateProof(tx, proof.id, patch);
+      await this.deposits.updateProofInTenant(tx, proof.tenantId, proof.id, patch);
     } catch (cause) {
       const mapped = mapPrismaError(cause, { model: 'DepositProof', operation: 'update' });
       if (!isUniqueConstraintError(mapped)) throw mapped;
       this.logger.log(
         `proof ${proof.id} normalizes to a hash already on deposit ${proof.depositRequestId}; keeping one copy`,
       );
-      await tx.depositProof.delete({ where: { id: proof.id } });
+      await tx.depositProof.delete({ where: { id: proof.id, tenantId: proof.tenantId } });
     }
   }
 
@@ -254,6 +259,7 @@ export class ProofIngestService {
     const perceptualHash = await this.perceptualHashFromTransitions(proof);
     if (perceptualHash === null) return;
     await this.duplicates.index({
+      tenantId: proof.tenantId,
       proofId: proof.id,
       depositRequestId: proof.depositRequestId,
       playerId,
@@ -300,7 +306,7 @@ export class ProofIngestService {
 
     await this.prisma.runInTransaction(async (tx) => {
       const current = await tx.depositRequest.findUniqueOrThrow({
-        where: { id: deposit.id },
+        where: { id: deposit.id, tenantId: deposit.tenantId },
         select: { status: true },
       });
       await tx.depositTransition.create({

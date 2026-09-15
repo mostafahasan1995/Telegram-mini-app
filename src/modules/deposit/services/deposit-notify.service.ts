@@ -25,6 +25,7 @@ import { AppConfigService } from '@core/config/config.service';
 import { IdempotencyService } from '@core/idempotency/idempotency.service';
 import { BALANCE_SNAPSHOT_METADATA_KEY, ichancyAgentFloatCode } from '@core/ledger';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { acrossTenants } from '@core/prisma/tenant-scope.extension';
 import { BotService } from '@core/telegram/services/bot.service';
 import { requireEffectiveTenantId } from '@core/tenant';
 
@@ -60,7 +61,9 @@ export class DepositNotifyService {
    * outbox delivers at least once and a redelivery must not produce a second card.
    */
   async postOrUpdateAdminCard(depositRequestId: string, reason: string): Promise<void> {
-    const deposit = await this.deposits.findByIdWithContext(this.prisma, depositRequestId);
+    // The telegram queue has no tenant context and its job carries only an id our own outbox wrote;
+    // the row is what names the operator. Everything after this line is pinned to deposit.tenantId.
+    const deposit = await this.deposits.findByIdWithContextForWorker(this.prisma, depositRequestId);
     if (deposit === null) {
       this.logger.warn(`admin card requested for unknown deposit ${depositRequestId}`);
       return;
@@ -71,7 +74,7 @@ export class DepositNotifyService {
       deposit.decidedByAdminId === null
         ? null
         : await this.prisma.adminUser.findUnique({
-            where: { id: deposit.decidedByAdminId },
+            where: { id: deposit.decidedByAdminId, tenantId: deposit.tenantId },
             select: { displayName: true },
           });
 
@@ -115,7 +118,7 @@ export class DepositNotifyService {
       return;
     }
 
-    await this.deposits.recordAdminCard(this.prisma, deposit.id, {
+    await this.deposits.recordAdminCard(this.prisma, deposit.tenantId, deposit.id, {
       chatId: BigInt(message.chat.id),
       messageId: BigInt(message.message_id),
       threadId: message.message_thread_id === undefined ? null : BigInt(message.message_thread_id),
@@ -144,7 +147,10 @@ export class DepositNotifyService {
    */
   async postCreditedOpsCard(depositRequestId: string): Promise<void> {
     const deposit = await this.prisma.depositRequest.findUnique({
-      where: { id: depositRequestId },
+      // Runs inside the outbox dispatcher, which entered the outbox row's own tenant — the operator
+      // whose credit committed that row. Pinned to it, so the card can only ever describe a deposit
+      // of the operator whose bot and admin chat it is posted through.
+      where: { id: depositRequestId, tenantId: requireEffectiveTenantId() },
       select: {
         id: true,
         tenantId: true,
@@ -170,7 +176,7 @@ export class DepositNotifyService {
     }
 
     const t2 = await this.prisma.ledgerTransaction.findUnique({
-      where: { id: deposit.ledgerCreditTxId },
+      where: { id: deposit.ledgerCreditTxId, tenantId: deposit.tenantId },
       select: { metadata: true, postedAt: true },
     });
     const snapshot = agentFloatSnapshot(
@@ -355,7 +361,10 @@ export class DepositNotifyService {
     params: Readonly<Record<string, string>>,
   ): Promise<void> {
     const player = await this.prisma.player.findUnique({
-      where: { id: playerId },
+      // The telegram queue again: no tenant context, and a player id our own outbox wrote. The row's
+      // tenant is what picks the bot below, so the message can only go out through the operator the
+      // player belongs to.
+      where: acrossTenants({ id: playerId }),
       select: { tenantId: true, telegramUserId: true },
     });
     if (player === null) {

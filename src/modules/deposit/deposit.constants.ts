@@ -126,11 +126,21 @@ export const PROOF_DUPLICATE_WINDOW_MS = PROOF_DUPLICATE_WINDOW_DAYS * 24 * 60 *
 export const PROOF_DUPLICATE_MAX_DISTANCE = 6;
 export const PROOF_HASH_BAND_COUNT = 8;
 
-/** Redis key for one band of the perceptual index. */
-export const proofBandKey = (band: string): string => `proof:phash:band:${band}`;
+/**
+ * Redis key for one band of ONE OPERATOR's perceptual index.
+ *
+ * The tenant is in the key because a duplicate is only a duplicate within an operator. With one
+ * shared index, operator A's ingest matched operator B's receipts: A's deposit got a duplicate-proof
+ * flag on B's evidence, and B's deposit and player ids were stored in A's transition metadata.
+ * Untenanted keys written before this change are simply never read again and expire with the
+ * 180-day window.
+ */
+export const proofBandKey = (tenantId: string, band: string): string =>
+  `proof:phash:${tenantId}:band:${band}`;
 
-/** Redis key holding the full record of one indexed proof. */
-export const proofRecordKey = (proofId: string): string => `proof:phash:rec:${proofId}`;
+/** Redis key holding the full record of one indexed proof, in its operator's index. */
+export const proofRecordKey = (tenantId: string, proofId: string): string =>
+  `proof:phash:${tenantId}:rec:${proofId}`;
 
 /** Presigned proof URLs are bearer credentials for a document identifying a real person. */
 export const PROOF_URL_TTL_SECONDS = 300;

@@ -35,13 +35,18 @@ import {
 
 interface Candidate {
   id: string;
+  tenantId: string;
   telegramUserId: bigint;
   ichancyLinkAttempts: number;
 }
 
+const OPERATOR_A = '11111111-1111-4111-8111-111111111111';
+const OPERATOR_B = '22222222-2222-4222-8222-222222222222';
+
 /** The stranded player from the live incident, minus the parts the selector does not read. */
 const STRANDED: Candidate = {
   id: 'player-hasan',
+  tenantId: OPERATOR_A,
   telegramUserId: 1_743_150_171n,
   ichancyLinkAttempts: 0,
 };
@@ -56,7 +61,9 @@ interface Harness {
   writes: { where: Record<string, unknown>; data: Record<string, unknown> }[];
 }
 
-function build(options: { candidates?: Candidate[]; down?: boolean; fake?: boolean } = {}): Harness {
+function build(
+  options: { candidates?: Candidate[]; down?: boolean | readonly string[]; fake?: boolean } = {},
+): Harness {
   const writes: Harness['writes'] = [];
 
   const findMany = jest.fn().mockResolvedValue(options.candidates ?? []);
@@ -74,7 +81,11 @@ function build(options: { candidates?: Candidate[]; down?: boolean; fake?: boole
   });
   const links = { ensureLinked } as unknown as PlayerLinkService;
 
-  const isDown = jest.fn().mockResolvedValue(options.down ?? false);
+  // `true` means every operator's breaker is DOWN; a list names the operators that are.
+  const down = options.down ?? false;
+  const isDown = jest.fn((tenantId: string) =>
+    Promise.resolve(typeof down === 'boolean' ? down : down.includes(tenantId)),
+  );
   const health = { isDown } as unknown as IchancyHealthService;
 
   const config = {
@@ -221,9 +232,22 @@ describe('PlayerLinkBackfillService — never double-registering', () => {
     const result = await harness.service.runOnce();
 
     expect(result.skipped).toBe('ichancy-down');
-    expect(harness.findMany).not.toHaveBeenCalled();
+    expect(harness.isDown).toHaveBeenCalledWith(STRANDED.tenantId);
     expect(harness.ensureLinked).not.toHaveBeenCalled();
     expect(harness.writes).toHaveLength(0);
+  });
+
+  it("asks each operator's own breaker: one operator's outage does not strand another's players", async () => {
+    // One shared verdict let operator A's blocked agent pause the rescue of operator B's players.
+    const playerOfB: Candidate = { ...STRANDED, id: 'player-of-b', tenantId: OPERATOR_B };
+    const harness = build({ candidates: [STRANDED, playerOfB], down: [OPERATOR_A] });
+
+    const result = await harness.service.runOnce();
+
+    expect(result.skipped).toBeNull();
+    expect(harness.ensureLinked).toHaveBeenCalledTimes(1);
+    expect(harness.ensureLinked).toHaveBeenCalledWith(playerOfB.id, PLAYER_LINK_BACKFILL_CORRELATION);
+    expect(result).toMatchObject({ scanned: 1, linked: 1 });
   });
 
   it('is inert against the fake adapter', async () => {

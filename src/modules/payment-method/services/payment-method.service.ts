@@ -87,7 +87,9 @@ export class PaymentMethodService {
   }
 
   async getActiveById(id: string): Promise<PaymentMethod> {
-    const method = await this.methods.findById(id);
+    // Pinned BEFORE the active check: another operator's method must be a plain 404, not a 422 that
+    // tells a player it exists (and whether it is retired).
+    const method = await this.methods.findByIdInTenant(requireEffectiveTenantId(), id);
     if (method === null) {
       throw new NotFoundError(
         PaymentMethodErrorCodes.PAYMENT_METHOD_NOT_FOUND,
@@ -177,9 +179,12 @@ export class PaymentMethodService {
     id: string,
     dto: UpdatePaymentMethodDto,
   ): Promise<AdminPaymentMethodView> {
+    // EFFECTIVE, not the caller's home: a PLATFORM_ADMIN with X-Tenant-Id edits that operator's
+    // method, and one without the header reaches no operator's method at all.
+    const tenantId = requireEffectiveTenantId();
     const updated = await this.prisma
       .runInTransaction(async (tx) => {
-        const current = await this.methods.findById(id, tx);
+        const current = await this.methods.findByIdInTenant(tenantId, id, tx);
         if (current === null) {
           throw new NotFoundError(
             PaymentMethodErrorCodes.PAYMENT_METHOD_NOT_FOUND,
@@ -204,7 +209,8 @@ export class PaymentMethodService {
 
         this.assertCoherent(minAmountMinor, maxAmountMinor, feeFixedMinor);
 
-        const method = await this.methods.update(
+        const method = await this.methods.updateInTenant(
+          tenantId,
           id,
           {
             ...(dto.displayName !== undefined ? { displayName: dto.displayName } : {}),
@@ -310,7 +316,7 @@ export class PaymentMethodService {
    * method row is never deleted (DELETE /v1/admin/payment-methods/:id deactivates).
    */
   async getOrThrow(id: string): Promise<PaymentMethod> {
-    const method = await this.methods.findById(id);
+    const method = await this.methods.findByIdInTenant(requireEffectiveTenantId(), id);
     if (method === null) {
       throw new NotFoundError(
         PaymentMethodErrorCodes.PAYMENT_METHOD_NOT_FOUND,

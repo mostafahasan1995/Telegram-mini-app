@@ -16,6 +16,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 
 import type { Tx } from '@core/prisma/tx.type';
+import { requireEffectiveTenantId } from '@core/tenant/tenant.storage';
 
 export type LedgerInvariant =
   | 'I1_TRANSACTION_ZERO_SUM'
@@ -197,6 +198,9 @@ export class InvariantsService {
   /**
    * Recompute one account's cache from its entries. The repairing half of I3 — kept here so the fix
    * lives next to the detection and cannot drift from it.
+   *
+   * Runs inside the owning operator's context (InvariantCheckCron enters it per finding), and the
+   * write is pinned to it: a repair can only ever touch an account of the operator it was filed for.
    */
   async recomputeAccountCache(tx: Tx, accountId: string): Promise<bigint> {
     const rows = await tx.$queryRaw<{ entries_minor: bigint }[]>`
@@ -206,7 +210,7 @@ export class InvariantsService {
     `;
     const balance = rows[0]?.entries_minor ?? 0n;
     await tx.ledgerAccount.update({
-      where: { id: accountId },
+      where: { id: accountId, tenantId: requireEffectiveTenantId() },
       data: { cachedBalanceMinor: balance, cachedAt: new Date() },
     });
     return balance;

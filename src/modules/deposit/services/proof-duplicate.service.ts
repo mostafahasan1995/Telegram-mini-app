@@ -1,5 +1,5 @@
 /**
- * Cross-player duplicate detection over a 180-day window, in two tiers.
+ * Cross-player duplicate detection over a 180-day window, in two tiers, WITHIN ONE OPERATOR.
  *
  * TIER 1 — exact. sha256 of the NORMALIZED bytes, queried straight out of `deposit_proofs`. Durable,
  * transactional, and immune to a Redis flush. It catches the same file re-uploaded, and (because the
@@ -8,6 +8,14 @@
  *
  * TIER 2 — perceptual. 64-bit dHash, Hamming distance <= 6. This is what survives a crop, a
  * re-compression, a screenshot of a screenshot.
+ *
+ * WHY BOTH TIERS ARE PER OPERATOR: a duplicate is evidence against a player, and only evidence from
+ * the same operator's books means anything. With one shared perceptual index, operator A's ingest
+ * matched operator B's receipts — the same wallet app screen photographed by two unrelated people —
+ * so A's reviewer saw a cross-player duplicate flag built from B's data, and B's deposit and player
+ * ids were written into A's transition metadata. So the fingerprint carries the tenant, the Redis
+ * keys contain it, every record stores it, and a record of another tenant is skipped even if it is
+ * somehow read.
  *
  * WHY tier 2 lives in Redis and not in Postgres — and why that is honest rather than a shortcut:
  * `deposit_proofs` has no perceptual-hash column, and the schema is owned by the foundation, so this
@@ -41,6 +49,8 @@ import {
 import { DepositRepository } from '../repositories/deposit.repository';
 
 export interface ProofFingerprint {
+  /** The operator of the deposit this proof belongs to. Both tiers search only its proofs. */
+  tenantId: string;
   proofId: string;
   depositRequestId: string;
   playerId: string;
@@ -70,6 +80,7 @@ export interface DuplicateReport {
 
 /** One indexed proof, as stored in the Redis record hash. All strings: it round-trips through JSON. */
 interface IndexedProof {
+  tenantId: string;
   proofId: string;
   depositRequestId: string;
   playerId: string;
@@ -118,13 +129,15 @@ export class ProofDuplicateService {
   }
 
   /**
-   * Add this proof to the perceptual index. Every key gets the same 180-day TTL, so the window
-   * expires on its own without a sweeper — and a band set that stops being written simply vanishes.
+   * Add this proof to its operator's perceptual index. Every key gets the same 180-day TTL, so the
+   * window expires on its own without a sweeper — and a band set that stops being written simply
+   * vanishes.
    */
   async index(fingerprint: ProofFingerprint): Promise<void> {
     if (!isPerceptualHash(fingerprint.perceptualHash)) return;
 
     const record: IndexedProof = {
+      tenantId: fingerprint.tenantId,
       proofId: fingerprint.proofId,
       depositRequestId: fingerprint.depositRequestId,
       playerId: fingerprint.playerId,
@@ -134,10 +147,15 @@ export class ProofDuplicateService {
 
     const ttlSeconds = Math.ceil(PROOF_DUPLICATE_WINDOW_MS / 1000);
     const pipeline = this.redis.multi();
-    pipeline.set(proofRecordKey(record.proofId), JSON.stringify(record), 'EX', ttlSeconds);
+    pipeline.set(
+      proofRecordKey(record.tenantId, record.proofId),
+      JSON.stringify(record),
+      'EX',
+      ttlSeconds,
+    );
 
     for (const band of hashBands(fingerprint.perceptualHash, PROOF_HASH_BAND_COUNT)) {
-      const key = proofBandKey(band);
+      const key = proofBandKey(record.tenantId, band);
       // A sorted set scored by timestamp lets one ZREMRANGEBYSCORE drop everything past the window
       // without touching the members that are still inside it.
       pipeline.zadd(key, record.at, record.proofId);
@@ -162,6 +180,7 @@ export class ProofDuplicateService {
     const cutoff = new Date(fingerprint.createdAt.getTime() - PROOF_DUPLICATE_WINDOW_MS);
     const rows = await this.deposits.findDepositsBySha256(
       tx,
+      fingerprint.tenantId,
       fingerprint.sha256,
       fingerprint.depositRequestId,
     );
@@ -181,7 +200,7 @@ export class ProofDuplicateService {
       }));
   }
 
-  /** Tier 2: the banded perceptual index. Degrades to "no matches" if Redis is unavailable. */
+  /** Tier 2: the operator's banded perceptual index. Degrades to "no matches" if Redis is down. */
   private async findSimilar(fingerprint: ProofFingerprint): Promise<DuplicateMatch[]> {
     if (!isPerceptualHash(fingerprint.perceptualHash)) return [];
 
@@ -189,8 +208,8 @@ export class ProofDuplicateService {
     const candidateIds = new Set<string>();
 
     try {
-      const bandKeys = hashBands(fingerprint.perceptualHash, PROOF_HASH_BAND_COUNT).map(
-        proofBandKey,
+      const bandKeys = hashBands(fingerprint.perceptualHash, PROOF_HASH_BAND_COUNT).map((band) =>
+        proofBandKey(fingerprint.tenantId, band),
       );
       const pipeline = this.redis.multi();
       for (const key of bandKeys) pipeline.zrangebyscore(key, since, '+inf');
@@ -216,10 +235,12 @@ export class ProofDuplicateService {
 
     if (candidateIds.size === 0) return [];
 
-    const records = await this.loadRecords([...candidateIds]);
+    const records = await this.loadRecords(fingerprint.tenantId, [...candidateIds]);
     const matches: DuplicateMatch[] = [];
 
     for (const record of records) {
+      // Belt and braces behind the keyed lookup: evidence from another operator is never a match.
+      if (record.tenantId !== fingerprint.tenantId) continue;
       if (record.depositRequestId === fingerprint.depositRequestId) continue;
       if (record.at < since) continue;
 
@@ -240,9 +261,9 @@ export class ProofDuplicateService {
     return matches;
   }
 
-  private async loadRecords(proofIds: readonly string[]): Promise<IndexedProof[]> {
+  private async loadRecords(tenantId: string, proofIds: readonly string[]): Promise<IndexedProof[]> {
     if (proofIds.length === 0) return [];
-    const raw = await this.redis.mget(...proofIds.map(proofRecordKey));
+    const raw = await this.redis.mget(...proofIds.map((proofId) => proofRecordKey(tenantId, proofId)));
     const records: IndexedProof[] = [];
 
     for (const entry of raw) {
@@ -257,6 +278,8 @@ export class ProofDuplicateService {
       if (typeof parsed !== 'object' || parsed === null) continue;
       const candidate = parsed as Partial<IndexedProof>;
       if (
+        // A record with no tenant predates per-operator indexing and cannot be attributed to one.
+        typeof candidate.tenantId !== 'string' ||
         typeof candidate.proofId !== 'string' ||
         typeof candidate.depositRequestId !== 'string' ||
         typeof candidate.playerId !== 'string' ||
@@ -267,6 +290,7 @@ export class ProofDuplicateService {
         continue;
       }
       records.push({
+        tenantId: candidate.tenantId,
         proofId: candidate.proofId,
         depositRequestId: candidate.depositRequestId,
         playerId: candidate.playerId,

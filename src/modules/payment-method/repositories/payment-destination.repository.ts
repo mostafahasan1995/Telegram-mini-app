@@ -43,8 +43,14 @@ export class PaymentDestinationRepository extends BaseRepository<
     return client.paymentDestination;
   }
 
-  findById(id: string, tx?: Tx): Promise<PaymentDestination | null> {
-    return this._findUnique({ id }, tx);
+  /**
+   * WHY THERE IS NO `findById(id)`: a destination is an account players send real money to. A bare
+   * primary-key lookup let one operator's staff deactivate, re-weight or relabel another operator's
+   * receiving accounts. The tenant is part of the selector, so a foreign id misses like an unknown
+   * one.
+   */
+  findByIdInTenant(tenantId: string, id: string, tx?: Tx): Promise<PaymentDestination | null> {
+    return this._findUnique({ id, tenantId }, tx);
   }
 
   listForMethod(
@@ -70,12 +76,14 @@ export class PaymentDestinationRepository extends BaseRepository<
     return this.run('create', () => (tx ?? this.prisma).paymentDestination.create({ data }));
   }
 
-  update(
+  /** Pinned like the read above; a miss is P2025, which the error filter answers with a 404. */
+  updateInTenant(
+    tenantId: string,
     id: string,
     data: Prisma.PaymentDestinationUpdateInput,
     tx?: Tx,
   ): Promise<PaymentDestination> {
-    return this._update({ id }, data, tx);
+    return this._update({ id, tenantId }, data, tx);
   }
 
   /** Claimed volume booked against each destination since `since`. Missing key = no volume. */

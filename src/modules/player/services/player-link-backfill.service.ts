@@ -178,16 +178,6 @@ export class PlayerLinkBackfillService {
       return { ...EMPTY_PASS, skipped: 'ichancy-fake' };
     }
 
-    // THE ANTI-HAMMER GATE, and the reason this cron cannot make an outage worse. While the breaker
-    // says DOWN we issue ZERO requests, so the backfill cannot keep failing challenges and dragging
-    // the IP's Cloudflare trust score lower — the mechanism that turned twenty minutes of failure
-    // into hours. The only prober left is the 5-minute agent float sync, which is exactly enough to
-    // notice recovery and reopen this gate.
-    if (await this.health.isDown()) {
-      this.logger.debug('player-link backfill skipped: Ichancy is DOWN');
-      return { ...EMPTY_PASS, skipped: 'ichancy-down' };
-    }
-
     const now = new Date();
     // Deliberately across operators: the tick has no tenant of its own, and every operator's
     // stranded players deserve rescue. Each candidate is then linked INSIDE its own operator's
@@ -218,13 +208,34 @@ export class PlayerLinkBackfillService {
 
     if (candidates.length === 0) return EMPTY_PASS;
 
+    // THE ANTI-HAMMER GATE, and the reason this cron cannot make an outage worse. While an operator's
+    // breaker says DOWN we issue ZERO requests for that operator, so the backfill cannot keep failing
+    // challenges and dragging the IP's Cloudflare trust score lower — the mechanism that turned
+    // twenty minutes of failure into hours. The only prober left is the 5-minute agent float sync,
+    // which is exactly enough to notice recovery and reopen this gate.
+    //
+    // PER OPERATOR, because each operator calls Ichancy with its own agent. One shared verdict let
+    // one operator's broken agent strand every other operator's players.
+    const downTenants = new Set<string>();
+    for (const tenantId of new Set(candidates.map((candidate) => candidate.tenantId))) {
+      if (await this.health.isDown(tenantId)) downTenants.add(tenantId);
+    }
+    if (downTenants.size > 0) {
+      this.logger.debug(
+        `player-link backfill skipping ${String(downTenants.size)} operator(s) whose Ichancy is DOWN`,
+      );
+    }
+    if (candidates.every((candidate) => downTenants.has(candidate.tenantId))) {
+      return { ...EMPTY_PASS, skipped: 'ichancy-down' };
+    }
+
     const deadline = Date.now() + PLAYER_LINK_BACKFILL_BUDGET_MS;
     let scanned = 0;
     let linked = 0;
     let deferred = 0;
     let parked = 0;
     /** Operators whose agent failed at the session: their other players wait for the next pass. */
-    const stalledTenants = new Set<string>();
+    const stalledTenants = new Set<string>(downTenants);
 
     for (const candidate of candidates) {
       if (Date.now() > deadline) {

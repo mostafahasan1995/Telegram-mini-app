@@ -140,6 +140,24 @@ export class ReconciliationBreakService {
     return this.prisma.runInTransaction((tx) => this.observe(tx, input));
   }
 
+  /**
+   * One break, in the effective operator. Another operator's break id is BREAK_NOT_FOUND, exactly
+   * like an id that never existed: its money figures and the deposit and player ids in it are the
+   * reconnaissance for reading that operator's deposits.
+   */
+  async getInTenant(breakId: string): Promise<ReconciliationBreak> {
+    const row = await this.prisma.reconciliationBreak.findUnique({
+      where: { id: breakId, tenantId: requireEffectiveTenantId() },
+    });
+    if (row === null) {
+      throw new NotFoundError(
+        ReconciliationErrorCodes.BREAK_NOT_FOUND,
+        'That reconciliation break does not exist.',
+      );
+    }
+    return row;
+  }
+
   async resolve(input: ResolveBreakInput): Promise<ReconciliationBreak> {
     return this.prisma.runInTransaction(async (tx) => {
       // EFFECTIVE, not `input.admin.tenantId`: the principal carries the admin's HOME tenant, which

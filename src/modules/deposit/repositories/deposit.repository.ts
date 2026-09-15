@@ -14,6 +14,7 @@
 import { Injectable } from '@nestjs/common';
 import { DepositStatus, Prisma, type DepositProof, type DepositRequest } from '@prisma/client';
 
+import { acrossTenants } from '@core/prisma/tenant-scope.extension';
 import type { Tx } from '@core/prisma/tx.type';
 import { requireEffectiveTenantId } from '@core/tenant';
 
@@ -66,12 +67,33 @@ export interface DepositPage {
 
 @Injectable()
 export class DepositRepository {
-  findById(tx: Tx, id: string): Promise<DepositRequest | null> {
-    return tx.depositRequest.findUnique({ where: { id } });
+  /**
+   * WHY THERE IS NO `findById(tx, id)`: a deposit id arrives in admin URLs and in bot callback data,
+   * and an operator owns its bot token, so it can put any string it likes into a button. A bare
+   * primary-key read handed one operator's staff another operator's player, amounts, destination
+   * account and receipts. The tenant is part of the selector: another operator's deposit misses
+   * exactly like an unknown id, with the same query shape and the same 404.
+   */
+  findByIdInTenant(tx: Tx, tenantId: string, id: string): Promise<DepositRequest | null> {
+    return tx.depositRequest.findUnique({ where: { id, tenantId } });
   }
 
-  findByIdWithContext(tx: Tx, id: string): Promise<DepositWithReviewContext | null> {
-    return tx.depositRequest.findUnique({ where: { id }, include: REVIEW_INCLUDE });
+  findByIdWithContextInTenant(
+    tx: Tx,
+    tenantId: string,
+    id: string,
+  ): Promise<DepositWithReviewContext | null> {
+    return tx.depositRequest.findUnique({ where: { id, tenantId }, include: REVIEW_INCLUDE });
+  }
+
+  /**
+   * FOR THE TELEGRAM QUEUE ONLY. Its jobs carry a deposit id and nothing else, run with no tenant
+   * context, and the id was written by our own outbox — never by a client. The row it returns is
+   * what names the operator (its bot, its admin chat), so this lookup cannot be pinned to a tenant
+   * it has not read yet. Anything past it must use `deposit.tenantId`.
+   */
+  findByIdWithContextForWorker(tx: Tx, id: string): Promise<DepositWithReviewContext | null> {
+    return tx.depositRequest.findUnique({ where: acrossTenants({ id }), include: REVIEW_INCLUDE });
   }
 
   /**
@@ -253,34 +275,57 @@ export class DepositRepository {
     });
   }
 
-  findProof(tx: Tx, proofId: string): Promise<DepositProof | null> {
-    return tx.depositProof.findUnique({ where: { id: proofId } });
+  /**
+   * One proof of one deposit, in one operator. All three are in the WHERE: the proof and deposit
+   * ids both come from the URL, so matching them against each other alone proves nothing, and a
+   * receipt is a document identifying a real person.
+   */
+  findProofInTenant(
+    tx: Tx,
+    tenantId: string,
+    depositRequestId: string,
+    proofId: string,
+  ): Promise<DepositProof | null> {
+    return tx.depositProof.findFirst({ where: { id: proofId, depositRequestId, tenantId } });
+  }
+
+  /**
+   * FOR THE MEDIA QUEUE ONLY. A proof-ingest job carries a proof id written by our own outbox and
+   * runs with no tenant context; the row it returns names the operator the rest of the job runs as.
+   * See ProofIngestService.ingest.
+   */
+  findProofForWorker(tx: Tx, proofId: string): Promise<DepositProof | null> {
+    return tx.depositProof.findUnique({ where: acrossTenants({ id: proofId }) });
   }
 
   createProof(tx: Tx, data: Prisma.DepositProofUncheckedCreateInput): Promise<DepositProof> {
     return tx.depositProof.create({ data });
   }
 
-  updateProof(
+  updateProofInTenant(
     tx: Tx,
+    tenantId: string,
     proofId: string,
     data: Prisma.DepositProofUncheckedUpdateInput,
   ): Promise<DepositProof> {
-    return tx.depositProof.update({ where: { id: proofId }, data });
+    return tx.depositProof.update({ where: { id: proofId, tenantId }, data });
   }
 
   /**
-   * Every deposit that has ever carried this exact content hash — the cheapest cross-player fraud
-   * signal there is, and the only one that survives a Redis flush.
+   * Every deposit OF THIS OPERATOR that has ever carried this exact content hash — the cheapest
+   * cross-player fraud signal there is, and the only one that survives a Redis flush. The tenant is
+   * spelled out rather than left to the extension: a match against another operator's receipt would
+   * put a fraud flag on a player on the strength of evidence that has nothing to do with them.
    */
   findDepositsBySha256(
     tx: Tx,
+    tenantId: string,
     sha256: string,
     excludeDepositRequestId: string,
   ): Promise<{ depositRequestId: string; playerId: string; createdAt: Date }[]> {
     return tx.depositProof
       .findMany({
-        where: { sha256, depositRequestId: { not: excludeDepositRequestId } },
+        where: { tenantId, sha256, depositRequestId: { not: excludeDepositRequestId } },
         select: {
           depositRequestId: true,
           createdAt: true,
@@ -301,11 +346,13 @@ export class DepositRepository {
   /** Where the admin review card lives, so a worker can edit that exact message later. */
   recordAdminCard(
     tx: Tx,
+    tenantId: string,
     depositRequestId: string,
     card: { chatId: bigint; messageId: bigint; threadId: bigint | null },
   ): Promise<Prisma.BatchPayload> {
     return tx.depositRequest.updateMany({
-      where: { id: depositRequestId },
+      // Named by hand: the telegram queue that calls this has no tenant context to inject from.
+      where: { id: depositRequestId, tenantId },
       data: {
         adminChatId: card.chatId,
         adminMessageId: card.messageId,

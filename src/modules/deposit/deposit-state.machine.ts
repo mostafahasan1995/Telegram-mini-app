@@ -37,6 +37,7 @@ import {
 import type { Actor } from '@common/types/actor.type';
 import { toNullableJson } from '@core/queue/json.util';
 import type { Tx } from '@core/prisma/tx.type';
+import { requireEffectiveTenantId } from '@core/tenant/tenant.storage';
 
 /**
  * Which statuses may follow which. This is the product's rulebook, and it is enforced as a
@@ -236,11 +237,21 @@ export class DepositStateMachine {
       typeof input.from === 'string' ? [input.from] : [...input.from];
     for (const from of fromStatuses) this.assertLegal(from, input.to);
 
+    // WHOSE DEPOSIT: the operator in context, named in every statement below rather than left to
+    // the tenant-scope extension. The CAS used to be safe only because the extension happened to
+    // inject a tenant into updateMany while the reads around it did not — so a foreign id moved
+    // nothing but still reported that operator's status back through `alreadyHandled`. Every caller
+    // runs inside one (a request, a bot update, or a worker that entered the deposit's own tenant),
+    // and a caller that does not is a programming error that must fail before touching money.
+    const tenantId = requireEffectiveTenantId();
+
     const { count } = await tx.depositRequest.updateMany({
       where: {
-        id: input.depositRequestId,
-        status: { in: fromStatuses },
         ...(input.guard ?? {}),
+        // After the guard, so no guard can widen the CAS to another row or another operator.
+        id: input.depositRequestId,
+        tenantId,
+        status: { in: fromStatuses },
       },
       data: {
         status: input.to,
@@ -248,12 +259,12 @@ export class DepositStateMachine {
       },
     });
 
-    if (count === 0) return this.explainMiss(tx, input, fromStatuses);
+    if (count === 0) return this.explainMiss(tx, tenantId, input, fromStatuses);
 
     // Safe read: the UPDATE above holds this row's lock until COMMIT, so nothing can change it
     // between the two statements. This is the RETURNING * the CAS conceptually asks for.
     const deposit = await tx.depositRequest.findUniqueOrThrow({
-      where: { id: input.depositRequestId },
+      where: { id: input.depositRequestId, tenantId },
     });
 
     // `from` is recorded as the status that actually matched. With a single-element `from` that is
@@ -313,14 +324,18 @@ export class DepositStateMachine {
   /**
    * Why the miss happened, for the caller's log line and for `alreadyHandled.current`. This read is
    * outside any lock, so `current` is advisory — it is never used to make a second decision.
+   *
+   * Pinned to the same tenant as the CAS: another operator's deposit is NOT_FOUND here, exactly like
+   * a missing one, so its status never comes back in a response.
    */
   private async explainMiss(
     tx: Tx,
+    tenantId: string,
     input: TransitionInput,
     fromStatuses: readonly DepositStatus[],
   ): Promise<TransitionOutcome> {
     const row = await tx.depositRequest.findUnique({
-      where: { id: input.depositRequestId },
+      where: { id: input.depositRequestId, tenantId },
       select: { status: true },
     });
     if (row === null) return { kind: 'alreadyHandled', current: null, reason: 'NOT_FOUND' };

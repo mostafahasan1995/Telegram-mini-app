@@ -967,7 +967,10 @@ describe('Per-operator Ichancy agents through an HTTP-level stub (integration)',
             actor: SYSTEM_ACTOR,
             allowNegative: true,
           });
-          await tx.depositRequest.update({ where: { id: deposit.id }, data: { ledgerClaimTxId: claim.transactionId } });
+          await tx.depositRequest.update({
+            where: { id: deposit.id, tenantId: operatorB.id },
+            data: { ledgerClaimTxId: claim.transactionId },
+          });
         }),
       operatorB.id,
     );

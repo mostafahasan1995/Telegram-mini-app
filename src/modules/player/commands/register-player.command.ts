@@ -191,7 +191,9 @@ export class RegisterPlayerCommand extends CommandRunner {
 
     if (options.playerId !== undefined) {
       const player = await this.prisma.player.findUnique({
-        where: { id: options.playerId },
+        // Pinned like the other two selectors: a player id of another operator is "no such player"
+        // here, rather than an account registered under this operator's agent.
+        where: { id: options.playerId, tenantId: CLI_TENANT_ID },
         select,
       });
       if (player === null) throw new Error(`No player with id ${options.playerId}`);

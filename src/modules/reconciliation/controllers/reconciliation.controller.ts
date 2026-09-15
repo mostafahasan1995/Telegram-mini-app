@@ -107,8 +107,7 @@ export class ReconciliationController {
   @Get('breaks/:id')
   @AdminAuth(...VIEW_ROLES)
   async detail(@Param('id', ParseUUIDPipe) id: string): Promise<BreakView> {
-    const row = await this.prisma.reconciliationBreak.findUniqueOrThrow({ where: { id } });
-    return toBreakView(row);
+    return toBreakView(await this.breaks.getInTenant(id));
   }
 
   /** POST /v1/admin/reconciliation/breaks/:id/resolve */

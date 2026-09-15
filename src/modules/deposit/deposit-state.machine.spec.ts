@@ -2,6 +2,7 @@ import { DepositStatus, type DepositRequest } from '@prisma/client';
 
 import { SYSTEM_ACTOR, adminActor } from '@common/types/actor.type';
 import type { Tx } from '@core/prisma/tx.type';
+import { runWithTenant } from '@core/tenant/tenant.storage';
 
 import {
   ALLOWED_TRANSITIONS,
@@ -11,10 +12,14 @@ import {
   REVIEWABLE_STATUSES,
   TERMINAL_STATUSES,
   isTerminal,
+  type TransitionInput,
 } from './deposit-state.machine';
 
 const DEPOSIT_ID = '11111111-2222-4333-8444-555555555555';
 const ADMIN_ID = '99999999-8888-4777-8666-555555555555';
+/** The operator every transition below runs as, and that owns the fake row unless a test says not. */
+const TENANT = 'aaaaaaaa-1111-4111-8111-111111111111';
+const OTHER_TENANT = 'bbbbbbbb-2222-4222-8222-222222222222';
 
 interface TransitionRow {
   depositRequestId: string;
@@ -32,7 +37,7 @@ interface TransitionRow {
  */
 function makeTx(initial: (Partial<DepositRequest> & { status: DepositStatus }) | null) {
   let row: (Partial<DepositRequest> & { status: DepositStatus }) | null =
-    initial === null ? null : { id: DEPOSIT_ID, ...initial };
+    initial === null ? null : { id: DEPOSIT_ID, tenantId: TENANT, ...initial };
   const transitions: TransitionRow[] = [];
   /** Predicates the fake understands, recorded so a test can assert the CAS shape. */
   const seenWhere: Record<string, unknown>[] = [];
@@ -43,6 +48,7 @@ function makeTx(initial: (Partial<DepositRequest> & { status: DepositStatus }) |
     if (status?.in !== undefined && !status.in.includes(row.status)) return false;
 
     // A tiny subset of Prisma's filter language: enough for the guards this module actually uses.
+    if (where['id'] !== row.id) return false;
     for (const [key, value] of Object.entries(where)) {
       if (key === 'id' || key === 'status') continue;
       const actual = (row as Record<string, unknown>)[key];
@@ -77,9 +83,23 @@ function makeTx(initial: (Partial<DepositRequest> & { status: DepositStatus }) |
         row = { ...(row as object), ...data } as typeof row;
         return Promise.resolve({ count: 1 });
       },
-      findUniqueOrThrow: () => Promise.resolve(row as DepositRequest),
-      findUnique: ({ select }: { select?: Record<string, boolean> }) => {
-        if (row === null) return Promise.resolve(null);
+      // Both reads honour the selector the way Postgres would: another operator's row is not found.
+      findUniqueOrThrow: ({ where }: { where: Record<string, unknown> }) => {
+        if (row === null || where['id'] !== row.id || where['tenantId'] !== row.tenantId) {
+          return Promise.reject(new Error('No record found'));
+        }
+        return Promise.resolve(row as DepositRequest);
+      },
+      findUnique: ({
+        where,
+        select,
+      }: {
+        where: Record<string, unknown>;
+        select?: Record<string, boolean>;
+      }) => {
+        if (row === null || where['id'] !== row.id || where['tenantId'] !== row.tenantId) {
+          return Promise.resolve(null);
+        }
         if (select === undefined) return Promise.resolve(row);
         return Promise.resolve({ status: row.status });
       },
@@ -152,7 +172,62 @@ describe('ALLOWED_TRANSITIONS', () => {
 });
 
 describe('DepositStateMachine.transition', () => {
-  const machine = new DepositStateMachine();
+  const real = new DepositStateMachine();
+  /** Every caller runs inside an operator (a request, a bot update, a worker); so do these tests. */
+  const machine = {
+    transition: (tx: Tx, input: TransitionInput) =>
+      runWithTenant(TENANT, () => real.transition(tx, input)),
+    tryTransition: (tx: Tx, input: TransitionInput) =>
+      runWithTenant(TENANT, () => real.tryTransition(tx, input)),
+  };
+
+  it('names the operator in the CAS, and no guard can move it to another row or tenant', async () => {
+    const { tx, seenWhere } = makeTx({ status: DepositStatus.SUBMITTED });
+
+    await machine.transition(tx, {
+      depositRequestId: DEPOSIT_ID,
+      from: DepositStatus.SUBMITTED,
+      to: DepositStatus.UNDER_REVIEW,
+      actor: adminActor(ADMIN_ID),
+      guard: { id: 'another-deposit', tenantId: OTHER_TENANT },
+    });
+
+    expect(seenWhere[0]).toMatchObject({ id: DEPOSIT_ID, tenantId: TENANT });
+  });
+
+  it("answers another operator's deposit exactly like a missing one, and writes nothing", async () => {
+    // The CAS was already filtered by the extension, but the read that explained a miss was not, so
+    // a foreign id reported that operator's status back. Now both are pinned.
+    const { tx, transitions, current } = makeTx({
+      status: DepositStatus.SUBMITTED,
+      tenantId: OTHER_TENANT,
+    });
+
+    const outcome = await machine.transition(tx, {
+      depositRequestId: DEPOSIT_ID,
+      from: DepositStatus.SUBMITTED,
+      to: DepositStatus.UNDER_REVIEW,
+      actor: adminActor(ADMIN_ID),
+    });
+
+    expect(outcome).toEqual({ kind: 'alreadyHandled', current: null, reason: 'NOT_FOUND' });
+    expect(transitions).toHaveLength(0);
+    expect(current()?.status).toBe(DepositStatus.SUBMITTED);
+  });
+
+  it('refuses to run outside a tenant context, before touching the row', async () => {
+    const { tx, seenWhere } = makeTx({ status: DepositStatus.SUBMITTED });
+
+    await expect(
+      real.transition(tx, {
+        depositRequestId: DEPOSIT_ID,
+        from: DepositStatus.SUBMITTED,
+        to: DepositStatus.UNDER_REVIEW,
+        actor: SYSTEM_ACTOR,
+      }),
+    ).rejects.toThrow(/No tenant context/);
+    expect(seenWhere).toHaveLength(0);
+  });
 
   it('CASes on (id, status) and writes a transition row', async () => {
     const { tx, transitions, seenWhere, current } = makeTx({

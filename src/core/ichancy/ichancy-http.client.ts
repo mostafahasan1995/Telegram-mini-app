@@ -55,6 +55,8 @@ export const TRANSPORT_ORIGIN_UNSUPPORTED_CODE = 'ICHANCY_TRANSPORT_ORIGIN_UNSUP
 export interface IchancyCallTarget {
   readonly baseUrl: string;
   readonly agentKey: string;
+  /** The operator whose agent this is: the outage breaker is kept per operator. */
+  readonly tenantId: string;
 }
 
 export interface IchancyCallParams {
@@ -188,9 +190,11 @@ export class IchancyHttpClient implements IchancyAuthClient {
       };
     }
 
-    // Fed before the call-log INSERT so the cluster-wide verdict is current even when the log
-    // write is slow. `record` swallows its own failures: instrumentation may never break a call.
-    await this.health.record(params.endpoint, classification);
+    // Fed before the call-log INSERT so the verdict is current even when the log write is slow.
+    // Recorded under the operator whose agent made the call: one operator's blocked agent is not
+    // another operator's outage. `record` swallows its own failures: instrumentation may never
+    // break a call.
+    await this.health.record(params.agent.tenantId, params.endpoint, classification);
 
     const durationMs = Date.now() - startedAt;
     await this.persist({

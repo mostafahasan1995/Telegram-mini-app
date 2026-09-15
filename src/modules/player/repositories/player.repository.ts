@@ -68,8 +68,13 @@ export class PlayerRepository extends BaseRepository<
     return tx ?? this.prisma;
   }
 
-  findById(id: string, tx?: Tx): Promise<Player | null> {
-    return this._findUnique({ id }, tx);
+  /**
+   * No bare `findById(id)`: a player id reached by primary key alone ignores the operator, and every
+   * caller of this repository knows which operator it is serving. Another operator's player misses
+   * like an unknown one.
+   */
+  findByIdInTenant(tenantId: string, id: string, tx?: Tx): Promise<Player | null> {
+    return this._findUnique({ id, tenantId }, tx);
   }
 
   /**
@@ -142,8 +147,8 @@ export class PlayerRepository extends BaseRepository<
     return this._updateMany({ id }, { lastSeenAt: new Date() }, tx);
   }
 
-  setStatus(id: string, status: PlayerStatus, tx?: Tx): Promise<Player> {
-    return this._update({ id }, { status }, tx);
+  setStatusInTenant(tenantId: string, id: string, status: PlayerStatus, tx?: Tx): Promise<Player> {
+    return this._update({ id, tenantId }, { status }, tx);
   }
 
   /**

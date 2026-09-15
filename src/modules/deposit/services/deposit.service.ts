@@ -435,6 +435,7 @@ export class DepositService {
       });
 
       const report = await this.duplicates.findDuplicates(tx, {
+        tenantId: deposit.tenantId,
         proofId: proof.id,
         depositRequestId: deposit.id,
         playerId: deposit.playerId,
@@ -464,6 +465,7 @@ export class DepositService {
 
     // The perceptual index is a rebuildable cache; a failure here must never undo a committed proof.
     await this.duplicates.index({
+      tenantId: deposit.tenantId,
       proofId: outcome.proofId,
       depositRequestId: deposit.id,
       playerId: deposit.playerId,
@@ -496,7 +498,10 @@ export class DepositService {
    */
   async attachStoredProof(input: StoredProofInput): Promise<StoredProofResult> {
     const deposit = await this.prisma.depositRequest.findUnique({
-      where: { id: input.depositRequestId },
+      // The operator whose bot received the photo. The id was picked from that player's own open
+      // deposits, so this only ever matches; pinning it keeps a receipt from landing on another
+      // operator's deposit if a caller ever passes an id from somewhere else.
+      where: { id: input.depositRequestId, tenantId: requireEffectiveTenantId() },
     });
     if (deposit === null) {
       throw new NotFoundError(DepositErrorCodes.DEPOSIT_NOT_FOUND, 'Deposit not found.');
@@ -955,7 +960,7 @@ export class DepositService {
     }
 
     const player = await tx.player.findUnique({
-      where: { id: deposit.playerId },
+      where: { id: deposit.playerId, tenantId: deposit.tenantId },
       select: { createdAt: true },
     });
     if (player !== null && Date.now() - player.createdAt.getTime() < 24 * 60 * MINUTE_MS) {
