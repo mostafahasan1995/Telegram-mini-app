@@ -81,7 +81,13 @@ describe('the harvested clearance reaches the wire', () => {
     const harvester = { harvest: jest.fn() } as unknown as CookieHarvesterService;
     const transport = new FetchIchancyTransport(configFor(true), store, harvester);
 
-    await transport.post({ url: 'https://x/y', body: {}, accessToken: null, timeoutMs: 8_000 });
+    await transport.post({
+      url: 'https://agents.ichancy.com/y',
+      body: {},
+      accessToken: null,
+      timeoutMs: 8_000,
+      agentKey: 'agent-1',
+    });
 
     expect(calls[0]?.headers['cookie']).toBe(HARVEST.cookie);
     // The pair must not be split — this is the mismatch that caused two outages.
@@ -100,11 +106,43 @@ describe('the harvested clearance reaches the wire', () => {
     const harvester = { harvest: jest.fn() } as unknown as CookieHarvesterService;
     const transport = new FetchIchancyTransport(configFor(false), store, harvester);
 
-    await transport.post({ url: 'https://x/y', body: {}, accessToken: null, timeoutMs: 8_000 });
+    await transport.post({
+      url: 'https://agents.ichancy.com/y',
+      body: {},
+      accessToken: null,
+      timeoutMs: 8_000,
+      agentKey: 'agent-1',
+    });
 
     expect(calls[0]?.headers['user-agent']).toBe(CONFIGURED_UA);
     // Redis is not even consulted when the feature is off.
     expect(read).not.toHaveBeenCalled();
+  });
+
+  it("never sends the configured host's clearance to another operator's host, and derives Origin from the call", async () => {
+    const { impl, calls } = stubFetch([
+      { status: 200, body: JSON_BODY, contentType: 'application/json' },
+    ]);
+    globalThis.fetch = impl as unknown as typeof fetch;
+
+    const read = jest.fn().mockResolvedValue(HARVEST);
+    const store = { read } as unknown as IchancyCookieStore;
+    const harvester = { harvest: jest.fn() } as unknown as CookieHarvesterService;
+    const transport = new FetchIchancyTransport(configFor(true), store, harvester);
+
+    await transport.post({
+      url: 'https://agents.other-ichancy.example/global/api/UserApi/signin',
+      body: {},
+      accessToken: null,
+      timeoutMs: 8_000,
+      agentKey: 'agent-2',
+    });
+
+    // The clearance was earned on ICHANCY_BASE_URL's host; another host must not receive it.
+    expect(read).not.toHaveBeenCalled();
+    expect(calls[0]?.headers['cookie']).toBeUndefined();
+    expect(calls[0]?.headers['user-agent']).toBe(CONFIGURED_UA);
+    expect(calls[0]?.headers['origin']).toBe('https://agents.other-ichancy.example');
   });
 
   it('refreshes once on a challenge and replays the call exactly once', async () => {
@@ -125,10 +163,11 @@ describe('the harvested clearance reaches the wire', () => {
     );
 
     const result = await transport.post({
-      url: 'https://x/y',
+      url: 'https://agents.ichancy.com/y',
       body: {},
       accessToken: null,
       timeoutMs: 8_000,
+      agentKey: 'agent-1',
     });
 
     // Replaying a CHALLENGE is safe: Cloudflare's edge answered, so the request never reached
@@ -151,10 +190,11 @@ describe('the harvested clearance reaches the wire', () => {
     } as unknown as CookieHarvesterService);
 
     const result = await transport.post({
-      url: 'https://x/y',
+      url: 'https://agents.ichancy.com/y',
       body: {},
       accessToken: null,
       timeoutMs: 8_000,
+      agentKey: 'agent-1',
     });
 
     expect(calls).toHaveLength(1);

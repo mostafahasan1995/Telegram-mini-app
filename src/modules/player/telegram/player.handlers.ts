@@ -6,10 +6,11 @@
  * to exist before a referrer can be attached to it. /start is also the first contact for most
  * users, well before they ever open the mini app, and a row here costs nothing.
  *
- * WHY /start ALSO CREATES THE ICHANCY ACCOUNT: this bot is the PLAYER-facing surface, and the one
- * Ichancy identity it holds is the AGENT's (ICHANCY_USERNAME/ICHANCY_PASSWORD, signed in by the
- * worker). Every account it opens is registered with `parentId: ICHANCY_AGENT_ID`, i.e. as a CHILD
- * of that agent — that is what makes the money flow legal: a credit is drawn from the agent's float
+ * WHY /start ALSO CREATES THE ICHANCY ACCOUNT: this bot is the PLAYER-facing surface of ONE operator,
+ * and the one Ichancy identity it acts with is that operator's AGENT (the username, sealed password
+ * and agent id on its tenant row, resolved per call by TenantIchancyAgentResolver; never env). Every
+ * account it opens is registered with `parentId` = that operator's agent id, i.e. as a CHILD of that
+ * agent — that is what makes the money flow legal: a credit is drawn from the agent's float
  * into an account the agent owns. Pressing Start therefore has to end with the player owning such an
  * account, not with a row that only becomes a real account at the first credit. See
  * ensureGamingAccount below for why it happens AFTER the greeting and why a failure is not fatal.
@@ -476,9 +477,9 @@ export class PlayerTelegramHandlers {
    * Opens the player's Ichancy account — as a CHILD of our agent — the moment they press Start.
    *
    * The parent link itself is not decided here: PlayerLinkService derives the credentials and
-   * HttpIchancyAdapter.ensurePlayer sends `parentId: ICHANCY_AGENT_ID` on registerPlayer, so every
-   * account this bot creates hangs off the one agent the worker is signed in as. This method only
-   * decides WHEN that happens.
+   * HttpIchancyAdapter.ensurePlayer sends the operator's own agent id as `parentId` on registerPlayer,
+   * so every account this bot creates hangs off the agent of the operator the update arrived for. This
+   * method only decides WHEN that happens.
    *
    * WHY AFTER THE GREETING: registering is a registerPlayer call plus a getPlayersForCurrentAgent
    * lookup (the API answers the number 1, never an id), each bounded by ICHANCY_TIMEOUT_MS. Someone
@@ -880,7 +881,10 @@ export class PlayerTelegramHandlers {
     });
 
     const name = [view.firstName, view.lastName].filter((part) => part !== null).join(' ');
-    const referralCode = `ref_${view.telegramUserId}`;
+    // A player talking to the bot is a Telegram account, so the id is there; only an imported row
+    // (which cannot reach this handler) has none.
+    const telegramId = view.telegramUserId ?? '—';
+    const referralCode = `ref_${telegramId}`;
     const username = this.botUsername(ctx);
 
     const lines = [
@@ -888,7 +892,7 @@ export class PlayerTelegramHandlers {
       '',
       `Name: <b>${esc(name.length > 0 ? name : 'not set')}</b>`,
       view.telegramUsername === null ? null : `Username: @${esc(view.telegramUsername)}`,
-      `Telegram id: <code>${esc(view.telegramUserId)}</code>`,
+      `Telegram id: <code>${esc(telegramId)}</code>`,
       `Currency: <b>${esc(view.currencyCode)}</b>`,
       `Account: <b>${esc(view.status)}</b>${eligibility === null ? '' : eligibility.eligible ? ' ✅' : ' ⛔'}`,
     ];

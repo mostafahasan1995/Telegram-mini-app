@@ -8,7 +8,19 @@
  * `ichancyAgentId`), and the console is built against them. TENANT_BOT_TOKEN_INVALID,
  * TENANT_SLUG_TAKEN, TENANT_AGENT_ID_REQUIRED and TENANT_ICHANCY_UNREACHABLE were defined for a
  * design that was lost, never thrown, and contradicted the dashboard, so they were removed before
- * anything could start throwing them.
+ * anything could start throwing them. TENANT_ACTIVATION_UNAVAILABLE (the 503 answered while
+ * per-operator Ichancy sign-in did not exist) was retired when activation became a real sign-in; it
+ * must not be reused.
+ *
+ * THE ACTIVATION REFUSALS: the contract and the MSW handlers name no code for a failed activation
+ * sign-in, but the dashboard's console test (src/features/tenants/tenant-status-actions.test.tsx,
+ * "surfaces the API message when that sign-in fails") answers `ICHANCY_SIGNIN_FAILED`. Ichancy's
+ * definite refusal therefore uses that name. It is NOT that fixture's 502: the console's ApiError
+ * treats every 5xx as retryable (src/lib/api/errors.ts `isRetryable`), and credentials Ichancy refused
+ * fail identically on every retry, so it is a 422. The console branches on neither code nor status
+ * here; it shows the message verbatim. The two cases that are not Ichancy's verdict keep their own
+ * codes (TENANT_ICHANCY_UNAVAILABLE, TENANT_ICHANCY_UNCONFIGURED), and the credential edit (PATCH
+ * /:id/ichancy) answers with the same three.
  */
 export const TenantErrorCodes = {
   /**
@@ -25,7 +37,8 @@ export const TenantErrorCodes = {
   TENANT_NOT_ACTIVE: 'TENANT_NOT_ACTIVE',
   /**
    * Refused a change of `ichancyAgentId` on an operator that already has players. Repointing an
-   * agent under existing players orphans them from the tree their balances live in.
+   * agent under existing players orphans them from the tree their balances live in. A 422 with
+   * `details: { players }` (dashboard TENANT-OPERATIONS.md §6, detail 4).
    */
   TENANT_AGENT_HAS_PLAYERS: 'TENANT_AGENT_HAS_PLAYERS',
   /** `slug` and `currencyCode` are immutable after creation: both rewrite the meaning of old rows. */
@@ -37,14 +50,32 @@ export const TenantErrorCodes = {
   TENANT_CLOSED: 'TENANT_CLOSED',
   /**
    * Tenant zero is the platform, not an operator. Suspending it would lock every platform admin out
-   * of sign-in (a suspended operator's staff are refused), leaving nobody able to undo it.
+   * of sign-in (a suspended operator's staff are refused), leaving nobody able to undo it. It also
+   * has no Ichancy agent, so its credentials cannot be edited and it has no players to import.
    */
   TENANT_PLATFORM_LOCKED: 'TENANT_PLATFORM_LOCKED',
   /**
-   * Activation needs a real Ichancy sign-in with the operator's own credentials, and this deployment
-   * cannot make one yet. A 503: the request was right, what is missing is the thing behind it.
+   * Ichancy definitively refused a real sign-in with the operator's credentials (a wrong username or
+   * password, or a host this deployment's transport cannot reach). A 422: retrying the same
+   * credentials gets the same answer; the fix is correcting them. Nothing was activated or saved.
    */
-  TENANT_ACTIVATION_UNAVAILABLE: 'TENANT_ACTIVATION_UNAVAILABLE',
+  ICHANCY_SIGNIN_FAILED: 'ICHANCY_SIGNIN_FAILED',
+  /**
+   * The sign-in could not complete: a timeout, a Cloudflare challenge, another process holding the
+   * agent's session lock. A 503: nothing is known about the credentials, and the same request can
+   * succeed later. Nothing was activated or saved.
+   */
+  TENANT_ICHANCY_UNAVAILABLE: 'TENANT_ICHANCY_UNAVAILABLE',
+  /**
+   * The operator's stored Ichancy details cannot be used at all: a placeholder username or agent id,
+   * or a sealed password that does not open. A 422 whose fix is entering them from the dashboard.
+   */
+  TENANT_ICHANCY_UNCONFIGURED: 'TENANT_ICHANCY_UNCONFIGURED',
+  /**
+   * POST /:id/import-players while another import for the same operator holds its lock. A 409; the
+   * dashboard's console test answers exactly this code and sentence.
+   */
+  IMPORT_ALREADY_RUNNING: 'IMPORT_ALREADY_RUNNING',
   /**
    * The operator's bot cannot be used for a reason waiting will not fix: no token set, a stored token
    * that does not open, or one Telegram rejects. A 422: the fix is a new token from the dashboard.

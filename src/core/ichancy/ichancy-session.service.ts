@@ -2,33 +2,59 @@
  * !!! READ THIS BEFORE TOUCHING ANYTHING IN HERE !!!
  *
  * ICHANCY ALLOWS EXACTLY ONE LIVE TOKEN PAIR PER AGENT ACCOUNT. Not one per process, not one per
- * pod — ONE, ever. Three consequences, and every line below exists to satisfy them:
+ * pod, not one per operator — ONE per agent login, ever. Four consequences, and every line below
+ * exists to satisfy them:
  *
- *   1. A second signIn silently kills the first process's tokens. So only APP_ROLE=worker may sign
- *      in, and only while holding a distributed lock.
+ *   1. A second signIn silently kills the first process's tokens. So only APP_ROLE=worker signs in on
+ *      demand, and only while holding a distributed lock. The one exception is signInNow(): an
+ *      explicit verification a human asked for (activation, a credential edit, a health check),
+ *      serialised under the same lock. The rotation it causes is absorbed by rule 3 below: an
+ *      in-flight call holding the old token gets one unauthorized answer, finds the new pair in
+ *      Redis, and replays once.
  *   2. refreshToken ROTATES: the moment the new pair comes back, the old refresh token is dead. Two
  *      concurrent refreshes therefore guarantee that at least one process is left holding garbage —
  *      and if the answer is ambiguous (timeout), the pair we were holding may already be dead while
  *      the winner's pair is unknown to us.
  *   3. N concurrent 401s must cause exactly ONE refresh. That needs single-flight in this process
  *      (a shared promise) AND across processes (SET NX PX). Both are implemented here.
+ *   4. The session belongs to the AGENT, not to the operator. Every key below is built from the
+ *      agent key (normalised base URL + username, see ichancy-agent.ts), so operators that share an
+ *      agent share one session and one lock instead of signing each other out, and operators with
+ *      different agents stay isolated.
  *
- * The api role never signs in. It reads the pair the worker put in Redis; if there is none it throws
- * a clear, actionable error instead of quietly authenticating and invalidating the worker's session.
- * It MAY refresh, because a refresh under the lock is still single-writer — but a dead refresh token
- * is only recoverable by the worker.
+ * A stored pair also records the digest of the exact credentials that obtained it. An operator whose
+ * digest differs (same login, different stored password) never uses that pair: it must prove its own
+ * credentials with a sign-in, which fails when they are wrong. Sharing a session therefore never
+ * lends one operator tokens its own credentials could not have obtained.
+ *
+ * The api role never signs in on demand. It reads the pair the worker put in Redis; if there is none
+ * it throws a clear, actionable error instead of quietly authenticating and invalidating the worker's
+ * session. It MAY refresh, because a refresh under the lock is still single-writer — but a dead
+ * refresh token is only recoverable by the worker.
  */
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { AppConfigService } from '@core/config/config.service';
+import { type IchancyAgent } from './ichancy-agent';
 import { ICHANCY_AUTH_CLIENT, type IchancyAuthClient } from './ichancy-http.client';
 import { ICHANCY_SESSION_STORE, type IchancySessionStore } from './ichancy-session.store';
-import { isIchancyOk, isIchancyRejected } from './ichancy.types';
+import {
+  ichancyAmbiguous,
+  ichancyOk,
+  isIchancyOk,
+  isIchancyRejected,
+  type IchancyResult,
+} from './ichancy.types';
 import { type IchancyTokenPair } from './ichancy.wire';
 
-/** One key holds the whole pair: reading half a session must be impossible. */
-export const ICHANCY_TOKENS_KEY = 'ichancy:session:v1:tokens';
-/** Follows the LockService.key('ichancy','session') convention from @core/cache. */
-export const ICHANCY_SESSION_LOCK_KEY = 'lock:ichancy:session';
+/**
+ * One key holds the whole pair for one agent: reading half a session must be impossible. `v2`
+ * because the v1 key was one global pair with no agent in it; nothing reads v1 any more, so the
+ * first worker call after a deploy signs in once per agent and the old key expires on its own.
+ */
+export const ichancyTokensKey = (agentKey: string): string => `ichancy:session:v2:${agentKey}:tokens`;
+/** Follows the LockService.key('ichancy','session',...) convention from @core/cache. */
+export const ichancySessionLockKey = (agentKey: string): string =>
+  `lock:ichancy:session:${agentKey}`;
 
 /** Long enough for a signin round trip on a bad day, short enough that a crashed holder unblocks. */
 const LOCK_TTL_MS = 15_000;
@@ -41,6 +67,7 @@ const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export type IchancySessionErrorCode =
   | 'ICHANCY_SESSION_MISSING'
   | 'ICHANCY_SESSION_REAUTH_REQUIRED'
+  | 'ICHANCY_SESSION_CREDENTIALS_CHANGED'
   | 'ICHANCY_SIGNIN_REJECTED'
   | 'ICHANCY_SIGNIN_AMBIGUOUS'
   | 'ICHANCY_SESSION_LOCK_TIMEOUT';
@@ -62,14 +89,24 @@ interface StoredSession {
   obtainedAt: string;
   /** Monotonic per rotation. Purely diagnostic, but it makes "who rotated last" answerable. */
   generation: number;
+  /** Digest of the credentials that obtained this pair; see the header. Empty when unreadable. */
+  credentialDigest: string;
 }
 
 /** Never exposes the tokens themselves — for /health and admin screens. */
 export interface IchancySessionInfo {
   hasSession: boolean;
+  /** True when the stored pair was obtained with exactly this agent's credentials. */
+  matchesCredentials?: boolean;
   source?: 'signin' | 'refresh';
   obtainedAt?: string;
   generation?: number;
+}
+
+/** What a successful explicit sign-in reports. No token, ever. */
+export interface IchancySignedIn {
+  readonly agentKey: string;
+  readonly generation: number;
 }
 
 function delay(ms: number): Promise<void> {
@@ -95,14 +132,20 @@ function parseStored(raw: string | null): StoredSession | null {
     source: candidate.source === 'signin' ? 'signin' : 'refresh',
     obtainedAt: typeof candidate.obtainedAt === 'string' ? candidate.obtainedAt : '',
     generation: typeof candidate.generation === 'number' ? candidate.generation : 0,
+    credentialDigest:
+      typeof candidate.credentialDigest === 'string' ? candidate.credentialDigest : '',
   };
 }
 
 @Injectable()
 export class IchancySessionService {
   private readonly logger = new Logger(IchancySessionService.name);
-  /** In-process single flight: N concurrent 401s share ONE rotation. */
-  private inflight: Promise<string> | null = null;
+  /**
+   * In-process single flight, per agent AND per credential digest: N concurrent 401s for one agent
+   * share ONE rotation, and a caller with other credentials never joins a rotation it could not have
+   * performed itself.
+   */
+  private readonly inflight = new Map<string, Promise<string>>();
 
   constructor(
     private readonly config: AppConfigService,
@@ -110,11 +153,11 @@ export class IchancySessionService {
     @Inject(ICHANCY_AUTH_CLIENT) private readonly auth: IchancyAuthClient,
   ) {}
 
-  /** The token to put in the Authorization header. Signs in on demand (worker only). */
-  async getAccessToken(): Promise<string> {
-    const current = await this.readSession();
+  /** The token to put in the Authorization header for this agent. Signs in on demand (worker only). */
+  async getAccessToken(agent: IchancyAgent): Promise<string> {
+    const current = this.ours(agent, await this.readSession(agent));
     if (current) return current.accessToken;
-    return this.singleFlight(() => this.rotateUnderLock(null));
+    return this.singleFlight(agent, () => this.rotateUnderLock(agent, null));
   }
 
   /**
@@ -122,51 +165,104 @@ export class IchancySessionService {
    * failed: if Redis already holds a different one, somebody rotated while we were in flight and we
    * simply take theirs — no second refresh, no invalidated pair.
    */
-  async refreshAfterUnauthorized(usedAccessToken: string | null): Promise<string> {
-    const first = await this.singleFlight(() => this.rotateUnderLock(usedAccessToken));
+  async refreshAfterUnauthorized(agent: IchancyAgent, usedAccessToken: string | null): Promise<string> {
+    const first = await this.singleFlight(agent, () => this.rotateUnderLock(agent, usedAccessToken));
     if (usedAccessToken === null || first !== usedAccessToken) return first;
     // We joined an in-flight rotation that handed back the very token we know is dead (it was
     // started for a different reason). Run one more — still single-flight, so still one refresh.
-    return this.singleFlight(() => this.rotateUnderLock(usedAccessToken));
+    return this.singleFlight(agent, () => this.rotateUnderLock(agent, usedAccessToken));
   }
 
-  /** Warm-up hook for the worker (cron/bootstrap). Safe to call repeatedly. */
-  async ensureSession(): Promise<void> {
-    await this.getAccessToken();
+  /** Warm-up hook for the worker (bootstrap). Safe to call repeatedly. */
+  async ensureSession(agent: IchancyAgent): Promise<void> {
+    await this.getAccessToken(agent);
   }
 
-  /** Drops the stored pair. The next caller signs in (worker) or fails loudly (api). */
-  async invalidate(): Promise<void> {
-    await this.store.remove(ICHANCY_TOKENS_KEY);
-    this.logger.warn('Ichancy session cleared from Redis');
+  /**
+   * A REAL sign-in with this agent's credentials, now, in any role — the proof activation and a
+   * credential edit rest on. It never trusts a stored pair: a pair proves that someone once signed
+   * in, not that these credentials still work.
+   *
+   * On success the new pair replaces the stored one (the old pair is dead at Ichancy the moment the
+   * sign-in succeeds, so keeping it would only hand out dead tokens). On a rejection or an unknown
+   * answer the stored pair is left exactly as it was: a refused sign-in does not end the account's
+   * existing session.
+   */
+  async signInNow(agent: IchancyAgent): Promise<IchancyResult<IchancySignedIn>> {
+    const deadline = Date.now() + LOCK_WAIT_TOTAL_MS;
+    const lockKey = ichancySessionLockKey(agent.agentKey);
+
+    for (;;) {
+      const lockToken = await this.store.acquireLock(lockKey, LOCK_TTL_MS);
+      if (lockToken !== null) {
+        try {
+          const before = await this.readSession(agent);
+          const signedIn = await this.auth.signin(agent);
+          if (!isIchancyOk(signedIn)) return signedIn;
+          const generation = (before?.generation ?? 0) + 1;
+          await this.persist(agent, signedIn.data, 'signin', before?.generation ?? 0);
+          this.logger.log(
+            `Signed in to Ichancy for agent ${agent.agentKey} on request (previous pair, if any, is now invalid)`,
+          );
+          return ichancyOk({ agentKey: agent.agentKey, generation });
+        } finally {
+          await this.store.releaseLock(lockKey, lockToken);
+        }
+      }
+
+      if (Date.now() >= deadline) {
+        return ichancyAmbiguous(
+          `Another process has held the Ichancy session lock of agent ${agent.agentKey} for ` +
+            `${String(LOCK_WAIT_TOTAL_MS)}ms; the sign-in was not attempted`,
+        );
+      }
+      await delay(LOCK_POLL_DELAY_MS);
+    }
   }
 
-  async describe(): Promise<IchancySessionInfo> {
-    const current = await this.readSession();
+  /**
+   * Drops the stored pair of one agent. The next caller signs in (worker) or fails loudly (api). Used
+   * when an operator's Ichancy settings move away from this agent.
+   */
+  async invalidate(agentKey: string): Promise<void> {
+    await this.store.remove(ichancyTokensKey(agentKey));
+    this.logger.warn(`Ichancy session of agent ${agentKey} cleared from Redis`);
+  }
+
+  async describe(agent: IchancyAgent): Promise<IchancySessionInfo> {
+    const current = await this.readSession(agent);
     if (!current) return { hasSession: false };
     return {
       hasSession: true,
+      matchesCredentials: current.credentialDigest === agent.credentialDigest,
       source: current.source,
       obtainedAt: current.obtainedAt,
       generation: current.generation,
     };
   }
 
-  private async singleFlight(work: () => Promise<string>): Promise<string> {
-    const existing = this.inflight;
+  private ours(agent: IchancyAgent, stored: StoredSession | null): StoredSession | null {
+    return stored !== null && stored.credentialDigest === agent.credentialDigest ? stored : null;
+  }
+
+  private async singleFlight(agent: IchancyAgent, work: () => Promise<string>): Promise<string> {
+    const key = `${agent.agentKey}:${agent.credentialDigest}`;
+    const existing = this.inflight.get(key);
     if (existing) return existing;
     const started = work().finally(() => {
-      this.inflight = null;
+      this.inflight.delete(key);
     });
-    this.inflight = started;
+    this.inflight.set(key, started);
     return started;
   }
 
-  private async readSession(): Promise<StoredSession | null> {
-    const raw = await this.store.read(ICHANCY_TOKENS_KEY);
+  private async readSession(agent: IchancyAgent): Promise<StoredSession | null> {
+    const raw = await this.store.read(ichancyTokensKey(agent.agentKey));
     const parsed = parseStored(raw);
     if (raw !== null && parsed === null) {
-      this.logger.error('Stored Ichancy session is corrupt; treating it as missing');
+      this.logger.error(
+        `Stored Ichancy session of agent ${agent.agentKey} is corrupt; treating it as missing`,
+      );
     }
     return parsed;
   }
@@ -175,66 +271,91 @@ export class IchancySessionService {
    * Cross-process single flight. Losers do NOT queue up behind the lock to refresh again — they wait
    * for the winner's pair to appear and use it, because a second refresh would kill the first.
    */
-  private async rotateUnderLock(staleAccessToken: string | null): Promise<string> {
+  private async rotateUnderLock(agent: IchancyAgent, staleAccessToken: string | null): Promise<string> {
     const deadline = Date.now() + LOCK_WAIT_TOTAL_MS;
+    const lockKey = ichancySessionLockKey(agent.agentKey);
 
     for (;;) {
-      const current = await this.readSession();
+      const current = this.ours(agent, await this.readSession(agent));
       if (current && staleAccessToken !== null && current.accessToken !== staleAccessToken) {
         return current.accessToken;
       }
 
-      const lockToken = await this.store.acquireLock(ICHANCY_SESSION_LOCK_KEY, LOCK_TTL_MS);
+      const lockToken = await this.store.acquireLock(lockKey, LOCK_TTL_MS);
       if (lockToken !== null) {
         try {
           // Re-read inside the lock: the previous holder probably just rotated.
-          const fresh = await this.readSession();
+          const stored = await this.readSession(agent);
+          const fresh = this.ours(agent, stored);
           if (fresh && staleAccessToken === null) return fresh.accessToken;
           if (fresh && staleAccessToken !== null && fresh.accessToken !== staleAccessToken) {
             return fresh.accessToken;
           }
-          return await this.authenticate(fresh);
+          return await this.authenticate(agent, fresh, stored);
         } finally {
-          await this.store.releaseLock(ICHANCY_SESSION_LOCK_KEY, lockToken);
+          await this.store.releaseLock(lockKey, lockToken);
         }
       }
 
       if (Date.now() >= deadline) {
         throw new IchancySessionError(
           'ICHANCY_SESSION_LOCK_TIMEOUT',
-          `Another process has held the Ichancy session lock for ${String(LOCK_WAIT_TOTAL_MS)}ms without publishing a token`,
+          `Another process has held the Ichancy session lock of agent ${agent.agentKey} for ` +
+            `${String(LOCK_WAIT_TOTAL_MS)}ms without publishing a token`,
         );
       }
       await delay(LOCK_POLL_DELAY_MS);
     }
   }
 
-  /** MUST only be called while holding the lock. */
-  private async authenticate(current: StoredSession | null): Promise<string> {
+  /**
+   * MUST only be called while holding the lock. `current` is the stored pair when it was obtained
+   * with this agent's credentials; `stored` is whatever is stored, which may belong to other
+   * credentials for the same login.
+   */
+  private async authenticate(
+    agent: IchancyAgent,
+    current: StoredSession | null,
+    stored: StoredSession | null,
+  ): Promise<string> {
     if (current) {
-      const refreshed = await this.auth.refresh(current.refreshToken);
+      const refreshed = await this.auth.refresh(agent, current.refreshToken);
       if (isIchancyOk(refreshed)) {
-        return this.persist(refreshed.data, 'refresh', current.generation);
+        return this.persist(agent, refreshed.data, 'refresh', current.generation);
       }
       this.logger.warn(
-        `Ichancy refreshToken failed (${isIchancyRejected(refreshed) ? refreshed.code : 'ambiguous'}); ` +
+        `Ichancy refreshToken failed for agent ${agent.agentKey} ` +
+          `(${isIchancyRejected(refreshed) ? refreshed.code : 'ambiguous'}); ` +
           'the stored pair must be assumed dead because refresh rotates',
       );
     }
 
     if (!this.config.app.isWorker) {
+      if (current) {
+        throw new IchancySessionError(
+          'ICHANCY_SESSION_REAUTH_REQUIRED',
+          'The stored Ichancy refresh token is dead. Only APP_ROLE=worker may sign in again.',
+        );
+      }
+      if (stored) {
+        throw new IchancySessionError(
+          'ICHANCY_SESSION_CREDENTIALS_CHANGED',
+          "The stored Ichancy session was obtained with different credentials for this agent's " +
+            "login. APP_ROLE=api never signs in — the worker, or a verification from the dashboard, must prove this operator's credentials.",
+        );
+      }
       throw new IchancySessionError(
-        current ? 'ICHANCY_SESSION_REAUTH_REQUIRED' : 'ICHANCY_SESSION_MISSING',
-        current
-          ? 'The stored Ichancy refresh token is dead. Only APP_ROLE=worker may sign in again.'
-          : 'No Ichancy session in Redis. APP_ROLE=api never signs in — start APP_ROLE=worker first.',
+        'ICHANCY_SESSION_MISSING',
+        'No Ichancy session in Redis for this agent. APP_ROLE=api never signs in — start APP_ROLE=worker first.',
       );
     }
 
-    const signedIn = await this.auth.signin();
+    const signedIn = await this.auth.signin(agent);
     if (isIchancyOk(signedIn)) {
-      this.logger.log('Signed in to Ichancy (previous token pair, if any, is now invalid)');
-      return this.persist(signedIn.data, 'signin', current?.generation ?? 0);
+      this.logger.log(
+        `Signed in to Ichancy for agent ${agent.agentKey} (previous token pair, if any, is now invalid)`,
+      );
+      return this.persist(agent, signedIn.data, 'signin', stored?.generation ?? 0);
     }
     if (isIchancyRejected(signedIn)) {
       throw new IchancySessionError(
@@ -249,6 +370,7 @@ export class IchancySessionService {
   }
 
   private async persist(
+    agent: IchancyAgent,
     pair: IchancyTokenPair,
     source: 'signin' | 'refresh',
     previousGeneration: number,
@@ -259,8 +381,9 @@ export class IchancySessionService {
       source,
       obtainedAt: new Date().toISOString(),
       generation: previousGeneration + 1,
+      credentialDigest: agent.credentialDigest,
     };
-    await this.store.write(ICHANCY_TOKENS_KEY, JSON.stringify(session), SESSION_TTL_MS);
+    await this.store.write(ichancyTokensKey(agent.agentKey), JSON.stringify(session), SESSION_TTL_MS);
     return session.accessToken;
   }
 }

@@ -1,16 +1,27 @@
 /**
- * The ordinary transport: Node's fetch, browser-shaped headers, and a cookie jar.
+ * The ordinary transport: Node's fetch, browser-shaped headers, and a cookie jar per agent.
  *
  * This is the RIGHT transport once Ichancy allowlists a server IP, and the only one that makes sense
- * for a host with no bot protection. It is kept exactly as it was when it lived inside
- * IchancyHttpClient — the cookie jar and its reasoning moved here verbatim, because the jar is a
- * property of "how bytes travel", not of what a credit means.
+ * for a host with no bot protection. It is kept as it was when it lived inside IchancyHttpClient —
+ * the cookie jar and its reasoning moved here, because the jar is a property of "how bytes travel",
+ * not of what a credit means.
+ *
+ * ══ ONE JAR PER AGENT, AND THE HOST COMES FROM THE REQUEST ═══════════════════════════════════════
+ * Operators carry their own Ichancy base URL and login. So:
+ *  - `Origin`/`Referer` are derived from the URL being called, never from ICHANCY_BASE_URL: an
+ *    operator on another Ichancy host must not announce this deployment's origin;
+ *  - the jar (PHPSESSID, __cf_bm) is kept per agent key, so one agent's PHP session is never
+ *    presented on another agent's calls;
+ *  - ICHANCY_COOKIE and the harvested clearance belong to ICHANCY_BASE_URL's host — they were earned
+ *    there — so they are only ever sent to that host. A request to another host carries only what
+ *    that host itself set.
  */
 import { Injectable, Logger } from '@nestjs/common';
 
 import { AppConfigService } from '@core/config/config.service';
 
 import { isCloudflareChallenge } from '../error-map';
+import { originOf } from '../ichancy-agent';
 
 import { CookieHarvesterService } from './cookie-harvester.service';
 import { IchancyCookieStore, type HarvestedCookies } from './ichancy-cookie.store';
@@ -51,18 +62,19 @@ export class FetchIchancyTransport implements IchancyTransport {
   private readonly logger = new Logger(FetchIchancyTransport.name);
 
   /**
-   * The cookies we present to Cloudflare and to their PHP session layer.
+   * The cookies we present to Cloudflare and to their PHP session layer, one jar per agent key.
    *
    * WHY A JAR AND NOT JUST THE CONFIGURED STRING: `PHPSESSID` and `__cf_bm` are ROTATED by the far
    * side mid-session (__cf_bm lives about 30 minutes), and replaying a stale one is how a working
-   * process starts getting challenged an hour after it booted. So the configured value seeds the jar
-   * and every Set-Cookie we are handed updates it.
+   * process starts getting challenged an hour after it booted. So the configured value seeds a jar
+   * for the configured host, and every Set-Cookie we are handed updates the jar of the agent it was
+   * handed to.
    *
    * In-memory on purpose: a restart re-seeds from config, and two processes each keeping their own
    * PHP session is exactly what the far side expects of two browsers.
    */
-  private readonly cookies = new Map<string, string>();
-  private cookiesSeeded = false;
+  private readonly jars = new Map<string, Map<string, string>>();
+  private missingCookieWarned = false;
 
   constructor(
     private readonly config: AppConfigService,
@@ -73,6 +85,10 @@ export class FetchIchancyTransport implements IchancyTransport {
   async post(request: IchancyTransportRequest): Promise<IchancyTransportResponse> {
     const first = await this.send(request);
     if (!isCloudflareChallenge(first.status, first.text, first.contentType)) return first;
+
+    // The harvester earns clearances for ICHANCY_BASE_URL's host only; a challenge elsewhere is
+    // reported as it is.
+    if (!this.isConfiguredHost(request.url)) return first;
 
     // CHALLENGED. When the harvester is enabled this is recoverable without a human: the clearance
     // has simply aged out, and a browser can earn a new one in seconds.
@@ -92,14 +108,15 @@ export class FetchIchancyTransport implements IchancyTransport {
   }
 
   private async send(request: IchancyTransportRequest): Promise<IchancyTransportResponse> {
+    const jar = this.jarFor(request);
     const response = await fetch(request.url, {
       method: 'POST',
-      headers: await this.buildHeaders(request.accessToken),
+      headers: await this.buildHeaders(request, jar),
       body: JSON.stringify(request.body),
       signal: AbortSignal.timeout(request.timeoutMs),
     });
 
-    this.absorbCookies(response);
+    this.absorbCookies(response, jar);
 
     return {
       status: response.status,
@@ -111,19 +128,23 @@ export class FetchIchancyTransport implements IchancyTransport {
   /**
    * The headers a browser would send, because that is what the far side is checking for.
    *
-   * `origin` and `referer` are derived from ICHANCY_BASE_URL rather than hard-coded so a staging
-   * host cannot end up announcing production's origin. The User-Agent is configuration for one
-   * reason only: cf_clearance is issued against the UA that solved the challenge, so a mismatch
-   * silently invalidates a cookie that looks perfectly valid in .env.
+   * `origin` and `referer` are derived from the URL being called rather than hard-coded, so neither a
+   * staging host nor another operator's host can end up announcing the wrong origin. The User-Agent
+   * is configuration for one reason only: cf_clearance is issued against the UA that solved the
+   * challenge, so a mismatch silently invalidates a cookie that looks perfectly valid in .env.
    */
-  private async buildHeaders(accessToken: string | null): Promise<Record<string, string>> {
-    // The HARVESTED clearance wins over ICHANCY_COOKIE, and brings its own User-Agent.
+  private async buildHeaders(
+    request: IchancyTransportRequest,
+    jar: Map<string, string>,
+  ): Promise<Record<string, string>> {
+    // The HARVESTED clearance wins over the jar, and brings its own User-Agent — on the host it was
+    // harvested for, and nowhere else.
     //
     // WHY THE UA TRAVELS WITH THE COOKIE: Cloudflare binds a clearance to the browser that earned
     // it, so a harvested cookie sent under the configured UA fails exactly as if no cookie had been
     // sent. Keeping the pair together is what makes that impossible to get wrong — it was got wrong
     // twice on 2026-08-19, once as Chrome 140 vs 150 and once as Chrome vs Firefox.
-    const harvested = await this.harvestedCookies();
+    const harvested = this.isConfiguredHost(request.url) ? await this.harvestedCookies() : null;
 
     const headers: Record<string, string> = {
       'content-type': 'application/json',
@@ -131,15 +152,15 @@ export class FetchIchancyTransport implements IchancyTransport {
       'user-agent': harvested?.userAgent ?? this.config.ichancy.userAgent,
     };
 
-    if (accessToken) headers['authorization'] = `Bearer ${accessToken}`;
+    if (request.accessToken) headers['authorization'] = `Bearer ${request.accessToken}`;
 
-    const origin = this.originOfBaseUrl();
+    const origin = originOf(request.url);
     if (origin !== null) {
       headers['origin'] = origin;
       headers['referer'] = `${origin}/`;
     }
 
-    const cookie = harvested?.cookie ?? this.cookieHeader();
+    const cookie = harvested?.cookie ?? cookieHeaderOf(jar);
     if (cookie !== null) headers['cookie'] = cookie;
 
     return headers;
@@ -151,18 +172,28 @@ export class FetchIchancyTransport implements IchancyTransport {
     return this.store.read();
   }
 
-  /** Everything in the jar, seeded from config on first use. Null when there is nothing to send. */
-  private cookieHeader(): string | null {
-    if (!this.cookiesSeeded) {
-      this.cookiesSeeded = true;
+  /**
+   * The jar of the agent making this call, created on first use. A jar for ICHANCY_BASE_URL's host is
+   * seeded from ICHANCY_COOKIE; any other host starts empty.
+   */
+  private jarFor(request: IchancyTransportRequest): Map<string, string> {
+    const key = request.agentKey ?? originOf(request.url) ?? request.url;
+    const existing = this.jars.get(key);
+    if (existing !== undefined) return existing;
+
+    const jar = new Map<string, string>();
+    this.jars.set(key, jar);
+
+    if (this.isConfiguredHost(request.url)) {
       const configured = this.config.ichancy.cookie;
       if (configured !== null) {
-        for (const [name, value] of parseCookieHeader(configured)) this.cookies.set(name, value);
+        for (const [name, value] of parseCookieHeader(configured)) jar.set(name, value);
         this.logger.log(
-          `Ichancy cookie jar seeded from ICHANCY_COOKIE (${String(this.cookies.size)} cookie(s): ` +
-            `${[...this.cookies.keys()].join(', ')})`,
+          `Ichancy cookie jar seeded from ICHANCY_COOKIE (${String(jar.size)} cookie(s): ` +
+            `${[...jar.keys()].join(', ')})`,
         );
-      } else {
+      } else if (!this.missingCookieWarned) {
+        this.missingCookieWarned = true;
         // Not an error: a host without bot protection needs none, and the browser transport owns its
         // own cookies. It IS the first thing to check when every call comes back CLOUDFLARE_CHALLENGE.
         this.logger.warn(
@@ -171,16 +202,14 @@ export class FetchIchancyTransport implements IchancyTransport {
         );
       }
     }
-
-    if (this.cookies.size === 0) return null;
-    return [...this.cookies].map(([name, value]) => `${name}=${value}`).join('; ');
+    return jar;
   }
 
   /**
-   * Merge whatever the far side just set into the jar. Never throws and never logs a VALUE: a
-   * session cookie is a credential, and this codebase does not write credentials to logs.
+   * Merge whatever the far side just set into the calling agent's jar. Never throws and never logs a
+   * VALUE: a session cookie is a credential, and this codebase does not write credentials to logs.
    */
-  private absorbCookies(response: Response): void {
+  private absorbCookies(response: Response, jar: Map<string, string>): void {
     // getSetCookie() splits correctly on the commas inside Expires=; a plain get('set-cookie')
     // returns them joined into one unparseable string.
     for (const line of response.headers.getSetCookie()) {
@@ -188,19 +217,22 @@ export class FetchIchancyTransport implements IchancyTransport {
       if (parsed === null) continue;
       // An empty value is a deletion. Dropping it beats sending `PHPSESSID=` back.
       if (parsed.value.length === 0) {
-        this.cookies.delete(parsed.name);
+        jar.delete(parsed.name);
         continue;
       }
-      this.cookies.set(parsed.name, parsed.value);
+      jar.set(parsed.name, parsed.value);
     }
   }
 
-  /** `https://agents.ichancy.com` from the configured base URL, or null if it will not parse. */
-  private originOfBaseUrl(): string | null {
-    try {
-      return new URL(this.config.ichancy.baseUrl).origin;
-    } catch {
-      return null;
-    }
+  /** True when `url` is on ICHANCY_BASE_URL's host, the one the configured cookies were earned on. */
+  private isConfiguredHost(url: string): boolean {
+    const configured = originOf(this.config.ichancy.baseUrl);
+    return configured !== null && originOf(url) === configured;
   }
+}
+
+/** Everything in a jar as one header, or null when there is nothing to send. */
+function cookieHeaderOf(jar: Map<string, string>): string | null {
+  if (jar.size === 0) return null;
+  return [...jar].map(([name, value]) => `${name}=${value}`).join('; ');
 }

@@ -9,20 +9,12 @@ import type { TenantRegistryService } from '@core/tenant/services/tenant-registr
 import { TENANT_ZERO_ID } from '@core/tenant/tenant.constants';
 import { getEffectiveTenantId } from '@core/tenant/tenant.storage';
 
-import { ichancyFingerprint, type IchancyIdentity, type StatusDecision } from '../utils/resume';
 import type { TenantViewRow } from '../views/tenant.view';
 
 import { TenantAdminService } from './tenant-admin.service';
 
 const OPERATOR_ID = '11111111-1111-4111-8111-111111111111';
 const ACTOR_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-000000000006';
-
-const IDENTITY: IchancyIdentity = {
-  ichancyBaseUrl: 'https://agents.ichancy.com',
-  ichancyUsername: 'agent_north',
-  ichancyPasswordEnc: 'v1:sealed-password',
-  ichancyAgentId: '10099',
-};
 
 const operatorRow = (overrides: Partial<TenantViewRow> = {}): TenantViewRow => ({
   id: OPERATOR_ID,
@@ -33,9 +25,9 @@ const operatorRow = (overrides: Partial<TenantViewRow> = {}): TenantViewRow => (
   adminChatId: -1001234567890n,
   feedChatId: null,
   botUsername: 'northern_cashier_bot',
-  ichancyBaseUrl: IDENTITY.ichancyBaseUrl,
-  ichancyUsername: IDENTITY.ichancyUsername,
-  ichancyAgentId: IDENTITY.ichancyAgentId,
+  ichancyBaseUrl: 'https://agents.ichancy.com',
+  ichancyUsername: 'agent_north',
+  ichancyAgentId: '10099',
   currencyCode: 'NSP',
   dualApprovalThresholdMinor: 30_000_000n,
   agentFloatLowWatermarkMinor: 50_000_000n,
@@ -48,16 +40,9 @@ const operatorRow = (overrides: Partial<TenantViewRow> = {}): TenantViewRow => (
   ...overrides,
 });
 
-const suspension = (identity: IchancyIdentity = IDENTITY): StatusDecision => ({
-  action: 'tenant.suspended',
-  after: { status: 'SUSPENDED', $meta: { ichancyFingerprint: ichancyFingerprint(identity) } },
-});
-
 interface HarnessOptions {
   /** The view row a read AFTER the write answers. Defaults to `current`. */
   after?: TenantViewRow;
-  /** The latest status decision in the operator's audit log. */
-  latest?: StatusDecision | null;
 }
 
 function harness(current: TenantViewRow | null, options: HarnessOptions = {}) {
@@ -65,15 +50,10 @@ function harness(current: TenantViewRow | null, options: HarnessOptions = {}) {
   const tx = {
     tenant: {
       findUnique: jest.fn().mockResolvedValue(current),
-      // Two different reads go through findUniqueOrThrow: the view after a write, and the Ichancy
-      // identity. They are told apart by what they select, as the database would.
-      findUniqueOrThrow: jest.fn((args: { select: Record<string, unknown> }) =>
-        Promise.resolve('ichancyPasswordEnc' in args.select ? IDENTITY : afterRow),
-      ),
+      findUniqueOrThrow: jest.fn().mockResolvedValue(afterRow),
       update: jest.fn(),
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
-    auditLog: { findFirst: jest.fn().mockResolvedValue(options.latest ?? null) },
   };
   const prisma = {
     runInTransaction: jest.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)),
@@ -106,7 +86,7 @@ function harness(current: TenantViewRow | null, options: HarnessOptions = {}) {
 }
 
 describe('TenantAdminService.suspend', () => {
-  it("suspends an ACTIVE operator, audits it with the Ichancy fingerprint in that operator's own log and evicts all three caches", async () => {
+  it("suspends an ACTIVE operator, audits it in that operator's own log and evicts all three caches", async () => {
     const h = harness(operatorRow(), { after: operatorRow({ status: TenantStatus.SUSPENDED }) });
 
     const view = await h.service.suspend(ACTOR_ID, OPERATOR_ID);
@@ -126,13 +106,9 @@ describe('TenantAdminService.suspend', () => {
           subjectId: OPERATOR_ID,
           before: { status: 'ACTIVE' },
           after: { status: 'SUSPENDED' },
-          metadata: { ichancyFingerprint: ichancyFingerprint(IDENTITY) },
         }),
       },
     ]);
-    // The evidence proves "unchanged" without carrying the credentials themselves.
-    const evidence = JSON.stringify(h.audits);
-    for (const value of Object.values(IDENTITY)) expect(evidence).not.toContain(value);
 
     expect(h.registry.invalidate).toHaveBeenCalledWith(OPERATOR_ID);
     expect(h.bots.invalidate).toHaveBeenCalledWith(OPERATOR_ID);
@@ -186,110 +162,15 @@ describe('TenantAdminService.suspend', () => {
   });
 });
 
-describe('TenantAdminService.activate', () => {
-  const suspended = () => operatorRow({ status: TenantStatus.SUSPENDED });
+describe('TenantAdminService.evictOperator', () => {
+  it('drops exactly the three caches a suspension drops, so an activation can reuse it', async () => {
+    const h = harness(operatorRow());
 
-  it('resumes an operator suspended while serving with unchanged credentials, audited as no sign-in', async () => {
-    const h = harness(suspended(), { latest: suspension(), after: operatorRow() });
+    await h.service.evictOperator(OPERATOR_ID);
 
-    const view = await h.service.activate(ACTOR_ID, OPERATOR_ID);
-
-    expect(view).toMatchObject({ status: 'ACTIVE', counts: { players: 3, deposits: 7 } });
-    expect(h.tx.auditLog.findFirst).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: {
-          tenantId: OPERATOR_ID,
-          entityType: 'Tenant',
-          entityId: OPERATOR_ID,
-          action: { in: ['tenant.suspended', 'tenant.activated'] },
-        },
-      }),
-    );
-    // Conditional on the credentials that were just fingerprinted, not only on the status.
-    expect(h.tx.tenant.updateMany).toHaveBeenCalledWith({
-      where: { id: OPERATOR_ID, status: TenantStatus.SUSPENDED, ...IDENTITY },
-      data: { status: TenantStatus.ACTIVE },
-    });
-    expect(h.audits).toEqual([
-      {
-        tenantId: OPERATOR_ID,
-        input: expect.objectContaining({
-          action: 'tenant.activated',
-          actor: { type: 'ADMIN', id: ACTOR_ID },
-          before: { status: 'SUSPENDED' },
-          after: { status: 'ACTIVE' },
-          metadata: { verification: 'resumed-previously-serving', signIn: false },
-        }),
-      },
-    ]);
     expect(h.registry.invalidate).toHaveBeenCalledWith(OPERATOR_ID);
     expect(h.bots.invalidate).toHaveBeenCalledWith(OPERATOR_ID);
     expect(h.initData.invalidate).toHaveBeenCalledWith(OPERATOR_ID);
-  });
-
-  it('refuses an operator that never served (no suspension on record) with 503 and changes nothing', async () => {
-    const h = harness(suspended(), { latest: null });
-
-    await expect(h.service.activate(ACTOR_ID, OPERATOR_ID)).rejects.toMatchObject({
-      httpStatus: 503,
-      errorCode: 'TENANT_ACTIVATION_UNAVAILABLE',
-    });
-    expect(h.tx.tenant.updateMany).not.toHaveBeenCalled();
-    expect(h.audits).toHaveLength(0);
-    expect(h.registry.invalidate).not.toHaveBeenCalled();
-  });
-
-  it('refuses an operator whose Ichancy details changed while it was suspended', async () => {
-    const h = harness(suspended(), {
-      latest: suspension({ ...IDENTITY, ichancyAgentId: '10500' }),
-    });
-
-    await expect(h.service.activate(ACTOR_ID, OPERATOR_ID)).rejects.toMatchObject({
-      httpStatus: 503,
-      errorCode: 'TENANT_ACTIVATION_UNAVAILABLE',
-    });
-    expect(h.tx.tenant.updateMany).not.toHaveBeenCalled();
-    expect(h.audits).toHaveLength(0);
-  });
-
-  it('writes nothing when a concurrent activate already won the row', async () => {
-    const h = harness(suspended(), { latest: suspension(), after: operatorRow() });
-    h.tx.tenant.updateMany.mockResolvedValue({ count: 0 });
-
-    await expect(h.service.activate(ACTOR_ID, OPERATOR_ID)).resolves.toMatchObject({
-      status: 'ACTIVE',
-    });
-    expect(h.audits).toHaveLength(0);
-    expect(h.registry.invalidate).not.toHaveBeenCalled();
-  });
-
-  it('refuses when the credentials changed between the fingerprint and the update', async () => {
-    const h = harness(suspended(), { latest: suspension(), after: suspended() });
-    h.tx.tenant.updateMany.mockResolvedValue({ count: 0 });
-
-    await expect(h.service.activate(ACTOR_ID, OPERATOR_ID)).rejects.toMatchObject({
-      errorCode: 'TENANT_ACTIVATION_UNAVAILABLE',
-    });
-    expect(h.audits).toHaveLength(0);
-  });
-
-  it('answers an ACTIVE operator as it is', async () => {
-    const h = harness(operatorRow());
-    await expect(h.service.activate(ACTOR_ID, OPERATOR_ID)).resolves.toMatchObject({
-      status: 'ACTIVE',
-    });
-    expect(h.tx.tenant.updateMany).not.toHaveBeenCalled();
-    expect(h.audits).toHaveLength(0);
-  });
-
-  it('refuses a CLOSED operator and an unknown id', async () => {
-    await expect(
-      harness(operatorRow({ status: TenantStatus.CLOSED })).service.activate(ACTOR_ID, OPERATOR_ID),
-    ).rejects.toMatchObject({ errorCode: 'TENANT_CLOSED' });
-    await expect(harness(null).service.activate(ACTOR_ID, OPERATOR_ID)).rejects.toMatchObject({
-      httpStatus: 404,
-      errorCode: 'TENANT_NOT_FOUND',
-    });
   });
 });
 

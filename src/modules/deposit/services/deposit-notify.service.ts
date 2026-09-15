@@ -38,6 +38,7 @@ import {
   renderOpsCardPublic,
   renderPlayerMessage,
   esc,
+  playerLabelOf,
   type OpsCardInput,
 } from '../telegram/deposit-card.util';
 
@@ -361,6 +362,12 @@ export class DepositNotifyService {
       this.logger.warn(`cannot notify unknown player ${playerId}`);
       return;
     }
+    // An imported player has no Telegram account, so there is no private chat to write to. Not an
+    // error: the message has nowhere to go until a Telegram id is attached to the row.
+    if (player.telegramUserId === null) {
+      this.logger.warn(`player ${playerId} has no Telegram account; message not sent`);
+      return;
+    }
     // A player's Telegram id is only a chat the bot they started can write to, which is their
     // operator's bot.
     await this.bot.sendMessage(
@@ -397,10 +404,11 @@ export class DepositNotifyService {
     });
   }
 
-  private playerLabel(player: { telegramUserId: bigint; telegramUsername: string | null }): string {
-    return player.telegramUsername === null
-      ? `id ${player.telegramUserId.toString()}`
-      : `@${player.telegramUsername} (${player.telegramUserId.toString()})`;
+  private playerLabel(player: {
+    telegramUserId: bigint | null;
+    telegramUsername: string | null;
+  }): string {
+    return playerLabelOf(player);
   }
 }
 

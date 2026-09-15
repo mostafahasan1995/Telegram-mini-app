@@ -58,6 +58,13 @@ const httpUrl = (label: string) =>
 
 const nonEmpty = (label: string) => z.string().trim().min(1, `${label} is required`);
 
+/** A trimmed string that may be absent; a blank line reads as absent, like optionalFlag. */
+const optionalText = (label: string) =>
+  z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z.string().trim().min(1, `${label} must not be blank`).optional(),
+  );
+
 /**
  * Sent as `User-Agent` to the agent API when ICHANCY_USER_AGENT is unset or blank.
  *
@@ -159,11 +166,22 @@ export const envSchema = z
       ),
 
     // ---- ICHANCY ------------------------------------------------------------
+    /**
+     * The deployment's Ichancy host: PlatformDefaults' base URL for new operators, and the host the
+     * transports' cookie, harvester and browser page belong to. An operator's calls go to the base
+     * URL on its own tenant row.
+     */
     ICHANCY_BASE_URL: httpUrl('ICHANCY_BASE_URL'),
-    ICHANCY_USERNAME: nonEmpty('ICHANCY_USERNAME'),
-    ICHANCY_PASSWORD: nonEmpty('ICHANCY_PASSWORD'),
-    /** affiliateId of our agent; used as parentId when registering players. */
-    ICHANCY_AGENT_ID: nonEmpty('ICHANCY_AGENT_ID'),
+    /**
+     * OPTIONAL, and no Ichancy call is ever made with these three. Every call is made with the
+     * credentials of the operator that owns the player or deposit, from its tenant row. They remain
+     * accepted so an env file written for the single-operator deployment still boots: the seed copies
+     * them into the bootstrap operator once, and ICHANCY_AGENT_ID seeds PlatformDefaults' agent id.
+     * Blank is the same as absent.
+     */
+    ICHANCY_USERNAME: optionalText('ICHANCY_USERNAME'),
+    ICHANCY_PASSWORD: optionalText('ICHANCY_PASSWORD'),
+    ICHANCY_AGENT_ID: optionalText('ICHANCY_AGENT_ID'),
     ICHANCY_CURRENCY: z
       .string()
       .regex(/^[A-Z]{3}$/, 'ICHANCY_CURRENCY must be a 3-letter uppercase code')
@@ -334,7 +352,10 @@ export const envSchema = z
 
     const secrets: Array<[keyof typeof env, string, number]> = [
       ['JWT_SECRET', env.JWT_SECRET, 32],
-      ['ICHANCY_PASSWORD', env.ICHANCY_PASSWORD, 8],
+      // Only when present: it is optional now, and only the seed ever reads it.
+      ...(env.ICHANCY_PASSWORD === undefined
+        ? []
+        : ([['ICHANCY_PASSWORD', env.ICHANCY_PASSWORD, 8]] as Array<[keyof typeof env, string, number]>)),
       ['S3_SECRET_KEY', env.S3_SECRET_KEY, 8],
     ];
 

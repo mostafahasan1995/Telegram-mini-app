@@ -242,11 +242,22 @@ export class SessionService {
     // actually stops it being used.
     await this.publishRevocation(existing.id);
 
+    // A session is only ever issued from a Telegram sign-in, so its player has a Telegram id. A row
+    // without one (an imported player) cannot have reached here legitimately; refusing is the only
+    // answer that does not mint a token for an identity the player never proved.
+    const telegramUserId = existing.player.telegramUserId;
+    if (telegramUserId === null) {
+      throw new UnauthorizedError(
+        CommonErrorCodes.UNAUTHENTICATED,
+        'This session is no longer valid. Please sign in again.',
+      );
+    }
+
     return this.buildIssuedSession(
       created.id,
       existing.tenantId,
       existing.playerId,
-      existing.player.telegramUserId,
+      telegramUserId,
       PLAYER_ROLE,
       refreshToken,
       refreshTokenExpiresAt,

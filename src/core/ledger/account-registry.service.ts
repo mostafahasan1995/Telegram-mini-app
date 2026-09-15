@@ -9,10 +9,20 @@
  * simply does not work here. ON CONFLICT resolves the race inside the database, in one statement,
  * without ever raising. The `DO UPDATE SET code = EXCLUDED.code` is a deliberate no-op write: it is
  * the only way to get RETURNING to hand back the pre-existing row.
+ *
+ * WHY EVERY STATEMENT NAMES THE TENANT BY HAND: these are raw SQL, which the Prisma tenant-scope
+ * extension never sees, and account codes are only unique WITHIN an operator
+ * (`ledger_accounts_tenant_id_code_key`): every operator has its own `ICHANCY_AGENT_FLOAT:NSP`. An
+ * insert without `tenant_id` fails the NOT NULL column and conflicts on no constraint, and a lookup
+ * by code alone answers an arbitrary operator's account — the float a credit is checked against, or
+ * a sync compares, would be somebody else's. The tenant is the effective one, read exactly as
+ * LedgerRepository.post reads it, so an account is always resolved in the operator its posting is
+ * written in; with no operator in context this throws rather than guess.
  */
 import { Injectable } from '@nestjs/common';
 
 import type { Tx } from '@core/prisma/tx.type';
+import { requireEffectiveTenantId } from '@core/tenant/tenant.storage';
 
 import { parseAccountCode } from './account-codes';
 import { LedgerError } from './ledger.errors';
@@ -60,16 +70,18 @@ export class AccountRegistryService {
    */
   async resolveOrCreate(tx: Tx, code: string): Promise<LedgerAccountRef> {
     const parsed = parseAccountCode(code);
+    const tenantId = requireEffectiveTenantId();
 
     // updated_at has no database default (Prisma normally fills @updatedAt client-side), so a raw
     // insert must set it explicitly or the NOT NULL constraint fires.
     const rows = await tx.$queryRaw<RawAccountRow[]>`
       INSERT INTO ledger_accounts (
-        id, code, kind, name, currency_code, player_id, payment_method_id,
+        id, tenant_id, code, kind, name, currency_code, player_id, payment_method_id,
         is_debit_normal, is_active, cached_balance_minor, created_at, updated_at
       )
       VALUES (
         gen_random_uuid(),
+        ${tenantId}::uuid,
         ${parsed.code},
         ${parsed.kind}::ledger_account_kind,
         ${parsed.name},
@@ -82,7 +94,7 @@ export class AccountRegistryService {
         now(),
         now()
       )
-      ON CONFLICT (code) DO UPDATE SET code = EXCLUDED.code
+      ON CONFLICT (tenant_id, code) DO UPDATE SET code = EXCLUDED.code
       RETURNING id, code, kind::text AS kind, currency_code,
                 is_debit_normal, is_active, cached_balance_minor
     `;
@@ -122,13 +134,17 @@ export class AccountRegistryService {
     return resolved;
   }
 
-  /** Look up without creating. Returns null when the account has never been used. */
+  /**
+   * Look up without creating, in the effective operator. Returns null when that operator has never
+   * used the account.
+   */
   async findByCode(tx: Tx, code: string): Promise<LedgerAccountRef | null> {
+    const tenantId = requireEffectiveTenantId();
     const rows = await tx.$queryRaw<RawAccountRow[]>`
       SELECT id, code, kind::text AS kind, currency_code,
              is_debit_normal, is_active, cached_balance_minor
       FROM ledger_accounts
-      WHERE code = ${code}
+      WHERE tenant_id = ${tenantId}::uuid AND code = ${code}
     `;
     const row = rows[0];
     return row === undefined ? null : toRef(row);

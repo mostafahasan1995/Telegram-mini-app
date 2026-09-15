@@ -1,15 +1,15 @@
 /**
  * THE PRODUCT REQUIREMENT, AS A TEST.
  *
- * "A player presses Start in the bot. That registers them as a player under OUR agent (the one in
- *  env). The agent then sees one new player in the Ichancy panel."
+ * "A player presses Start in the bot. That registers them as a player under OUR agent (the operator's
+ *  own, from its tenant row). The agent then sees one new player in the Ichancy panel."
  *
  * Every clause of that sentence is asserted below, because each is served by a different piece of
  * the system and any one of them can be broken without the others noticing:
  *
  *   "a player"                -> a Player row is upserted from the Telegram identity
  *   "registers them"          -> ensureLinked runs on /start, not lazily at the first credit
- *   "under OUR agent"         -> registerPlayer carries parentId = ICHANCY_AGENT_ID. Proven one
+ *   "under OUR agent"         -> registerPlayer carries parentId = the operator's agent id. Proven one
  *                                layer down, in http-ichancy.adapter.spec.ts ("registers, then
  *                                resolves the id"), because that is where the wire body is built.
  *   "the agent sees one"      -> the call happens EXACTLY once per player: a second /start finds the

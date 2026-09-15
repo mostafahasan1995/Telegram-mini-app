@@ -16,6 +16,7 @@ import type { Job } from 'bullmq';
 
 import { QUEUE_NAMES } from '@core/queue/queue.constants';
 import { TASKS, type ReconAgentFloatCheckTask } from '@core/queue/queue.types';
+import { runWithTenant } from '@core/tenant/tenant.storage';
 
 import { AgentFloatSyncService } from '../services/agent-float-sync.service';
 import { InvariantCheckCron } from '../services/invariant-check.cron';
@@ -38,7 +39,15 @@ export class ReconProcessor extends WorkerHost {
     switch (job.name) {
       case TASKS.RECON_AGENT_FLOAT_CHECK: {
         const data = job.data as ReconAgentFloatCheckTask;
-        const result = await this.floatSync.sync(data.currencyCode);
+        // A job has no request and therefore no operator. The float is one operator's, read with
+        // that operator's agent, so the job names it and the comparison runs inside its context. A
+        // job without one fails here, loudly, instead of reading some agent's wallet.
+        if (typeof data.tenantId !== 'string' || data.tenantId.length === 0) {
+          throw new Error(`${TASKS.RECON_AGENT_FLOAT_CHECK} needs the tenantId of the operator to sync`);
+        }
+        const result = await runWithTenant(data.tenantId, () =>
+          this.floatSync.sync(data.currencyCode),
+        );
         return {
           ledgerMinor: result.ledgerMinor.toString(),
           ichancyMinor: result.ichancyMinor?.toString() ?? null,
@@ -67,7 +76,10 @@ export class ReconProcessor extends WorkerHost {
     }
   }
 
-  /** Exposed so a deploy hook or an operator can force a full pass. */
+  /**
+   * Exposed so a deploy hook or an operator can force a full pass. Must be called inside the
+   * operator's tenant context: the float sync refuses to run without one.
+   */
   async runAll(currencyCode: string): Promise<void> {
     await this.invariants.runOnce();
     await this.floatSync.sync(currencyCode);

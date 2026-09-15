@@ -184,9 +184,27 @@ function button(text: string, action: string, depositId: string): InlineButton {
   return { text, callback_data: encodeCallbackData(DEPOSIT_CALLBACK_NS, action, depositId) };
 }
 
+/**
+ * How a card names the player: `@username (id)`, `id <id>`, or a plain statement that the row has no
+ * Telegram account (an imported player, which cannot open a deposit until one is attached). Shared
+ * by the notifier and the handler that redraws a card, so both cards read the same.
+ */
+export function playerLabelOf(player: {
+  telegramUserId: bigint | null;
+  telegramUsername: string | null;
+}): string {
+  if (player.telegramUserId === null) {
+    return player.telegramUsername === null ? 'no Telegram account' : `@${player.telegramUsername}`;
+  }
+  return player.telegramUsername === null
+    ? `id ${player.telegramUserId.toString()}`
+    : `@${player.telegramUsername} (${player.telegramUserId.toString()})`;
+}
+
 export interface OpsCardInput {
   shortId: string;
-  telegramUserId: bigint;
+  /** Null for an imported player with no Telegram account. Rendered as —. */
+  telegramUserId: bigint | null;
   /** Null on a legacy row whose Ichancy account predates the stored credentials. Rendered as —. */
   ichancyLogin: string | null;
   ichancyPlayerId: string | null;
@@ -217,7 +235,9 @@ export function renderOpsCard(input: OpsCardInput): string {
 
   return [
     '📥 <b>عملية شحن على المنصة</b>',
-    `👤 مستخدم التيليغرام: <code>${input.telegramUserId.toString()}</code>`,
+    `👤 مستخدم التيليغرام: ${
+      input.telegramUserId === null ? NO_VALUE : `<code>${input.telegramUserId.toString()}</code>`
+    }`,
     `🎮 حساب المنصة: ${login}`,
     `🆔 ID اللاعب: ${playerId}`,
     `💰 المبلغ المشحون: <b>${esc(dualNsp(input.amountMinor))}</b>`,

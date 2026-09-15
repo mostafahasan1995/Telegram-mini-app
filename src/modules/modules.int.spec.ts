@@ -54,6 +54,7 @@ import { RedisService } from '@core/cache/redis.service';
 import { AuditModule } from '@core/audit/audit.module';
 import { LedgerModule } from '@core/ledger/ledger.module';
 import { FakeIchancyAdapter } from '@core/ichancy/fake-ichancy.adapter';
+import { TenantSecretService } from '@core/tenant/services/tenant-secret.service';
 import { runWithTenant } from '@core/tenant';
 import { TENANT_BOOTSTRAP_ID } from '@core/tenant';
 import { GlobalExceptionFilter } from '@common/filters/global-exception.filter';
@@ -181,6 +182,13 @@ describe('feature modules (integration)', () => {
   let prisma: PrismaService;
   let redis: RedisService;
   let fakeIchancy: FakeIchancyAdapter;
+  /** The bootstrap operator's Ichancy columns as this suite found them, restored in afterAll. */
+  let bootstrapAgentBefore: {
+    ichancyBaseUrl: string;
+    ichancyUsername: string;
+    ichancyPasswordEnc: string;
+    ichancyAgentId: string;
+  } | null = null;
 
   const createdPlayerIds: string[] = [];
   const createdAdminIds: string[] = [];
@@ -216,6 +224,31 @@ describe('feature modules (integration)', () => {
     fakeIchancy.reset();
 
     await purgeLeftovers(prisma);
+
+    // Every Ichancy call, the fake's included, is made with the operator's own agent from its tenant
+    // row, and an operator whose row holds no usable agent is refused before anything is sent. A
+    // shared test database's bootstrap row may carry a placeholder or a password sealed under another
+    // root secret, so this suite gives it a real one for its own run and puts the original back.
+    bootstrapAgentBefore = await prisma.tenant.findUniqueOrThrow({
+      where: { id: TENANT_BOOTSTRAP_ID },
+      select: {
+        ichancyBaseUrl: true,
+        ichancyUsername: true,
+        ichancyPasswordEnc: true,
+        ichancyAgentId: true,
+      },
+    });
+    await prisma.tenant.update({
+      where: { id: TENANT_BOOTSTRAP_ID },
+      data: {
+        ichancyBaseUrl: 'http://localhost:9',
+        ichancyUsername: 'modules-int-agent',
+        ichancyPasswordEnc: moduleRef
+          .get(TenantSecretService)
+          .sealIchancyPassword('modules-int-agent-password'),
+        ichancyAgentId: '4242',
+      },
+    });
   });
 
   afterAll(async () => {
@@ -240,6 +273,9 @@ describe('feature modules (integration)', () => {
         if (methodId !== null) await prisma.paymentMethod.deleteMany({ where: { id: methodId } });
         await prisma.player.deleteMany({ where: { id: { in: createdPlayerIds } } });
         await prisma.adminUser.deleteMany({ where: { id: { in: createdAdminIds } } });
+        if (bootstrapAgentBefore !== null) {
+          await prisma.tenant.update({ where: { id: TENANT_BOOTSTRAP_ID }, data: bootstrapAgentBefore });
+        }
       }
       if (redis !== undefined) {
         const keys = await redis.keys(`paydest:*${SUFFIX}*`);
@@ -566,7 +602,7 @@ describe('feature modules (integration)', () => {
       // The Telegram id is the readable half so the agent can find the row in their own panel; the
       // keyed suffix is what stops that public id from revealing the login (ichancy-credentials.util).
       expect(row.ichancyLogin).toMatch(
-        new RegExp(`^p${row.telegramUserId.toString()}_[a-z0-9]{8}$`),
+        new RegExp(`^p${String(row.telegramUserId)}_[a-z0-9]{8}$`),
       );
       expect(row.status).toBe('ACTIVE');
       // The stored value must be the sealed envelope, never the password itself.

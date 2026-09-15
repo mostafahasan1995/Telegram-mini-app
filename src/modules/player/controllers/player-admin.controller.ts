@@ -18,11 +18,14 @@
  * PlayerLinkService.ensureLinked. There is no second implementation of a non-idempotent
  * registration in this system, and there must never be.
  *
- * ══ WHY THERE IS NO POST /v1/admin/players ════════════════════════════════════════════════════
- * A player IS a Telegram account here — `players.telegram_user_id` is the identity, and everything
- * downstream (login codes, deposit notifications, the bot itself) addresses that chat. A player row
- * invented by staff would have no chat to notify and no way to sign in, so creating one is not a
- * gap, it is a thing that must not exist. People arrive by pressing Start.
+ * ══ PLAYERS WITHOUT A TELEGRAM ACCOUNT ════════════════════════════════════════════════════════
+ * `players.telegram_user_id` is nullable now, and `source` says why (dashboard API-CONTRACT.md,
+ * Players): TELEGRAM rows arrive by pressing Start; ICHANCY_IMPORT rows are an operator's existing
+ * Ichancy players, written by POST /v1/admin/tenants/:id/import-players (modules/tenant). The
+ * contract's POST /v1/admin/players (ADMIN rows), POST /v1/admin/players/import and
+ * PATCH /v1/admin/players/:id/telegram are NOT served by this backend yet. Until the last exists, a
+ * row with no Telegram id has no chat to notify and no way to sign in, so the paths that need one (the
+ * player session refresh, PlayerLinkService's credential derivation) refuse it rather than guess.
  */
 import { Controller, Get, HttpCode, HttpStatus, Param, Post, Query } from '@nestjs/common';
 
@@ -31,7 +34,8 @@ import { CurrentAdmin } from '@common/decorators/current-principal.decorator';
 import type { AuthenticatedAdmin } from '@common/decorators/auth.types';
 import { IdParamDto } from '@common/dtos/id-param.dto';
 import type { PaginatedResult } from '@common/dtos/paginated.dto';
-import { AppConfigService } from '@core/config/config.service';
+import { PrismaService } from '@core/prisma/prisma.service';
+import { requireEffectiveTenantId } from '@core/tenant/tenant.storage';
 
 import { ListPlayersQueryDto, type IchancyAccountView } from '../dtos/player-admin.dto';
 import type { AdminPlayerView, PlayerView } from '../dtos/player.view';
@@ -46,7 +50,7 @@ export class PlayerAdminController {
   constructor(
     private readonly players: PlayerService,
     private readonly links: PlayerLinkService,
-    private readonly config: AppConfigService,
+    private readonly prisma: PrismaService,
   ) {}
 
   /**
@@ -96,13 +100,18 @@ export class PlayerAdminController {
     await this.players.getView(viewerFromAdmin(admin), params.id);
 
     const link = await this.links.ensureLinked(params.id, `admin:${admin.adminUserId}`);
+    // The effective operator's own agent: the one ensureLinked just registered under.
+    const operator = await this.prisma.tenant.findUnique({
+      where: { id: requireEffectiveTenantId() },
+      select: { ichancyAgentId: true },
+    });
 
     return {
       playerId: link.playerId,
       ichancyPlayerId: link.ichancyPlayerId,
       ichancyLogin: link.ichancyLogin,
       created: link.created,
-      agentId: this.config.ichancy.agentId,
+      agentId: operator?.ichancyAgentId ?? '',
     };
   }
 }

@@ -2,17 +2,21 @@
  * `provision()`: what creating an operator does after its row commits (dashboard docs/API-CONTRACT.md,
  * "What creation actually does — the provisioning block").
  *
- * FIVE STEPS, EACH INDEPENDENT, EACH A BOOLEAN AND A NULLABLE ERROR:
+ * FIVE STEPS, EACH A BOOLEAN AND A NULLABLE ERROR:
  *  1. register the webhook with Telegram;
  *  2. push the command menus;
  *  3. write the default payment rails on placeholder destinations;
- *  4. activation: NOT ATTEMPTED until per-operator Ichancy sign-in exists. `activated: false` with a
- *     sentence that says it was not attempted, never one that implies a sign-in failed. The operator
- *     stays SUSPENDED, which is where the contract says a new operator lands;
- *  5. the import of existing players, which runs only after activation succeeded, so `0` and a
- *     sentence saying why (the dashboard mock's own wording).
- * One step failing never stops the next: a webhook Telegram refuses says nothing about whether menus
- * or rails can be written, and an admin reading the report needs every answer.
+ *  4. activation: a real Ichancy sign-in with the operator's own credentials (TenantIchancyService).
+ *     Accepted, the operator is ACTIVE; refused, it stays SUSPENDED and `activationError` carries the
+ *     same sentence POST /:id/activate would have answered;
+ *  5. the import of the agent's existing players, which runs ONLY after activation succeeded
+ *     (API-CONTRACT.md: "an operator that did not activate reports `0` and says why").
+ * Steps 1–3 never stop each other: a webhook Telegram refuses says nothing about whether menus or
+ * rails can be written, and an admin reading the report needs every answer. Step 5 depends on 4 by
+ * contract.
+ *
+ * WHY THE RAILS COME BEFORE ACTIVATION: an operator activated here can be shown to a player at once,
+ * and it should never be ACTIVE without the rails `paymentMethodsNeedAccounts` warns about.
  *
  * NOTHING HERE THROWS FOR A STEP. The row has already committed, so the request must answer 201 with
  * what did not happen. Each step is audited by the code that performed it, in the operator's own log,
@@ -32,13 +36,10 @@ import {
 import { PrismaService } from '@core/prisma/prisma.service';
 import { runWithTenant } from '@core/tenant/tenant.storage';
 
-import {
-  ACTIVATION_NOT_ATTEMPTED_MESSAGE,
-  PLAYERS_NOT_IMPORTED_MESSAGE,
-  TenantAuditActions,
-} from '../tenant-admin.constants';
+import { PLAYERS_NOT_IMPORTED_MESSAGE, TenantAuditActions } from '../tenant-admin.constants';
 import type { TenantProvisioningView } from '../views/tenant-operations.view';
 
+import { TenantIchancyService } from './tenant-ichancy.service';
 import { TenantTelegramService } from './tenant-telegram.service';
 
 const TENANT_SUBJECT = 'Tenant';
@@ -62,12 +63,17 @@ export class TenantProvisioningService {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly telegram: TenantTelegramService,
+    private readonly ichancy: TenantIchancyService,
   ) {}
 
   async provision(actorAdminId: string, tenant: ProvisioningTarget): Promise<TenantProvisioningView> {
     const webhook = await this.telegram.registerWebhookForProvisioning(actorAdminId, tenant.id);
     const menus = await this.telegram.pushMenusForProvisioning(actorAdminId, tenant.id);
     const rails = await this.provisionPaymentMethods(actorAdminId, tenant);
+    const activation = await this.ichancy.activateForProvisioning(actorAdminId, tenant.id);
+    const players = activation.ok
+      ? await this.ichancy.importForProvisioning(actorAdminId, tenant.id)
+      : { imported: 0, error: PLAYERS_NOT_IMPORTED_MESSAGE };
 
     const report: TenantProvisioningView = {
       webhookRegistered: webhook.ok,
@@ -76,13 +82,13 @@ export class TenantProvisioningService {
       menusPushed: menus.ok,
       menuScopes: menus.scopes,
       menuError: menus.error,
-      activated: false,
-      activationError: ACTIVATION_NOT_ATTEMPTED_MESSAGE,
+      activated: activation.ok,
+      activationError: activation.error,
       paymentMethodsCreated: rails.created,
       paymentMethodsError: rails.error,
       paymentMethodsNeedAccounts: rails.needAccounts,
-      playersImported: 0,
-      playersImportError: PLAYERS_NOT_IMPORTED_MESSAGE,
+      playersImported: players.imported,
+      playersImportError: players.error,
     };
 
     await this.recordReport(actorAdminId, tenant.id, report);

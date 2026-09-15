@@ -7,12 +7,17 @@
  * `telegramUserId` leaves as a STRING. It is a 64-bit value and `JSON.stringify` of a bigint throws
  * without the global patch; a number would round. The API contract is: ids are strings.
  */
-import type { Player, PlayerStatus } from '@prisma/client';
+import type { Player, PlayerSource, PlayerStatus } from '@prisma/client';
 
 /** What a player may see about themselves. */
 export interface PlayerView {
   id: string;
-  telegramUserId: string;
+  /**
+   * Null only for a player that was never a Telegram account (`source: ICHANCY_IMPORT`), which is
+   * the contract's AdminPlayerView (`telegramUserId: string | null`). Such a player cannot sign in,
+   * so a player reading their own view always has one.
+   */
+  telegramUserId: string | null;
   telegramUsername: string | null;
   firstName: string | null;
   lastName: string | null;
@@ -30,6 +35,8 @@ export interface PlayerView {
 
 /** Everything staff may see. Adds the operational identifiers, never the credentials. */
 export interface AdminPlayerView extends PlayerView {
+  /** Which door the player came in through: TELEGRAM, ICHANCY_IMPORT or ADMIN. */
+  source: PlayerSource;
   ichancyPlayerId: string | null;
   ichancyLogin: string | null;
   ichancyRegisteredAt: string | null;
@@ -39,7 +46,7 @@ export interface AdminPlayerView extends PlayerView {
 export function toPlayerView(player: Player): PlayerView {
   return {
     id: player.id,
-    telegramUserId: player.telegramUserId.toString(),
+    telegramUserId: player.telegramUserId?.toString() ?? null,
     telegramUsername: player.telegramUsername,
     firstName: player.firstName,
     lastName: player.lastName,
@@ -55,6 +62,7 @@ export function toPlayerView(player: Player): PlayerView {
 export function toAdminPlayerView(player: Player): AdminPlayerView {
   return {
     ...toPlayerView(player),
+    source: player.source,
     ichancyPlayerId: player.ichancyPlayerId,
     ichancyLogin: player.ichancyLogin,
     ichancyRegisteredAt: player.ichancyRegisteredAt?.toISOString() ?? null,

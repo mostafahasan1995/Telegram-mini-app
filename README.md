@@ -447,8 +447,8 @@ chats are set in the dashboard and stored on its tenant row. Delete the lines.
 | `REPORT_SCHEDULE_HOURS`                 | Hours between automatic `/report` posts, per operator. Default `6`. `0` or empty = off. |
 | `MINI_APP_ORIGIN`                       | Comma-separated. CORS allow-list. Must be `https` in production.                     |
 | `ICHANCY_BASE_URL`                      | The agent API.                                                                       |
-| `ICHANCY_USERNAME` / `ICHANCY_PASSWORD` | Agent login. **Only the worker uses these.**                                         |
-| `ICHANCY_AGENT_ID`                      | Our `affiliateId`. Used as `parentId` when we register a player.                     |
+| `ICHANCY_USERNAME` / `ICHANCY_PASSWORD` | Optional, seed-only. **No Ichancy call uses them**: each operator's agent login lives on its tenant row, set in the dashboard. |
+| `ICHANCY_AGENT_ID`                      | Optional, seed-only (PlatformDefaults). Each operator's `parentId` is the agent id on its own tenant row. |
 | `ICHANCY_TRANSPORT`                     | `browser` (default) or `fetch`. See Step 1. `browser` needs Chromium or boot fails.  |
 | `ICHANCY_BROWSER_HEADLESS`              | Default `true`. `false` on a desktop when a challenge refuses to clear headless.      |
 | `ICHANCY_COOKIE`                        | Fetch mode: the full cookie jar. Browser mode: only the panel half is seeded.         |

@@ -42,7 +42,7 @@ import { DEPOSIT_CALLBACK_NS } from '../deposit.constants';
 import { DepositService } from '../services/deposit.service';
 import { DepositReviewService, type ReviewOutcome } from '../services/deposit-review.service';
 import { DepositRepository } from '../repositories/deposit.repository';
-import { renderAdminCard, renderAdminKeyboard } from './deposit-card.util';
+import { playerLabelOf, renderAdminCard, renderAdminKeyboard } from './deposit-card.util';
 
 /** Statuses a photo can still be attached to. Mirrors DepositService.assertAcceptsProof. */
 const PROOFABLE: readonly DepositStatus[] = Object.freeze([
@@ -308,10 +308,7 @@ export class DepositTelegramHandlers {
       deposit,
       proofs: deposit.proofs,
       riskFlags,
-      playerLabel:
-        deposit.player.telegramUsername === null
-          ? `id ${deposit.player.telegramUserId.toString()}`
-          : `@${deposit.player.telegramUsername} (${deposit.player.telegramUserId.toString()})`,
+      playerLabel: playerLabelOf(deposit.player),
       paymentMethodName: deposit.paymentMethod.displayName,
       destinationLabel: deposit.paymentDestination?.label ?? null,
       reviewerLabel:

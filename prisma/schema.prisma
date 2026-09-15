@@ -43,6 +43,19 @@ enum PlayerStatus {
   @@map("player_status")
 }
 
+/// Which door a player came in through (dashboard API-CONTRACT.md, "Players that were never a
+/// Telegram account").
+enum PlayerSource {
+  /// A Telegram account that pressed Start. Every row written before this enum existed.
+  TELEGRAM
+  /// An account that already existed under the operator's Ichancy agent, pulled in by the import.
+  ICHANCY_IMPORT
+  /// A row registered from the console.
+  ADMIN
+
+  @@map("player_source")
+}
+
 enum AdminRole {
   /// Platform staff. Lives ONLY in tenant zero (enforced by a CHECK constraint) and is the
   /// only role whose X-Tenant-Id header is honoured. The owner superset (dashboard
@@ -504,14 +517,16 @@ model PaymentDestination {
 model Player {
   id               String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   tenantId         String       @map("tenant_id") @db.Uuid
-  /// Telegram ids are 64-bit; storing them as BigInt avoids the 2^53 trap.
-  telegramUserId   BigInt       @map("telegram_user_id")
+  /// Telegram ids are 64-bit; storing them as BigInt avoids the 2^53 trap. Null only for a player
+  /// that was never a Telegram account (an ICHANCY_IMPORT row), until one is attached.
+  telegramUserId   BigInt?      @map("telegram_user_id")
   telegramUsername String?      @map("telegram_username")
   firstName        String?      @map("first_name")
   lastName         String?      @map("last_name")
   languageCode     String?      @map("language_code")
   phone            String?
   status           PlayerStatus @default(PENDING_ICHANCY)
+  source           PlayerSource @default(TELEGRAM)
   currencyCode     String       @default("NSP") @map("currency_code") @db.VarChar(3)
 
   /// registerPlayer returns the number 1, NOT an id — this is resolved afterwards through

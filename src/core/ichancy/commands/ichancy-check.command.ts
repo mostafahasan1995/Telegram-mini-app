@@ -1,36 +1,48 @@
 /**
- * `npm run ichancy:check` — does this deployment actually reach the agent API, and as whom?
+ * `npm run ichancy:check [-- --tenant <id>]` — does this deployment actually reach an operator's
+ * agent API, and as whom?
  *
  * WHY THIS EXISTS AS A COMMAND: every failure mode of this integration looks the same from the
  * outside ("deposits stopped crediting"), and they need completely different fixes:
  *   - Cloudflare answered with a challenge  -> refresh ICHANCY_COOKIE / allowlist the server IP
- *   - wrong username or password            -> fix ICHANCY_USERNAME / ICHANCY_PASSWORD
+ *   - wrong username or password            -> fix the operator's Ichancy credentials in the dashboard
  *   - no session in Redis, running as api   -> start the worker once
  *   - signed in fine, wallet is empty       -> top the agent up; nothing is broken
  * Reading that off a live call takes seconds; inferring it from a stuck deposit queue takes an
  * afternoon. It is READ-ONLY on purpose — it signs in, reads the wallet, and writes nothing.
  *
+ * WHOSE AGENT: an operator's, read from its tenant row like every other Ichancy call — the bootstrap
+ * operator unless `--tenant` names another. The env's ICHANCY_USERNAME / ICHANCY_PASSWORD are never
+ * used for a call, so checking them would prove nothing about what the money path does.
+ *
  * WHY IT PRINTS THE AGENT ID IT WILL PARENT PLAYERS TO: the single most expensive misconfiguration
- * here is a correct login paired with somebody else's ICHANCY_AGENT_ID, because registration then
- * succeeds and hangs every player off the wrong agent. Seeing the id next to the wallet that will
- * pay for their credits is what makes that visible before the first player arrives.
+ * here is a correct login paired with somebody else's agent id, because registration then succeeds
+ * and hangs every player off the wrong agent. Seeing the id next to the wallet that will pay for their
+ * credits is what makes that visible before the first player arrives.
  */
 import { Inject, Logger } from '@nestjs/common';
 import { existsSync } from 'node:fs';
-import { Command, CommandRunner } from 'nest-commander';
+import { Command, CommandRunner, Option } from 'nest-commander';
 
 import { AppConfigService } from '@core/config/config.service';
 import { formatMinorToDecimal } from '@common/helpers/money.util';
+import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
+import { runWithTenant } from '@core/tenant/tenant.storage';
 
 import { CLOUDFLARE_CHALLENGE_CODE } from '../error-map';
+import { ICHANCY_AGENT_RESOLVER, type IchancyAgent, type IchancyAgentResolver } from '../ichancy-agent';
 import { BrowserIchancyTransport } from '../transport/browser.transport';
 import { IchancySessionService } from '../ichancy-session.service';
 import { ICHANCY_PORT, type IchancyPort } from '../ichancy.port';
 import { isIchancyOk, isIchancyRejected } from '../ichancy.types';
 
+interface IchancyCheckOptions {
+  tenant?: string;
+}
+
 @Command({
   name: 'ichancy:check',
-  description: 'Sign in to the agent API and read the agent wallet. Read-only.',
+  description: "Sign in to an operator's agent API and read its agent wallet. Read-only.",
 })
 export class IchancyCheckCommand extends CommandRunner {
   private readonly logger = new Logger('ichancy:check');
@@ -39,6 +51,7 @@ export class IchancyCheckCommand extends CommandRunner {
     private readonly config: AppConfigService,
     private readonly session: IchancySessionService,
     @Inject(ICHANCY_PORT) private readonly ichancy: IchancyPort,
+    @Inject(ICHANCY_AGENT_RESOLVER) private readonly agents: IchancyAgentResolver,
     // The concrete class, not the ICHANCY_TRANSPORT token: this command has to be able to say what
     // the browser transport WOULD do even when the fetch one is selected.
     private readonly browser: BrowserIchancyTransport,
@@ -46,17 +59,28 @@ export class IchancyCheckCommand extends CommandRunner {
     super();
   }
 
-  async run(): Promise<void> {
+  @Option({
+    flags: '--tenant <id>',
+    description: 'The operator whose agent to check (default: the bootstrap operator)',
+  })
+  parseTenant(value: string): string {
+    return value.trim();
+  }
+
+  async run(_args: string[], options: IchancyCheckOptions = {}): Promise<void> {
+    const tenantId = options.tenant ?? TENANT_BOOTSTRAP_ID;
+    // Every call below is made as this operator, exactly as the money path makes it.
+    await runWithTenant(tenantId, () => this.check(tenantId));
+  }
+
+  private async check(tenantId: string): Promise<void> {
     const settings = this.config.ichancy;
 
     this.logger.log('── configuration ────────────────────────────────────────────');
-    this.logger.log(`base url    ${settings.baseUrl}`);
-    this.logger.log(`username    ${settings.username}`);
-    this.logger.log(`agent id    ${settings.agentId}   (parentId for every registerPlayer)`);
-    this.logger.log(`currency    ${settings.currency}`);
+    this.logger.log(`operator    ${tenantId}`);
     this.logger.log(`role        ${this.config.app.role}`);
     this.logger.log(
-      `cookie      ${settings.cookie === null ? 'NOT SET' : `${String(settings.cookie.length)} chars`}`,
+      `cookie      ${settings.cookie === null ? 'NOT SET' : `${String(settings.cookie.length)} chars`} (for ${settings.baseUrl})`,
     );
     // PRINTED IN FULL, and not as a length: a User-Agent that does not match the browser which
     // earned cf_clearance fails EXACTLY like no cookie at all, with no hint anywhere that the two
@@ -66,9 +90,23 @@ export class IchancyCheckCommand extends CommandRunner {
     this.logger.log(`adapter     ${settings.fake ? 'FAKE — nothing real is contacted' : 'REAL'}`);
     // Until 2026-08-20 this command could not tell an operator WHICH transport was in effect — the
     // only signal was a line in the boot log, which is exactly what nobody has in front of them
-    // while an integration is down. The transport is the first thing to check now that a pasted
-    // cf_clearance is no longer the supported path.
+    // while an integration is down.
     await this.reportTransport();
+
+    let agent: IchancyAgent;
+    try {
+      agent = await this.agents.forTenant(tenantId);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`agent       UNUSABLE — ${message}`);
+      throw new Error('ichancy:check could not read the operator’s agent');
+    }
+    this.logger.log('── agent ────────────────────────────────────────────────────');
+    this.logger.log(`base url    ${agent.baseUrl}`);
+    this.logger.log(`username    ${agent.username}`);
+    this.logger.log(`agent id    ${agent.agentId}   (parentId for every registerPlayer)`);
+    this.logger.log(`agent key   ${agent.agentKey}   (operators sharing this key share one session)`);
+    this.logger.log(`currency    ${agent.currency}`);
 
     // MIRRORS the guard in WorkerBootstrapService: ICHANCY_FAKE means this process does not CONTACT
     // Ichancy, not merely that it does not move money. ensureSession() would sign in for real even
@@ -78,14 +116,14 @@ export class IchancyCheckCommand extends CommandRunner {
     if (settings.fake) {
       this.logger.warn('ICHANCY_FAKE is on: the real API is NOT contacted and no session is opened.');
       this.logger.warn('Set ICHANCY_FAKE=false to check the real agent account.');
-      await this.reportWallet(settings.currency);
+      await this.reportWallet(agent.currency);
       return;
     }
 
     this.logger.log('── session ──────────────────────────────────────────────────');
     try {
-      await this.session.ensureSession();
-      const info = await this.session.describe();
+      await this.session.ensureSession(agent);
+      const info = await this.session.describe(agent);
       this.logger.log(
         `signed in   yes (via ${info.source ?? 'unknown'}, generation ${String(info.generation ?? 0)})`,
       );
@@ -96,7 +134,7 @@ export class IchancyCheckCommand extends CommandRunner {
       throw new Error('ichancy:check failed at sign-in');
     }
 
-    await this.reportWallet(settings.currency);
+    await this.reportWallet(agent.currency);
   }
 
   /**
@@ -188,7 +226,10 @@ export class IchancyCheckCommand extends CommandRunner {
       return;
     }
     if (detail.toLowerCase().includes('invalid username or password')) {
-      this.logger.error('FIX: ICHANCY_USERNAME / ICHANCY_PASSWORD are wrong for this base URL.');
+      this.logger.error(
+        "FIX: this operator's Ichancy username or password is wrong for its base URL. Correct them " +
+          'from the dashboard (PATCH /v1/admin/tenants/:id/ichancy verifies before saving).',
+      );
       return;
     }
     if (detail.includes('ICHANCY_SESSION_MISSING')) {

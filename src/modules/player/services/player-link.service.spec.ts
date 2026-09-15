@@ -21,6 +21,7 @@ import { type AuditService } from '@core/audit/audit.service';
 import { type IchancyPort } from '@core/ichancy';
 import { ichancyAmbiguous, ichancyOk, ichancyRejected } from '@core/ichancy/ichancy.types';
 import { type PrismaService } from '@core/prisma/prisma.service';
+import { runWithTenant } from '@core/tenant/tenant.storage';
 
 import { PLAYER_LINK_LOCK_TTL_MS, PlayerErrorCodes, playerLinkLockKey } from '../player.constants';
 import { type PlayerRepository } from '../repositories/player.repository';
@@ -29,11 +30,14 @@ import { PlayerLinkService } from './player-link.service';
 const PLAYER_ID = 'player-hasan';
 const TELEGRAM_ID = 1_743_150_171n;
 const ICHANCY_ID = '459424640';
+const TENANT_ID = '00000000-0000-4000-8000-0000000000a1';
+const OTHER_TENANT_ID = '00000000-0000-4000-8000-0000000000b2';
 
 /** Only the columns this service reads. Cast at the seam so the Prisma model stays out of here. */
 function playerRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id: PLAYER_ID,
+    tenantId: TENANT_ID,
     telegramUserId: TELEGRAM_ID,
     status: 'PENDING_ICHANCY',
     ichancyPlayerId: null,
@@ -67,6 +71,8 @@ function build(
     rows?: Record<string, unknown>[];
     lockHeldByAnotherCaller?: boolean;
     linkWins?: boolean;
+    /** The operator the call runs inside. Defaults to the player's own. */
+    tenantInContext?: string;
   } = {},
 ): Harness {
   const rows = options.rows ?? [playerRow()];
@@ -102,6 +108,12 @@ function build(
   } as unknown as AppConfigService;
 
   const service = new PlayerLinkService(prisma, players, locks, audit, config, ichancy);
+  // Every real caller runs inside the player's operator (the credit service, the backfill, the admin
+  // route); the harness does the same so each test below is about its own mechanism. The test at the
+  // end of this file is the one that runs it in the WRONG operator.
+  const raw = service.ensureLinked.bind(service);
+  service.ensureLinked = (playerId, correlationId) =>
+    runWithTenant(options.tenantInContext ?? TENANT_ID, () => raw(playerId, correlationId));
   return { service, findById, linkIchancyAccount, ensurePlayer, acquire, release, auditWrite };
 }
 
@@ -269,5 +281,36 @@ describe('PlayerLinkService — what gets persisted, and when', () => {
     expect(entry['action']).toBe('player.ichancy.linked');
     expect(entry['correlationId']).toBe('cron:player-link-backfill');
     expect(JSON.stringify(entry)).not.toContain('password');
+  });
+});
+
+describe("PlayerLinkService — only ever under the player's own operator", () => {
+  it("sends NOTHING when the operator in context is not the player's", async () => {
+    // The port registers under the agent of the operator in context. A player of operator A linked
+    // while operator B is in context would be minted under B's agent, with no way to delete it.
+    const h = build({ tenantInContext: OTHER_TENANT_ID });
+
+    await expect(h.service.ensureLinked(PLAYER_ID)).rejects.toThrow(/never registered under another operator/);
+    expect(h.ensurePlayer).not.toHaveBeenCalled();
+    expect(h.linkIchancyAccount).not.toHaveBeenCalled();
+    expect(h.release).toHaveBeenCalledWith(HANDLE);
+  });
+
+  it('sends NOTHING with no operator in context at all', async () => {
+    const h = build();
+    const service = new PlayerLinkService(
+      { runInTransaction: jest.fn() } as unknown as PrismaService,
+      { findById: h.findById, linkIchancyAccount: h.linkIchancyAccount } as unknown as PlayerRepository,
+      { acquire: h.acquire, release: h.release } as unknown as LockService,
+      { write: h.auditWrite } as unknown as AuditService,
+      {
+        jwt: { secret: 'unit-test-root-secret-not-a-real-one' },
+        ichancy: { playerEmailDomain: 'example.com' },
+      } as unknown as AppConfigService,
+      { ensurePlayer: h.ensurePlayer } as unknown as IchancyPort,
+    );
+
+    await expect(service.ensureLinked(PLAYER_ID)).rejects.toThrow(/No tenant context/);
+    expect(h.ensurePlayer).not.toHaveBeenCalled();
   });
 });

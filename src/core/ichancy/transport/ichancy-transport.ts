@@ -17,6 +17,9 @@
  * Everything above this line — the envelope parsing, the error map, the call log, the money
  * semantics — is identical either way. That is the whole point of putting the seam here and not
  * higher up: swapping how bytes travel must not be able to change what a credit means.
+ *
+ * It is also the natural HTTP-level stub for tests: a fake transport sees exactly the URL, body and
+ * bearer token every operator's call would put on the wire.
  */
 
 /** DI token. `@Inject(ICHANCY_TRANSPORT) private readonly transport: IchancyTransport`. */
@@ -29,6 +32,13 @@ export interface IchancyTransportRequest {
   /** Omitted for signin/refreshToken; a Bearer header for everything else. */
   readonly accessToken: string | null;
   readonly timeoutMs: number;
+  /**
+   * The agent the call is made as (ichancy-agent.ts). A transport that keeps per-conversation state,
+   * such as the fetch transport's cookie jar, keys it by this, so one agent's PHP session is never
+   * presented on another agent's calls. Null only for a caller with no agent, which the client
+   * never is.
+   */
+  readonly agentKey: string | null;
 }
 
 export interface IchancyTransportResponse {
@@ -49,4 +59,9 @@ export interface IchancyTransport {
   /** Short name for logs and the ichancy:check diagnostic — 'fetch' or 'browser'. */
   readonly name: string;
   post(request: IchancyTransportRequest): Promise<IchancyTransportResponse>;
+  /**
+   * False when this transport cannot carry a request to `url` at all, which the client turns into a
+   * refusal before anything is sent. Absent means "any URL".
+   */
+  canReach?(url: string): boolean;
 }

@@ -37,10 +37,13 @@
  * outbox topic plus a handler in OutboxModule.forWorker — a separable follow-up.
  */
 import { Injectable, Logger } from '@nestjs/common';
+import { TenantStatus, type Prisma } from '@prisma/client';
 
 import { AppConfigService } from '@core/config/config.service';
-import { IchancyHealthService } from '@core/ichancy';
+import { IchancyAgentErrorCodes, IchancyHealthService, TRANSPORT_ORIGIN_UNSUPPORTED_CODE } from '@core/ichancy';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { acrossTenants } from '@core/prisma/tenant-scope.extension';
+import { runWithTenant } from '@core/tenant/tenant.storage';
 import { isAppException } from '@common/exceptions/app.exception';
 
 import {
@@ -76,6 +79,12 @@ const SESSION_FAILURE_REASONS: ReadonlySet<string> = new Set([
   'ICHANCY_SIGNIN_REJECTED',
   'ICHANCY_SIGNIN_AMBIGUOUS',
   'ICHANCY_SESSION_LOCK_TIMEOUT',
+  'ICHANCY_SESSION_CREDENTIALS_CHANGED',
+  // The operator's agent cannot be used as configured (a placeholder, a password that does not
+  // open, a host the transport cannot reach). Nothing was sent, and a platform admin fixing the row
+  // makes the next attempt work, so it is retried with backoff rather than parked.
+  IchancyAgentErrorCodes.AGENT_UNCONFIGURED,
+  TRANSPORT_ORIGIN_UNSUPPORTED_CODE,
 ]);
 
 /** A contended per-player lock is not a failure; it is somebody else doing this exact work. */
@@ -180,8 +189,11 @@ export class PlayerLinkBackfillService {
     }
 
     const now = new Date();
+    // Deliberately across operators: the tick has no tenant of its own, and every operator's
+    // stranded players deserve rescue. Each candidate is then linked INSIDE its own operator's
+    // context, so the registration is made with that operator's agent and nobody else's.
     const candidates = await this.prisma.player.findMany({
-      where: {
+      where: acrossTenants<Prisma.PlayerWhereInput>({
         // LOAD-BEARING, not cosmetic. linkIchancyAccount force-sets `status: 'ACTIVE'` with a WHERE
         // of only `{ id, ichancyPlayerId: null }`, so a selector of `ichancyPlayerId: null` alone
         // would mint a casino account for a SUSPENDED / SELF_EXCLUDED / CLOSED player and silently
@@ -192,12 +204,16 @@ export class PlayerLinkBackfillService {
         OR: [{ ichancyLinkNextAttemptAt: null }, { ichancyLinkNextAttemptAt: { lte: now } }],
         // Do not race /start's own attempt; see PLAYER_LINK_BACKFILL_GRACE_MS.
         createdAt: { lte: new Date(now.getTime() - PLAYER_LINK_BACKFILL_GRACE_MS) },
-      },
+        // Only operators that are serving. A suspended operator's agent has not been (re)proven, and
+        // an account registered under it cannot be deleted; its players are linked on demand by a
+        // credit already in flight, or here once it is activated again.
+        tenant: { status: TenantStatus.ACTIVE },
+      }),
       // Oldest first, and totally ordered so an interrupted pass resumes predictably: the people who
       // have been waiting longest are rescued first.
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
       take: limit ?? PLAYER_LINK_BACKFILL_BATCH,
-      select: { id: true, telegramUserId: true, ichancyLinkAttempts: true },
+      select: { id: true, tenantId: true, telegramUserId: true, ichancyLinkAttempts: true },
     });
 
     if (candidates.length === 0) return EMPTY_PASS;
@@ -207,6 +223,8 @@ export class PlayerLinkBackfillService {
     let linked = 0;
     let deferred = 0;
     let parked = 0;
+    /** Operators whose agent failed at the session: their other players wait for the next pass. */
+    const stalledTenants = new Set<string>();
 
     for (const candidate of candidates) {
       if (Date.now() > deadline) {
@@ -216,13 +234,16 @@ export class PlayerLinkBackfillService {
         );
         break;
       }
+      if (stalledTenants.has(candidate.tenantId)) continue;
       scanned += 1;
 
       try {
-        const link = await this.links.ensureLinked(candidate.id, PLAYER_LINK_BACKFILL_CORRELATION);
+        const link = await runWithTenant(candidate.tenantId, () =>
+          this.links.ensureLinked(candidate.id, PLAYER_LINK_BACKFILL_CORRELATION),
+        );
         linked += 1;
         this.logger.log(
-          `backfilled player ${candidate.id} (tg:${candidate.telegramUserId.toString()}) -> ` +
+          `backfilled player ${candidate.id} (tg:${String(candidate.telegramUserId)}) -> ` +
             `ichancy ${link.ichancyPlayerId}`,
         );
         await this.clearBookkeeping(candidate.id);
@@ -232,7 +253,7 @@ export class PlayerLinkBackfillService {
         if (outcome === 'parked') parked += 1;
         else deferred += 1;
 
-        if (kind === 'TRANSPORT' || kind === 'SESSION') {
+        if (kind === 'TRANSPORT') {
           // ABORT THE PASS on the first sign that Ichancy itself is unreachable: at most ONE failed
           // request per tick while the integration is unhealthy, which is what lets the breaker trip
           // on the ambient float sync instead of on a burst of our own making.
@@ -241,6 +262,17 @@ export class PlayerLinkBackfillService {
               describeError(error),
           );
           break;
+        }
+        if (kind === 'SESSION') {
+          // A session failure belongs to ONE operator's agent (its credentials, its lock). Stopping
+          // that operator for this pass keeps the anti-hammer property for its agent without holding
+          // every other operator's players hostage to one misconfigured row.
+          stalledTenants.add(candidate.tenantId);
+          this.logger.warn(
+            `player-link backfill skipping operator ${candidate.tenantId} for this pass: SESSION on ` +
+              `player ${candidate.id} — ${describeError(error)}`,
+          );
+          continue;
         }
         this.logger.warn(`player-link backfill ${kind} on player ${candidate.id}: ${describeError(error)}`);
       }

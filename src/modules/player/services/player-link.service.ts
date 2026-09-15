@@ -26,6 +26,7 @@ import { AppConfigService } from '@core/config/config.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { LockService } from '@core/cache/lock.service';
 import { AuditService } from '@core/audit/audit.service';
+import { requireEffectiveTenantId } from '@core/tenant/tenant.storage';
 import { ICHANCY_PORT, type IchancyPort, isIchancyOk, isIchancyRejected } from '@core/ichancy';
 import {
   BusinessRuleError,
@@ -149,6 +150,15 @@ export class PlayerLinkService implements PlayerLinkPort {
     // The Telegram id goes into the login so the agent can identify the row in their own panel; the
     // player id still keys the secret part. Both come off the SAME row, so a stored login and a
     // recomputed one can never describe different people.
+    //
+    // A row with no Telegram id (an imported player) has no derivable login: its Ichancy account was
+    // opened elsewhere, with credentials this system never held. Inventing a login for it would
+    // register a SECOND account under the agent, which cannot be deleted, so this refuses instead.
+    if (player.telegramUserId === null) {
+      throw new Error(
+        `Player ${player.id} has no Telegram id and no stored Ichancy credentials, so none can be derived`,
+      );
+    }
     return deriveIchancyCredentials(
       this.rootSecret,
       player.id,
@@ -161,6 +171,18 @@ export class PlayerLinkService implements PlayerLinkPort {
     player: Player,
     correlationId: string | null,
   ): Promise<LinkedIchancyAccount> {
+    // WHOSE AGENT: the port registers under the agent of the operator IN CONTEXT, not of the row, and
+    // the row was read by primary key (which the tenant scope does not filter). A caller holding
+    // another operator's player id would otherwise mint that player's account under the wrong agent,
+    // irreversibly (there is no deletePlayer). Every caller today aligns the two; this makes a future
+    // one that does not a loud programming error before anything is sent.
+    const inContext = requireEffectiveTenantId();
+    if (player.tenantId !== inContext) {
+      throw new Error(
+        `Player ${player.id} belongs to operator ${player.tenantId}, not to operator ${inContext} in ` +
+          'context; it is never registered under another operator\'s Ichancy agent',
+      );
+    }
     const credentials = this.credentialsFor(player);
 
     const result = await this.ichancy.ensurePlayer({

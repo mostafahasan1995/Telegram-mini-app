@@ -115,7 +115,8 @@ export class PlayerService {
         subjectType: 'Player',
         subjectId: player.id,
         after: {
-          telegramUserId: player.telegramUserId.toString(),
+          // The profile's id, which the upsert keyed the row on: a row upserted from Telegram has one.
+          telegramUserId: profile.telegramUserId.toString(),
           telegramUsername: player.telegramUsername,
           currencyCode: player.currencyCode,
         },

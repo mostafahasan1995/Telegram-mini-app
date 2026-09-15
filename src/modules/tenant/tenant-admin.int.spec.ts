@@ -10,14 +10,16 @@
  *    service cannot see;
  *  - a validation failure arrives in the envelope the console renders (`details.fields`);
  *  - a suspension really evicts the Redis registry entry and calls both in-process evictions;
- *  - a suspension is reversible: an operator suspended while serving is resumed, and one whose
- *    Ichancy details changed meanwhile, or that never served, is refused;
+ *  - activation always signs in with the operator's own stored credentials: accepted, it is ACTIVE
+ *    and audited as a sign-in (by the fake here); refused, or with a password that does not open,
+ *    it stays SUSPENDED with the refusal the console shows;
  *  - a suspension really stops new deposits on the mini app's route, while a deposit already started
- *    can still be cancelled, and deposits open again once the operator is resumed;
+ *    can still be cancelled, and deposits open again once the operator serves again;
  *  - three concurrent first reads of platform defaults seed from the env exactly once.
  *
- * Telegram is never called: suspending and resuming evict caches and build no bot. Ichancy is the
- * fake adapter (ICHANCY_FAKE=1 in the test env), and /activate never reaches any adapter.
+ * Telegram is never called: suspending and activating evict caches and build no bot. Ichancy is the
+ * fake adapter (ICHANCY_FAKE=1 in the test env), which answers activation's sign-in; the same flows
+ * against an HTTP-level Ichancy stub, with real sessions, are in tenant-ichancy.int.spec.ts.
  *
  * `tenants`, `platform_defaults` and `currencies` survive truncateAll, so the operators this suite
  * adds carry a run-unique slug prefix and are deleted in afterAll, after a reset has cleared the
@@ -485,29 +487,56 @@ describe('Tenant admin surface (integration)', () => {
     expect(zero.status).toBe(TenantStatus.ACTIVE);
   });
 
-  it('activates again an operator suspended while serving, and refuses one whose Ichancy details changed since', async () => {
+  it('activates only through a sign-in with its own credentials, audited as one and evicting the registry, and stays SUSPENDED when the sign-in is refused', async () => {
     const { TenantRegistryService: RegistryClass } = await import(
       '@core/tenant/services/tenant-registry.service'
     );
+    const { TenantSecretService: SecretsClass } = await import(
+      '@core/tenant/services/tenant-secret.service'
+    );
+    const { FakeIchancyAdapter: FakeClass } = await import('@core/ichancy/fake-ichancy.adapter');
     const registry: TenantRegistryService = ctx.app.get(RegistryClass);
+    const secrets = ctx.app.get(SecretsClass);
+    const fake = ctx.app.get(FakeClass);
+
     const resumedId = await createOperator('resumed', TenantStatus.ACTIVE);
+    // A password that really opens, so the sign-in has credentials to make.
+    await prisma.tenant.update({
+      where: { id: resumedId },
+      data: { ichancyPasswordEnc: secrets.sealIchancyPassword('p9 resumed agent password') },
+    });
     const post = (action: 'suspend' | 'activate'): request.Test =>
       api().post(`/v1/admin/tenants/${resumedId}/${action}`).set('authorization', platformBearer);
 
     await post('suspend').expect(200);
-    // The suspension carries a fingerprint of the credentials, and none of the credentials.
     const suspension = await prisma.auditLog.findFirstOrThrow({
       where: { tenantId: resumedId, action: 'tenant.suspended', entityId: resumedId },
     });
+    // No credential, and no fingerprint of one: serving before a suspension proves nothing any more.
     const evidence = JSON.stringify(suspension.after);
-    expect(evidence).toContain('ichancyFingerprint');
-    for (const secret of [SEALED_PASSWORD, 'p9-agent-resumed']) expect(evidence).not.toContain(secret);
+    expect(evidence).not.toContain('ichancyFingerprint');
+    expect(evidence).not.toContain('p9-agent-resumed');
+
+    // A refused sign-in: nothing changes, and the refusal is recorded without the credentials.
+    fake.rejectSignIn('p9-agent-resumed');
+    const refused = await post('activate').expect(422);
+    expect(failure(refused.body)).toMatchObject({
+      code: 'ICHANCY_SIGNIN_FAILED',
+      message: expect.stringContaining('The operator stays suspended.'),
+    });
+    expect(
+      (await prisma.tenant.findUniqueOrThrow({ where: { id: resumedId }, select: { status: true } }))
+        .status,
+    ).toBe(TenantStatus.SUSPENDED);
+    expect(await auditCount(resumedId, 'tenant.activation.refused', resumedId)).toBe(1);
+    expect(await auditCount(resumedId, 'tenant.activated', resumedId)).toBe(0);
+    fake.reset();
 
     // Prime the cache every process reads status through, as a delivery during the suspension would.
     expect(await registry.find(resumedId)).toMatchObject({ status: TenantStatus.SUSPENDED });
 
-    const resumed = await post('activate').expect(200);
-    expect(tenantSchema.parse((resumed.body as Body).data).status).toBe('ACTIVE');
+    const activated = await post('activate').expect(200);
+    expect(tenantSchema.parse((activated.body as Body).data).status).toBe('ACTIVE');
     expect(await cache.get(tenantRegistryKey(resumedId))).toBeNull();
     expect(await registry.find(resumedId)).toMatchObject({ status: TenantStatus.ACTIVE });
     const activations = await prisma.auditLog.findMany({
@@ -516,23 +545,13 @@ describe('Tenant admin surface (integration)', () => {
     expect(activations).toHaveLength(1);
     expect(activations[0]?.after).toMatchObject({
       status: 'ACTIVE',
-      $meta: { verification: 'resumed-previously-serving', signIn: false },
+      $meta: { verification: 'signin', signIn: true, adapter: 'fake' },
     });
+    expect(JSON.stringify(activations)).not.toContain('p9 resumed agent password');
+    expect(fake.callsFor('signIn').map((call) => call.tenantId)).toEqual([resumedId]);
 
     // Repeating it answers the row and records no second decision.
     await post('activate').expect(200);
-    expect(await auditCount(resumedId, 'tenant.activated', resumedId)).toBe(1);
-
-    // Suspended again, and the agent id changes meanwhile: nothing has proven the new details.
-    await post('suspend').expect(200);
-    await prisma.tenant.update({ where: { id: resumedId }, data: { ichancyAgentId: '10500' } });
-    const refused = await post('activate').expect(503);
-    expect(failure(refused.body).code).toBe('TENANT_ACTIVATION_UNAVAILABLE');
-    const row = await prisma.tenant.findUniqueOrThrow({
-      where: { id: resumedId },
-      select: { status: true },
-    });
-    expect(row.status).toBe(TenantStatus.SUSPENDED);
     expect(await auditCount(resumedId, 'tenant.activated', resumedId)).toBe(1);
   });
 
@@ -590,11 +609,15 @@ describe('Tenant admin surface (integration)', () => {
         'REJECTED',
       );
 
-      // It was serving before the suspension, so it resumes, and deposits open again at once.
-      await api()
-        .post(`/v1/admin/tenants/${TENANT_BOOTSTRAP_ID}/activate`)
-        .set('authorization', platformBearer)
-        .expect(200);
+      // Serving again, deposits open again at once. Activation itself (a sign-in with the operator's
+      // credentials, which this shared bootstrap row may not hold in a usable form) is covered above
+      // and in tenant-ichancy.int.spec.ts; this test is about the deposit gate, so the status is
+      // restored directly, with the registry entry dropped as an activation drops it.
+      await prisma.tenant.update({
+        where: { id: TENANT_BOOTSTRAP_ID },
+        data: { status: TenantStatus.ACTIVE },
+      });
+      await cache.del(tenantRegistryKey(TENANT_BOOTSTRAP_ID));
       expect(shortIdOf((await openDeposit().expect(201)).body)).not.toBe(started);
     } finally {
       // Every other suite signs in to this operator, so it is never left suspended by a failure here.
@@ -606,15 +629,18 @@ describe('Tenant admin surface (integration)', () => {
     }
   });
 
-  it('refuses to activate an operator that never served until per-operator Ichancy sign-in exists, and changes nothing', async () => {
+  it('refuses to activate an operator whose stored password cannot be opened, changes nothing, and answers an ACTIVE one as it is', async () => {
+    // SEALED_PASSWORD is not a sealed value, so there is no credential to sign in with: nothing is
+    // sent to Ichancy at all, and the fix is re-entering the password.
     const refused = await api()
       .post(`/v1/admin/tenants/${suspendedId}/activate`)
       .set('authorization', platformBearer)
-      .expect(503);
+      .expect(422);
     expect(failure(refused.body)).toMatchObject({
-      code: 'TENANT_ACTIVATION_UNAVAILABLE',
+      code: 'TENANT_ICHANCY_UNCONFIGURED',
       message: expect.stringContaining('The operator stays suspended'),
     });
+    expect(JSON.stringify(refused.body)).not.toContain(SEALED_PASSWORD);
     const row = await prisma.tenant.findUniqueOrThrow({
       where: { id: suspendedId },
       select: { status: true },

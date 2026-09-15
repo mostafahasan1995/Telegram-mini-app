@@ -9,8 +9,8 @@
  * audit row in X's log regardless of where the request's context points.
  *
  * Status codes: create answers 201 (it creates the operator). Every other POST answers 200, not
- * Nest's POST default of 201: suspend, activate, webhook registration and menu pushes change an
- * existing operator and create nothing.
+ * Nest's POST default of 201: suspend, activate, webhook registration, menu pushes and the import
+ * change an existing operator and create no resource the client addresses.
  */
 import {
   Body,
@@ -33,12 +33,15 @@ import { Idempotent } from '@core/idempotency/idempotent.decorator';
 import { CreateTenantDto } from '../dtos/create-tenant.dto';
 import { ReplaceTenantBotDto } from '../dtos/replace-tenant-bot.dto';
 import { TenantIdParamDto } from '../dtos/tenant-id-param.dto';
+import { UpdateTenantIchancyDto } from '../dtos/update-tenant-ichancy.dto';
 import { UpdateTenantDto } from '../dtos/update-tenant.dto';
 import { TenantAdminService } from '../services/tenant-admin.service';
 import { TenantCreationService } from '../services/tenant-creation.service';
 import { TenantHealthService } from '../services/tenant-health.service';
+import { TenantIchancyService } from '../services/tenant-ichancy.service';
 import { TenantTelegramService } from '../services/tenant-telegram.service';
 import type {
+  PlayerImportSummaryView,
   TenantBotSetupView,
   TenantCreatedView,
   TenantHealthView,
@@ -53,6 +56,7 @@ export class TenantAdminController {
     private readonly creation: TenantCreationService,
     private readonly telegram: TenantTelegramService,
     private readonly healthChecks: TenantHealthService,
+    private readonly ichancy: TenantIchancyService,
   ) {}
 
   /** `{ tenants: [...] }`, a wrapper object and not a bare array, as the console parses it. */
@@ -102,6 +106,7 @@ export class TenantAdminController {
     return this.tenants.suspend(actorAdminId, params.id);
   }
 
+  /** A real Ichancy sign-in with the operator's own credentials; SUSPENDED -> ACTIVE only if accepted. */
   @AdminAuth(AdminRole.PLATFORM_ADMIN)
   @Post(':id/activate')
   @HttpCode(HttpStatus.OK)
@@ -109,7 +114,7 @@ export class TenantAdminController {
     @CurrentAdmin('adminUserId') actorAdminId: string,
     @Param() params: TenantIdParamDto,
   ): Promise<TenantView> {
-    return this.tenants.activate(actorAdminId, params.id);
+    return this.ichancy.activate(actorAdminId, params.id);
   }
 
   /** Tells Telegram where to deliver, generating a legacy row's path token and secret if needed. */
@@ -149,6 +154,17 @@ export class TenantAdminController {
     return this.healthChecks.health(params.id);
   }
 
+  /** Only the fields that change; verified with a real sign-in before anything is saved. */
+  @AdminAuth(AdminRole.PLATFORM_ADMIN)
+  @Patch(':id/ichancy')
+  updateIchancy(
+    @CurrentAdmin('adminUserId') actorAdminId: string,
+    @Param() params: TenantIdParamDto,
+    @Body() body: UpdateTenantIchancyDto,
+  ): Promise<TenantView> {
+    return this.ichancy.updateIchancy(actorAdminId, params.id, body);
+  }
+
   /** Verified with getMe before it is sealed; the webhook must be registered again afterwards. */
   @AdminAuth(AdminRole.PLATFORM_ADMIN)
   @Patch(':id/bot')
@@ -159,5 +175,19 @@ export class TenantAdminController {
   ): Promise<TenantView> {
     await this.telegram.replaceBot(actorAdminId, params.id, body.botToken);
     return this.tenants.get(params.id);
+  }
+
+  /**
+   * The "old players", again. 200 with a PlayerImportSummary even when Ichancy failed part-way (the
+   * failure is in `error`); 409 IMPORT_ALREADY_RUNNING while another import of this operator runs.
+   */
+  @AdminAuth(AdminRole.PLATFORM_ADMIN)
+  @Post(':id/import-players')
+  @HttpCode(HttpStatus.OK)
+  importPlayers(
+    @CurrentAdmin('adminUserId') actorAdminId: string,
+    @Param() params: TenantIdParamDto,
+  ): Promise<PlayerImportSummaryView> {
+    return this.ichancy.importPlayers(actorAdminId, params.id);
   }
 }

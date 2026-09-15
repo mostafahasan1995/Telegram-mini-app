@@ -211,6 +211,11 @@ export class AdminTelegramHandlers {
 
     try {
       const link = await this.playerLink.ensureLinked(player.id, `telegram:/register:${admin.adminUserId}`);
+      // The operator's own agent, which is the one ensureLinked registered under. Never the env's.
+      const operator = await this.prisma.tenant.findUnique({
+        where: { id: requireEffectiveTenantId() },
+        select: { ichancyAgentId: true },
+      });
       await this.reply(
         ctx,
         [
@@ -221,7 +226,7 @@ export class AdminTelegramHandlers {
           `Ichancy login: <code>${esc(link.ichancyLogin)}</code>`,
           `Ichancy id: <code>${esc(link.ichancyPlayerId)}</code>`,
           '',
-          `<i>Registered under agent ${esc(this.config.ichancy.agentId)}.</i>`,
+          `<i>Registered under agent ${esc(operator?.ichancyAgentId ?? '—')}.</i>`,
         ].join('\n'),
       );
     } catch (error: unknown) {
@@ -295,10 +300,14 @@ export class AdminTelegramHandlers {
       // Waiting starts when the player submitted, not when the draft was opened: an abandoned draft
       // that was finished an hour later has not been ignored for a day.
       const since = row.submittedAt ?? row.createdAt;
+      // An imported player has no Telegram account until one is attached, and cannot open a
+      // deposit before that, but a queue line must never throw on the row it describes.
       const who =
-        row.player.telegramUsername === null
-          ? `id ${row.player.telegramUserId.toString()}`
-          : `@${row.player.telegramUsername}`;
+        row.player.telegramUsername !== null
+          ? `@${row.player.telegramUsername}`
+          : row.player.telegramUserId === null
+            ? 'no Telegram account'
+            : `id ${row.player.telegramUserId.toString()}`;
 
       lines.push(
         `<code>${esc(row.shortId)}</code> · <b>${formatMinorToDecimal(amountMinor)} ${esc(row.currencyCode)}</b>`,

@@ -95,6 +95,23 @@ export interface TenantProvisioningView {
 /** POST /v1/admin/tenants: `{ ...TenantView, provisioning }`, flattened as the contract answers it. */
 export type TenantCreatedView = TenantView & { provisioning: TenantProvisioningView };
 
+/**
+ * POST /:id/import-players (dashboard src/types/player.ts playerImportSummarySchema). `error` is a
+ * sentence rather than a thrown failure: an Ichancy outage part-way leaves the rows already written,
+ * and the summary reports how far it got beside what stopped it.
+ */
+export interface PlayerImportSummaryView {
+  /** Agent rows read from Ichancy, usable or not. */
+  scanned: number;
+  /** New `ICHANCY_IMPORT` players written by this run. */
+  created: number;
+  /** Rows this operator already held, by Ichancy id or login. */
+  existing: number;
+  error: string | null;
+  startedAt: string;
+  finishedAt: string;
+}
+
 /** A webhook URL or a Telegram sentence, with any path token masked. */
 export const maskWebhookText = (text: string): string => redactWebhookPathToken(text);
 
@@ -186,9 +203,10 @@ export function botHealthUnavailable(username: string | null, reason: string): T
 }
 
 /**
- * The Ichancy half of GET /health until per-operator Ichancy sign-in exists: a schema-valid "not
- * checked", never a success. `floatMinor` is null and `belowWatermark` false, which the contract
- * defines as "no comparison was possible". `sharesAgentWith` needs no sign-in and is real.
+ * The Ichancy half of GET /health when no check can be made at all (tenant zero, which has no agent):
+ * a schema-valid "not checked", never a success. `floatMinor` is null and `belowWatermark` false,
+ * which the contract defines as "no comparison was possible". `sharesAgentWith` needs no sign-in and
+ * is real.
  */
 export function ichancyHealthNotChecked(input: {
   baseUrl: string;

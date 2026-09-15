@@ -1,6 +1,6 @@
 /**
- * The platform surface's own constants: audit verbs and the bounds the dashboard's tenant form
- * enforces.
+ * The platform surface's own constants: audit verbs, the bounds the dashboard's tenant form
+ * enforces, and the few sentences the operator-operations routes answer with.
  *
  * WHY THE BOUNDS ARE RESTATED HERE: the console validates before it sends, but a console is one
  * client among several and a PATCH from anything else must meet the same rules. The numbers are
@@ -13,16 +13,27 @@
 export const TenantAuditActions = {
   /** A PATCH /v1/admin/tenants/:id that changed at least one field. Lands in that operator's log. */
   TENANT_UPDATED: 'tenant.updated',
-  /**
-   * ACTIVE -> SUSPENDED. Lands in that operator's log, carrying the Ichancy fingerprint the operator
-   * was serving with (see utils/resume.ts).
-   */
+  /** ACTIVE -> SUSPENDED. Lands in that operator's log. */
   TENANT_SUSPENDED: 'tenant.suspended',
   /**
-   * SUSPENDED -> ACTIVE. Lands in that operator's log. Its `$meta.verification` says how it was
-   * allowed; today only RESUME_VERIFICATION exists, recorded with `signIn: false`.
+   * SUSPENDED -> ACTIVE after a real Ichancy sign-in with the operator's own credentials. Lands in
+   * that operator's log, with `$meta.verification: 'signin'`, `signIn: true` and which adapter
+   * answered (`real`, or `fake` under ICHANCY_FAKE).
    */
   TENANT_ACTIVATED: 'tenant.activated',
+  /** An activation whose sign-in did not prove the credentials. The code only, never a credential. */
+  TENANT_ACTIVATION_REFUSED: 'tenant.activation.refused',
+  /** PATCH /:id/ichancy saved credentials a real sign-in had just accepted. The password is never in it. */
+  TENANT_ICHANCY_UPDATED: 'tenant.ichancy.updated',
+  /**
+   * A PATCH /:id/ichancy that saved nothing: the refusal's code, the names of the fields it tried to
+   * change and, when it tried to move the operator, the ORIGIN it named. Never a credential. It exists
+   * because a refused edit still sent a sign-in somewhere, and the only other trace of that attempt
+   * (the ichancy_calls row) records no host.
+   */
+  TENANT_ICHANCY_UPDATE_REFUSED: 'tenant.ichancy.update.refused',
+  /** An import of the operator's existing Ichancy players ran. Counts only. That operator's log. */
+  TENANT_PLAYERS_IMPORTED: 'tenant.players.imported',
   /** POST /v1/admin/tenants inserted the row. Lands in the NEW operator's log. */
   TENANT_CREATED: 'tenant.created',
   /** What provisioning managed on create: booleans only, never a URL. The new operator's log. */
@@ -63,39 +74,124 @@ export const WEBHOOK_SECRET_BYTES = 24;
 /** How many derived slugs creation tries when concurrent creates keep taking the one it picked. */
 export const SLUG_INSERT_ATTEMPTS = 5;
 
-/**
- * provisioning.activationError until per-operator Ichancy sign-in exists. Activation was not
- * attempted, and the sentence says so rather than implying a sign-in failed.
- */
-export const ACTIVATION_NOT_ATTEMPTED_MESSAGE =
-  'Not activated: activating an operator signs in to Ichancy with its own stored credentials, and ' +
-  'this deployment cannot make that sign-in yet. The operator stays suspended.';
+/** How an activation or a credential edit was proven: a real sign-in, never a stored session. */
+export const SIGNIN_VERIFICATION = 'signin';
 
 /** provisioning.playersImportError: the import runs only after activation, which did not happen. */
 export const PLAYERS_NOT_IMPORTED_MESSAGE =
   'Players were not imported: the operator was not activated. Import them from the operator once it is.';
 
-/** health.ichancy.error until per-operator Ichancy sign-in exists. No sign-in was made. */
-export const ICHANCY_HEALTH_UNAVAILABLE_MESSAGE =
-  'Not checked: checking an Ichancy agent signs in with the operator’s own stored credentials, ' +
-  'and this deployment cannot make that sign-in yet.';
+/** provisioning.activationError when something other than Ichancy's answer stopped the attempt. */
+export const ACTIVATION_FAILED_UNEXPECTEDLY_MESSAGE =
+  'Activation failed: an unexpected error occurred on this server. Activate the operator from its page.';
+
+/** provisioning.playersImportError when the import itself threw. */
+export const IMPORT_FAILED_UNEXPECTEDLY_MESSAGE =
+  "The import failed: an unexpected error occurred on this server. Import the players from the operator's page.";
+
+/** The dashboard's own sentence for 409 IMPORT_ALREADY_RUNNING (src/features/tenants tests). */
+export const IMPORT_ALREADY_RUNNING_MESSAGE = 'An import is already running for this operator.';
+
+/** health.ichancy.error, and every credential refusal, for tenant zero. */
+export const PLATFORM_HAS_NO_AGENT_MESSAGE =
+  'Tenant zero is the platform, not an operator: it has no Ichancy agent.';
+
+/**
+ * One page of the agent's players per request. Paging keeps each round trip small (Cloudflare treats
+ * a huge answer no better than a small one) and lets an outage part-way keep what it already wrote.
+ */
+export const IMPORT_PAGE_SIZE = 100;
+/**
+ * A SAFETY bound on the players one run reads, not the expected size of an agent: a run normally ends
+ * at Ichancy's first short page. It exists so a listing that never ends (an API that ignores `start`
+ * and answers the same full page forever) cannot hold the lock and the request for ever. A run that
+ * reaches it says so in `error`, and the next run resumes where it stopped (see the cursor below), so
+ * no agent is ever too big to import — it only takes more than one run.
+ */
+export const IMPORT_MAX_PLAYERS_PER_RUN = 50_000;
+
+/** The import's paging, injectable so a test can page an agent of five players. */
+export interface PlayerImportLimits {
+  readonly pageSize: number;
+  readonly maxPlayersPerRun: number;
+}
+export const TENANT_IMPORT_LIMITS = 'TENANT_IMPORT_LIMITS';
+export const DEFAULT_PLAYER_IMPORT_LIMITS: PlayerImportLimits = {
+  pageSize: IMPORT_PAGE_SIZE,
+  maxPlayersPerRun: IMPORT_MAX_PLAYERS_PER_RUN,
+};
+
+/**
+ * The lock's lease, renewed after every page. So it bounds how long ONE page may take, not the whole
+ * run: a large agent keeps its lock for as long as pages keep arriving, and a crashed holder releases
+ * within this. A run that loses its lease stops and says so rather than race a second run.
+ */
+export const IMPORT_LOCK_TTL_MS = 15 * 60_000;
+/** LockService.key('tenant', 'import-players', id): one import per operator, cluster-wide. */
+export const importPlayersLockKey = (tenantId: string): string =>
+  `lock:tenant:import-players:${tenantId}`;
+
+/**
+ * Where a run that stopped early (the safety bound, an Ichancy failure, a lost lease) records the
+ * offset it had reached, so the next run continues there instead of re-reading the same first pages
+ * for ever. Cleared by a run that reaches the end. It resumes one page EARLY: if players were removed
+ * at Ichancy in between and the listing shifted back, the overlap re-reads rows (counted `existing`)
+ * rather than skipping one. A week, because a cursor older than that describes a listing that has
+ * moved on; starting again from 0 is always correct, only slower.
+ */
+export const IMPORT_CURSOR_TTL_SECONDS = 7 * 24 * 60 * 60;
+export const importPlayersCursorKey = (tenantId: string): string =>
+  `tenant:import-players:cursor:v1:${tenantId}`;
+
+/** `error` of a run that reached the safety bound. */
+export const importStoppedAtBoundMessage = (scanned: number): string =>
+  `The import stopped after reading ${String(scanned)} players, the most one run reads. ` +
+  'Run it again to continue from where it stopped.';
+
+/** `error` of a run whose lock lease was lost between pages. */
+export const importLeaseLostMessage = (scanned: number): string =>
+  `The import stopped after reading ${String(scanned)} players because its lock expired. ` +
+  'Run it again to continue from where it stopped.';
+
+/**
+ * `error` when players were left out because another operator shares this login under another
+ * agent id and Ichancy did not say which agent id they hang off. Importing them would hand one
+ * operator's players (logins and emails) to another.
+ */
+export const importUnattributedMessage = (skipped: number, sharedWith: readonly string[]): string =>
+  `${String(skipped)} ${skipped === 1 ? 'player was' : 'players were'} not imported: this Ichancy login is shared with ` +
+  `${sharedWith.join(', ')} under another agent id, and Ichancy did not say which agent id they ` +
+  'belong to.';
+
+/**
+ * `error` when players were left out because another operator on the same login AND agent id already
+ * holds them. Both rows would be ACTIVE and point at one Ichancy wallet, so once a Telegram account is
+ * attached to each, one wallet could be credited from two operators' books. Which operator owns such a
+ * player is a decision for a person, not for an import.
+ */
+export const importHeldElsewhereMessage = (skipped: number, heldBy: readonly string[]): string =>
+  `${String(skipped)} ${skipped === 1 ? 'player was' : 'players were'} not imported: ` +
+  `${heldBy.join(', ')} already ${heldBy.length === 1 ? 'holds' : 'hold'} ${skipped === 1 ? 'it' : 'them'} ` +
+  'under the same Ichancy login and agent id. Decide which operator owns them before importing them here.';
+
+/**
+ * The refusal of a PATCH /:id/ichancy that moves the operator to another Ichancy host without sending
+ * the password. Signing in there with the STORED password would hand the sealed agent password, which
+ * controls a real-money float, to whatever host the request named.
+ */
+export const HOST_MOVE_NEEDS_PASSWORD_FIELD =
+  'ichancyPassword is required when ichancyBaseUrl moves the operator to another host; the stored password is only ever sent to the stored host';
+
+/**
+ * How long one operator's Ichancy health answer is reused. The console does not poll (it asks when
+ * someone looks, `refetchInterval: false`), but a detail panel re-rendered, or two admins looking at
+ * once, must not each cost a wallet read — and, for an operator with no stored session, a sign-in
+ * that rotates the agent's tokens. Thirty seconds bounds that to two per minute per operator while
+ * still showing a credential fix almost at once; a PATCH or an activation drops the entry anyway.
+ */
+export const ICHANCY_HEALTH_CACHE_SECONDS = 30;
+export const ichancyHealthCacheKey = (tenantId: string): string =>
+  `tenant:ichancy-health:v1:${tenantId}`;
 
 /** PlatformDefaults is a singleton; prisma/sql/006 pins the id with a CHECK constraint. */
 export const PLATFORM_DEFAULTS_ID = 1;
-
-/**
- * How a resume is recorded: the operator was serving before its suspension and its Ichancy details
- * are unchanged since, so no sign-in was made. Never recorded as a verification.
- */
-export const RESUME_VERIFICATION = 'resumed-previously-serving';
-
-/**
- * What /activate answers, until per-operator Ichancy sign-in exists, for an operator that cannot be
- * resumed. Worded for the admin reading it in the activate dialog, which shows the API's message
- * verbatim.
- */
-export const ACTIVATION_UNAVAILABLE_MESSAGE =
-  'Activating an operator signs in to Ichancy with its own stored credentials, and this ' +
-  'deployment cannot make that sign-in yet. Only an operator that was serving before it was ' +
-  'suspended, with its Ichancy details unchanged since, can be resumed now. The operator stays ' +
-  'suspended and nothing was changed.';

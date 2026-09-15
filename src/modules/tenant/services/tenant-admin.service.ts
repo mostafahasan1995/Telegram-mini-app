@@ -1,5 +1,5 @@
 /**
- * The platform's view of its operators: list, read, edit, suspend, activate.
+ * The platform's view of its operators: list, read, edit, suspend.
  *
  * ══ TENANT ZERO IS LISTED ════════════════════════════════════════════════════════════════════════
  * The dashboard's mock answers `GET /v1/admin/tenants` with every row, tenant zero included, and its
@@ -27,14 +27,15 @@
  *  - "credits already in flight still land": proof upload, cancel, review and crediting are not
  *    gated, and neither is player sign-in. A player who has already sent money has to be able to
  *    sign in and attach the receipt, or the suspension would strand that money;
- *  - "you can activate the tenant again at any time": see ACTIVATE below.
+ *  - "you can activate the tenant again at any time": activation (TenantIchancyService) signs in to
+ *    Ichancy with the operator's own credentials and moves it back to ACTIVE when Ichancy accepts.
  *
  * Staff console sessions issued before the suspension stay valid until they expire. The dialog does
  * not promise a staff lockout, and the operator's staff are the people reconciling the credits still
  * in flight. New staff sign-ins are refused (AdminCredentialsService), which is enough to stop
  * anybody new from arriving.
  *
- * After the status commits, three caches are dropped in this process:
+ * After the status commits, three caches are dropped in this process (evictOperator):
  *  - TenantRegistryService: the Redis entry every process reads status through, so the webhook and
  *    the update processor stop serving the operator at once instead of after the 30s TTL;
  *  - TenantBotRegistry: the built Bot and its cached identity, so a reactivated operator is
@@ -47,32 +48,11 @@
  * about the agent those credits draw on. Dropping them would leave a credit that landed invisible to
  * the player who paid for it and to the staff who have to reconcile it. That is exactly "touching
  * what is already recorded", which the dialog promises a suspension will not do.
- *
- * ══ ACTIVATE: RESUME, OR REFUSE ═════════════════════════════════════════════════════════════════
- * The contract makes activation "a real Ichancy signin with that operator's credentials", and it is
- * the only check standing between a wrong agent id and real players registered under another
- * operator's agent. Per-operator Ichancy sign-in does not exist yet. Refusing everything would make a
- * suspension one-way, which the dialog promises it is not, so /activate answers in one of two ways:
- *  - RESUME: the operator's latest status decision is a suspension, and its Ichancy details are the
- *    ones it was serving with when it was suspended (a fingerprint recorded on that audit row). It
- *    goes back to ACTIVE, audited as `tenant.activated` with `verification:
- *    'resumed-previously-serving'` and `signIn: false`. The reasoning is in utils/resume.ts.
- *  - REFUSE: anything else, for example a new operator that never served or one whose credentials
- *    changed while suspended, gets 503 TENANT_ACTIVATION_UNAVAILABLE and nothing changes.
- * Neither path follows ICHANCY_FAKE. The fake adapter never reads an operator's credentials, so
- * "success" there would be a verification that never happened, recorded as if it had, which is the
- * one outcome the dashboard's own mock refuses to fake ("rather than claiming a verification that
- * never happened").
  */
 import { Injectable } from '@nestjs/common';
 import { TenantStatus, type Prisma } from '@prisma/client';
 
-import {
-  BusinessRuleError,
-  NotFoundError,
-  ServiceUnavailableError,
-  ValidationError,
-} from '@common/exceptions/app.exception';
+import { BusinessRuleError, ValidationError } from '@common/exceptions/app.exception';
 import { adminActor } from '@common/types/actor.type';
 import { AuditService } from '@core/audit/audit.service';
 import { InitDataService } from '@core/auth/services/init-data.service';
@@ -85,29 +65,18 @@ import { TENANT_ZERO_ID } from '@core/tenant/tenant.constants';
 import { runWithTenant } from '@core/tenant/tenant.storage';
 
 import type { UpdateTenantDto } from '../dtos/update-tenant.dto';
-import {
-  ACTIVATION_UNAVAILABLE_MESSAGE,
-  RESUME_VERIFICATION,
-  TenantAuditActions,
-} from '../tenant-admin.constants';
+import { TenantAuditActions } from '../tenant-admin.constants';
 import { changedFields } from '../utils/changed-fields';
 import { immutableFieldsIn, tenantEditsFromDto, type TenantEditableFields } from '../utils/edits';
-import {
-  ICHANCY_FINGERPRINT_KEY,
-  ICHANCY_IDENTITY_SELECT,
-  STATUS_DECISION_ACTIONS,
-  ichancyFingerprint,
-  mayResumeWithoutSignIn,
-} from '../utils/resume';
+import { tenantNotFound } from '../utils/tenant-errors';
 import {
   TENANT_VIEW_SELECT,
   toTenantView,
   type TenantCounts,
   type TenantView,
-  type TenantViewRow,
 } from '../views/tenant.view';
 
-/** The audit subject of every row this service writes, and what activate searches the log for. */
+/** The audit subject of every row this service writes. */
 const TENANT_SUBJECT = 'Tenant';
 
 @Injectable()
@@ -229,13 +198,6 @@ export class TenantAdminService {
       });
 
       if (claimed.count === 1) {
-        // Read after the claim, inside the same transaction: the conditional update holds the row
-        // lock until commit, so no concurrent credential change can land between this read and the
-        // suspension it describes. The fingerprint is exactly what the operator was serving with.
-        const identity = await tx.tenant.findUniqueOrThrow({
-          where: { id },
-          select: ICHANCY_IDENTITY_SELECT,
-        });
         await runWithTenant(id, () =>
           this.audit.write(tx, {
             action: TenantAuditActions.TENANT_SUSPENDED,
@@ -244,7 +206,6 @@ export class TenantAdminService {
             subjectId: id,
             before: { status: TenantStatus.ACTIVE },
             after: { status: TenantStatus.SUSPENDED },
-            metadata: { [ICHANCY_FINGERPRINT_KEY]: ichancyFingerprint(identity) },
           }),
         );
       }
@@ -259,79 +220,6 @@ export class TenantAdminService {
   }
 
   /**
-   * See the file header: resumes an operator suspended while serving with unchanged Ichancy details,
-   * refuses every other SUSPENDED operator until per-operator Ichancy sign-in exists.
-   */
-  async activate(actorAdminId: string, id: string): Promise<TenantView> {
-    const { row, resumed } = await this.prisma.runInTransaction(async (tx) => {
-      const current = await tx.tenant.findUnique({ where: { id }, select: TENANT_VIEW_SELECT });
-      if (current === null) throw tenantNotFound();
-      if (current.status === TenantStatus.CLOSED) throw tenantClosed();
-      // Already serving: answer the row, write nothing. Repeating an activate is not a new decision.
-      if (current.status === TenantStatus.ACTIVE) return { row: current, resumed: false };
-
-      const identity = await tx.tenant.findUniqueOrThrow({
-        where: { id },
-        select: ICHANCY_IDENTITY_SELECT,
-      });
-      // An explicit tenantId, which the scope extension never overrides: the evidence is in the
-      // operator's own log, wherever the request's context points.
-      const latest = await tx.auditLog.findFirst({
-        where: {
-          tenantId: id,
-          entityType: TENANT_SUBJECT,
-          entityId: id,
-          action: { in: [...STATUS_DECISION_ACTIONS] },
-        },
-        // uuidv7 ids are time-ordered, so they settle two rows written in the same microsecond.
-        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-        select: { action: true, after: true },
-      });
-      if (!mayResumeWithoutSignIn(latest, identity)) throw activationUnavailable();
-
-      // Conditional on the status AND on the very credentials just fingerprinted. A concurrent
-      // activate, or a credential change that commits after the reads above, makes this match no
-      // row instead of resuming an operator whose details were never proven.
-      const claimed = await tx.tenant.updateMany({
-        where: { id, status: TenantStatus.SUSPENDED, ...identity },
-        data: { status: TenantStatus.ACTIVE },
-      });
-      const updated = await tx.tenant.findUniqueOrThrow({
-        where: { id },
-        select: TENANT_VIEW_SELECT,
-      });
-      if (claimed.count === 0) {
-        if (updated.status === TenantStatus.ACTIVE) return { row: updated, resumed: false };
-        if (updated.status === TenantStatus.CLOSED) throw tenantClosed();
-        throw activationUnavailable();
-      }
-
-      await runWithTenant(id, () =>
-        this.audit.write(tx, {
-          action: TenantAuditActions.TENANT_ACTIVATED,
-          actor: adminActor(actorAdminId),
-          subjectType: TENANT_SUBJECT,
-          subjectId: id,
-          before: { status: TenantStatus.SUSPENDED },
-          after: { status: TenantStatus.ACTIVE },
-          metadata: { verification: RESUME_VERIFICATION, signIn: false },
-        }),
-      );
-      return { row: updated, resumed: true };
-    });
-
-    // The same three as a suspension: every process has to see ACTIVE now, and the bot and the
-    // mini-app key are rebuilt from the row rather than trusted from before the suspension.
-    if (resumed) await this.evictOperator(id);
-
-    return this.viewWithCounts(row);
-  }
-
-  private async viewWithCounts(row: TenantViewRow): Promise<TenantView> {
-    return toTenantView(row, await this.countsOf(row.id));
-  }
-
-  /**
    * An explicit tenantId, which the scope extension never overrides. Public for GET /:id/health,
    * which reports the same two numbers.
    */
@@ -343,22 +231,16 @@ export class TenantAdminService {
     return { players, deposits };
   }
 
-  private async evictOperator(id: string): Promise<void> {
+  /**
+   * Drops the three caches that hold an operator's serving state in this process. Public because an
+   * activation (TenantIchancyService) changes status too, and must evict exactly what a suspension
+   * does.
+   */
+  async evictOperator(id: string): Promise<void> {
     await this.registry.invalidate(id);
     await this.bots.invalidate(id);
     this.initData.invalidate(id);
   }
-}
-
-function activationUnavailable(): ServiceUnavailableError {
-  return new ServiceUnavailableError(
-    TenantErrorCodes.TENANT_ACTIVATION_UNAVAILABLE,
-    ACTIVATION_UNAVAILABLE_MESSAGE,
-  );
-}
-
-function tenantNotFound(): NotFoundError {
-  return new NotFoundError(TenantErrorCodes.TENANT_NOT_FOUND, 'Tenant not found.');
 }
 
 function tenantClosed(): BusinessRuleError {

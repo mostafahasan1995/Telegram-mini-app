@@ -179,7 +179,7 @@ export class RegisterPlayerCommand extends CommandRunner {
   /** Exactly one selector must be given; ambiguity here would register the wrong person. */
   private async resolveTargets(
     options: RegisterPlayerOptions,
-  ): Promise<{ id: string; telegramUserId: bigint }[]> {
+  ): Promise<{ id: string; telegramUserId: bigint | null }[]> {
     const selectors = [options.playerId, options.telegramId, options.allPending].filter(
       (value) => value !== undefined,
     );

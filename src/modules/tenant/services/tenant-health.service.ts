@@ -2,23 +2,23 @@
  * GET /v1/admin/tenants/:id/health: bot, webhook, Ichancy agent and counts in one call, "because they
  * fail together" (dashboard src/types/tenant.ts, tenantHealthSchema).
  *
- *  - bot: real. getWebhookInfo through the operator's own bot, compared with the URL this deployment
+ *  - bot: getWebhookInfo through the operator's own bot, compared with the URL this deployment
  *    expects (TenantTelegramService.botHealth).
- *  - ichancy: interim. A real check signs in with the operator's own stored credentials, which this
- *    deployment cannot do yet, so the block is a schema-valid "not checked": `ok: false`, the reason,
- *    no float. `sharesAgentWith` needs no sign-in and is real: the slugs of the other operators on the
- *    same base URL and username, which share one Ichancy session whether or not anyone meant them to.
- *  - counts: real, the same two numbers the tenant list reports.
+ *  - ichancy: the operator's own agent — a wallet read with its credentials (signing in first only
+ *    when no session for exactly those credentials exists), the float against the operator's own
+ *    watermark, and `sharesAgentWith`, the slugs of the other operators on the same login. Cached
+ *    briefly; see TenantIchancyService.health.
+ *  - counts: the same two numbers the tenant list reports.
  */
 import { Injectable } from '@nestjs/common';
 
 import { PrismaService } from '@core/prisma/prisma.service';
 
-import { ICHANCY_HEALTH_UNAVAILABLE_MESSAGE } from '../tenant-admin.constants';
 import { tenantNotFound } from '../utils/tenant-errors';
-import { ichancyHealthNotChecked, type TenantHealthView } from '../views/tenant-operations.view';
+import type { TenantHealthView } from '../views/tenant-operations.view';
 
 import { TenantAdminService } from './tenant-admin.service';
+import { TenantIchancyService } from './tenant-ichancy.service';
 import { TenantTelegramService } from './tenant-telegram.service';
 
 @Injectable()
@@ -27,6 +27,7 @@ export class TenantHealthService {
     private readonly prisma: PrismaService,
     private readonly telegram: TenantTelegramService,
     private readonly tenants: TenantAdminService,
+    private readonly ichancy: TenantIchancyService,
   ) {}
 
   async health(id: string): Promise<TenantHealthView> {
@@ -39,37 +40,17 @@ export class TenantHealthService {
         ichancyBaseUrl: true,
         ichancyUsername: true,
         ichancyAgentId: true,
+        agentFloatLowWatermarkMinor: true,
       },
     });
     if (row === null) throw tenantNotFound();
 
-    const [bot, sharing, counts] = await Promise.all([
+    const [bot, ichancy, counts] = await Promise.all([
       this.telegram.botHealth(row),
-      // Matched on base URL + username, NOT agent id: the Ichancy session belongs to the login
-      // (TENANT-OPERATIONS.md §6, detail 1). `Tenant` is not tenant-scoped, so this sees every operator.
-      this.prisma.tenant.findMany({
-        where: {
-          id: { not: id },
-          ichancyBaseUrl: row.ichancyBaseUrl,
-          ichancyUsername: row.ichancyUsername,
-        },
-        select: { slug: true },
-        orderBy: { slug: 'asc' },
-      }),
+      this.ichancy.health(row),
       this.tenants.countsOf(id),
     ]);
 
-    return {
-      bot,
-      ichancy: ichancyHealthNotChecked({
-        baseUrl: row.ichancyBaseUrl,
-        username: row.ichancyUsername,
-        agentId: row.ichancyAgentId,
-        sharesAgentWith: sharing.map((other) => other.slug),
-        reason: ICHANCY_HEALTH_UNAVAILABLE_MESSAGE,
-        checkedAt: new Date(),
-      }),
-      counts,
-    };
+    return { bot, ichancy, counts };
   }
 }

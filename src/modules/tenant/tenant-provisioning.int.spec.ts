@@ -7,7 +7,10 @@
  * app's own TenantBotRegistry: every getMe, setWebhook and setMyCommands still goes through grammY's
  * request building and the registry's transformers, and every call is recorded with the token it used.
  * No request can reach api.telegram.org. Ichancy is the fake adapter (ICHANCY_FAKE=1 in the test env),
- * and nothing here signs in to it: activation is not attempted yet.
+ * told to refuse every sign-in, so provisioning's activation attempt is refused and every operator
+ * created here stays SUSPENDED, as a wrong password would leave it. Activation that succeeds, the
+ * import that follows it, and the same flows against an HTTP-level Ichancy stub are in
+ * tenant-ichancy.int.spec.ts.
  *
  * API_BASE_URL is an https URL for this suite, because registering an http one is refused before
  * Telegram is asked (unit-tested). The laptop's real failure, Telegram refusing a URL it cannot
@@ -41,6 +44,7 @@ import request from 'supertest';
 import { z } from 'zod';
 
 import { PasswordHasherService } from '@core/auth/services/password-hasher.service';
+import { FakeIchancyAdapter } from '@core/ichancy/fake-ichancy.adapter';
 import { InitDataService } from '@core/auth/services/init-data.service';
 import { CacheService } from '@core/cache/cache.service';
 import { PrismaService } from '@core/prisma/prisma.service';
@@ -282,6 +286,8 @@ describe('Tenant creation and Telegram operations (integration)', () => {
 
     await ctx.reset();
     await removeSuiteRows();
+    // See the header: every operator created by this suite must stay SUSPENDED after provisioning.
+    ctx.app.get(FakeIchancyAdapter).refuseAllSignIns();
     defaultsBefore = await prisma.platformDefaults.findUnique({ where: { id: 1 } });
     // A named house agent, and marked seeded so the first read does not overwrite it from the env.
     await prisma.platformDefaults.update({
@@ -364,7 +370,9 @@ describe('Tenant creation and Telegram operations (integration)', () => {
       menuScopes: ['default', 'all_private_chats', 'chat'],
       menuError: null,
       activated: false,
-      activationError: expect.stringMatching(/^Not activated: .*stays suspended\.$/),
+      activationError: expect.stringMatching(
+        /^Ichancy refused the sign-in with these credentials \(INVALID_CREDENTIALS: .*\)\. The operator stays suspended\.$/,
+      ),
       paymentMethodsCreated: 4,
       paymentMethodsError: null,
       paymentMethodsNeedAccounts: true,
@@ -418,10 +426,12 @@ describe('Tenant creation and Telegram operations (integration)', () => {
       'tenant.webhook.registered',
       'tenant.bot.menusPushed',
       'tenant.paymentMethods.provisioned',
+      'tenant.activation.refused',
       'tenant.provisioned',
     ]) {
       expect(await auditCount(created.id, action)).toBe(1);
     }
+    expect(await auditCount(created.id, 'tenant.activated')).toBe(0);
 
     const wire = JSON.stringify(response.body);
     const evidence = JSON.stringify(await prisma.auditLog.findMany({ where: { tenantId: created.id } }));
@@ -843,13 +853,15 @@ describe('Tenant creation and Telegram operations (integration)', () => {
       lastErrorMessage: null,
       lastErrorDate: null,
     });
+    // The agent answered with its float (the fake's wallet here; tenant-ichancy.int.spec.ts reads a
+    // stubbed Ichancy with real credentials), and the operators on the same login are named.
     expect(healthy.ichancy).toMatchObject({
-      ok: false,
+      ok: true,
       username: SHARED_AGENT_LOGIN,
       agentId: PLATFORM_DEFAULT_AGENT,
-      error: expect.stringMatching(/^Not checked/),
-      floatMinor: null,
-      belowWatermark: false,
+      error: null,
+      floatMinor: '10000000',
+      belowWatermark: expect.any(Boolean),
       sharesAgentWith: [`${SLUG_PREFIX}${RUN}-laptop`],
     });
     expect(healthy.counts).toEqual({ players: 0, deposits: 0 });
@@ -933,7 +945,8 @@ describe('Tenant creation and Telegram operations (integration)', () => {
     await deliver(messageUpdate()).expect(200);
     expect(await prisma.telegramUpdate.count({ where: { tenantId: created.id } })).toBe(0);
 
-    // Activation is a later step, so the status is set directly here, as the contract's activate would.
+    // This suite's fake refuses every sign-in (see the header), so the status is set directly here, as
+    // an accepted activation would set it.
     await prisma.tenant.update({ where: { id: created.id }, data: { status: TenantStatus.ACTIVE } });
     await cache.del(tenantRegistryKey(created.id));
 

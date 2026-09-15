@@ -139,6 +139,11 @@ export function readStringFieldAny(
 export const PLAYER_ID_FIELDS = ['playerId', 'id'] as const;
 export const LOGIN_FIELDS = ['username', 'userName', 'login'] as const;
 export const AFFILIATE_ID_FIELDS = ['affiliateId', 'id'] as const;
+/**
+ * The agent a listed player hangs off. Only names that can mean nothing else: `affiliateId` or `id` on
+ * a player row could be the player's own, and a wrong guess would hand a player to another operator.
+ */
+export const PARENT_ID_FIELDS = ['parentId', 'parent_id'] as const;
 
 /** Token pair returned by signin/refreshToken. */
 export interface IchancyTokenPair {

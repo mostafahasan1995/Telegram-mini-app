@@ -100,6 +100,8 @@ export interface MediaProofProcessTask {
 }
 
 export interface ReconAgentFloatCheckTask {
+  /** The operator whose float is compared, with its own agent. Required: a job has no context. */
+  tenantId: string;
   currencyCode: string;
 }
 

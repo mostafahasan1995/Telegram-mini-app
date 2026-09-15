@@ -7,6 +7,8 @@ export * from './ichancy.port';
 export * from './ichancy.wire';
 export * from './money-codec';
 export * from './error-map';
+export * from './ichancy-agent';
+export * from './tenant-ichancy-agent.resolver';
 export * from './ichancy-call-log.service';
 export * from './ichancy-health.service';
 export * from './ichancy-session.store';

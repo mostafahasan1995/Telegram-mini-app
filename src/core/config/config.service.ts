@@ -70,11 +70,14 @@ export interface TelegramSettings {
 }
 
 export interface IchancySettings {
+  /** The deployment's Ichancy host: PlatformDefaults' seed and the transports' cookie host. */
   readonly baseUrl: string;
-  readonly username: string;
-  readonly password: string;
-  /** Our agent's affiliateId — parentId on registerPlayer, filter value on getChildren. */
-  readonly agentId: string;
+  /**
+   * ICHANCY_AGENT_ID, or null. It only seeds PlatformDefaults' agent id. There is deliberately no
+   * username or password here: every Ichancy call is made with the credentials on the tenant row of
+   * the operator that owns the work, so no deployment-wide agent account can be reached from code.
+   */
+  readonly agentId: string | null;
   readonly currency: string;
   readonly timeoutMs: number;
   /** True => every Ichancy call is served by the in-memory fake. No real money can move. */
@@ -177,9 +180,7 @@ export class AppConfigService {
 
     this._ichancy = Object.freeze({
       baseUrl: env.ICHANCY_BASE_URL,
-      username: env.ICHANCY_USERNAME,
-      password: env.ICHANCY_PASSWORD,
-      agentId: env.ICHANCY_AGENT_ID,
+      agentId: env.ICHANCY_AGENT_ID ?? null,
       currency: env.ICHANCY_CURRENCY,
       timeoutMs: env.ICHANCY_TIMEOUT_MS,
       // Unset => fake only under test, so CI can never reach the real agent API by omission.
