@@ -4,10 +4,29 @@
  * (so a bad .env fails before any provider is constructed) and once in the ENV_TOKEN factory, which
  * is the value the typed service actually wraps.
  */
-import { Global, Module } from '@nestjs/common';
+import { Global, Logger, Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AppConfigService, ENV_TOKEN } from './config.service';
-import { validateEnv, type Env } from './env.schema';
+import { legacyTelegramEnvKeys, validateEnv, type Env } from './env.schema';
+
+/**
+ * Says, once per process, which retired Telegram variables the environment still carries.
+ *
+ * WHY A WARNING AND NOT SILENCE: those lines are ignored (see LEGACY_TELEGRAM_ENV_KEYS), but a bot
+ * token in an env file looks like it is doing something, and the next person to debug a silent bot
+ * would edit it. Key NAMES only: the values are credentials, and this line is shipped to the logs.
+ */
+let legacyKeysReported = false;
+function reportLegacyTelegramKeys(raw: Record<string, unknown>): void {
+  if (legacyKeysReported) return;
+  const present = legacyTelegramEnvKeys(raw);
+  if (present.length === 0) return;
+  legacyKeysReported = true;
+  new Logger('AppConfig').warn(
+    `Ignoring retired environment variables: ${present.join(', ')}. Every operator's bot token, ` +
+      'webhook and chats are set per tenant from the dashboard; delete these lines.',
+  );
+}
 
 /**
  * The validated env, captured from @nestjs/config's `validate` hook.
@@ -16,7 +35,7 @@ import { validateEnv, type Env } from './env.schema';
  * @nestjs/config reads .env with `dotenv.parse()`, which deliberately does NOT mutate process.env.
  * It copies the values across afterwards — but only the ones that are still string | number |
  * boolean. Every var our schema TRANSFORMS into another type is therefore absent from process.env:
- * MINI_APP_ORIGIN (-> string[]), TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_FEED_CHAT_ID,
+ * MINI_APP_ORIGIN (-> string[]),
  * DUAL_APPROVAL_THRESHOLD_MINOR and AGENT_FLOAT_LOW_WATERMARK_MINOR (-> bigint), ICHANCY_FAKE and
  * TELEGRAM_FEED_FULL_DETAIL (-> boolean). Validating process.env a second time reported the
  * required ones as "expected string, received undefined" and refused to boot, even though .env
@@ -40,6 +59,7 @@ let captured: Env | undefined;
       validate: (raw: Record<string, unknown>): Env => {
         // Capture the parsed result. See `captured` below for why re-reading process.env is wrong.
         captured = validateEnv(raw);
+        reportLegacyTelegramKeys(raw);
         return captured;
       },
     }),
@@ -47,7 +67,11 @@ let captured: Env | undefined;
   providers: [
     {
       provide: ENV_TOKEN,
-      useFactory: (): Env => captured ?? validateEnv(process.env),
+      useFactory: (): Env => {
+        if (captured !== undefined) return captured;
+        reportLegacyTelegramKeys(process.env);
+        return validateEnv(process.env);
+      },
     },
     AppConfigService,
   ],

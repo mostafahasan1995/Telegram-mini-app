@@ -9,5 +9,7 @@ export * from './services/update-dedupe.service';
 export * from './services/handler-registrar.service';
 export * from './controllers/webhook.controller';
 export * from './commands/set-webhook.command';
+export * from './commands/setup-bot.command';
+export * from './commands/tenant-targets';
 export * from './utils/callback-data.util';
 export * from './utils/secure-compare.util';

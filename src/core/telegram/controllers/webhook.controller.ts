@@ -74,6 +74,7 @@ import {
   TELEGRAM_SECRET_HEADER,
   TELEGRAM_UPDATE_JOB,
   TELEGRAM_UPDATE_QUEUE,
+  TELEGRAM_WEBHOOK_ROUTE,
   telegramUpdateJobId,
 } from '../telegram.constants';
 import { type TelegramUpdateJobData } from '../telegram.types';
@@ -102,7 +103,7 @@ const invalidCredentials = (): ForbiddenError =>
     'Invalid webhook credentials.',
   );
 
-@Controller('telegram/webhook')
+@Controller(TELEGRAM_WEBHOOK_ROUTE)
 export class TelegramWebhookController {
   private readonly logger = new Logger(TelegramWebhookController.name);
 

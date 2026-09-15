@@ -40,13 +40,20 @@ import { PlayerService } from './player.service';
 import { ReferralService } from './referral.service';
 
 /**
- * TEMPORARY, until phase 6 resolves the tenant from the webhook path token.
+ * ⚠ INTERIM: ONLY THE BOOTSTRAP OPERATOR'S PLAYERS CAN SIGN IN TO THE MINI APP.
  *
  * WHY NOT requireEffectiveTenantId() HERE, unlike every other service: both sign-in routes are
  * @Public(). They arrive with no bearer token, so TenantContextMiddleware never opened a context
  * and there is nothing ambient to require — the tenant is precisely what signing in establishes.
- * Both credentials are minted by the one bot that exists today (initData by its web app, the login
- * code by its chat), so the operator behind them is the bootstrap operator.
+ *
+ * Every operator has its own bot now, and initData is signed with the token of the bot whose web
+ * app was opened. But the mini app does not yet say WHICH operator it was opened for, and the API
+ * contract has not decided how it will (a tenant hint in the request, a per-operator origin, ...).
+ * Until that is decided, sign-in is pinned to the bootstrap operator: InitDataService checks the
+ * signature against THAT operator's sealed bot token, and a player of any other operator gets
+ * INIT_DATA_HASH_INVALID, because their initData was signed by a different bot. That is a known,
+ * deliberate gap for a later step, not a bug to paper over by trying every operator's token (which
+ * would turn one signature check into a search across operators).
  */
 const SIGN_IN_TENANT_ID = TENANT_BOOTSTRAP_ID;
 
@@ -75,41 +82,43 @@ export class PlayerAuthService {
   ) {}
 
   async loginWithInitData(rawInitData: string, context: SessionContext): Promise<LoginResult> {
-    // 1 — authenticate.
-    const verified = this.initData.verify(rawInitData);
+    // 1 — authenticate, against the bot of the operator sign-in is pinned to (see SIGN_IN_TENANT_ID).
+    const verified = await this.initData.verify(rawInitData, SIGN_IN_TENANT_ID);
 
     // 2 — one initData, one login.
     await this.sessions.consumeInitDataNonce(verified.hash);
 
     try {
       // 3 — player row + audit, atomically.
-      const { player, playerId, tenantId, isNew } = await this.prisma.runInTransaction(async (tx) => {
-        const upserted = await this.players.upsertFromTelegram(
-          tx,
-          SIGN_IN_TENANT_ID,
-          {
-            telegramUserId: verified.user.id,
-            telegramUsername: verified.user.username ?? null,
-            firstName: verified.user.firstName,
-            lastName: verified.user.lastName ?? null,
-            languageCode: verified.user.languageCode ?? null,
-          },
-          this.config.ichancy.currency,
-        );
+      const { player, playerId, tenantId, isNew } = await this.prisma.runInTransaction(
+        async (tx) => {
+          const upserted = await this.players.upsertFromTelegram(
+            tx,
+            SIGN_IN_TENANT_ID,
+            {
+              telegramUserId: verified.user.id,
+              telegramUsername: verified.user.username ?? null,
+              firstName: verified.user.firstName,
+              lastName: verified.user.lastName ?? null,
+              languageCode: verified.user.languageCode ?? null,
+            },
+            this.config.ichancy.currency,
+          );
 
-        await this.audit.write(tx, {
-          action: 'player.login',
-          actor: { type: 'PLAYER', id: upserted.playerId },
-          subjectType: 'Player',
-          subjectId: upserted.playerId,
-          after: {
-            telegramAuthDate: verified.authDate.toISOString(),
-            chatType: verified.chatType ?? null,
-          },
-        });
+          await this.audit.write(tx, {
+            action: 'player.login',
+            actor: { type: 'PLAYER', id: upserted.playerId },
+            subjectType: 'Player',
+            subjectId: upserted.playerId,
+            after: {
+              telegramAuthDate: verified.authDate.toISOString(),
+              chatType: verified.chatType ?? null,
+            },
+          });
 
-        return upserted;
-      });
+          return upserted;
+        },
+      );
 
       // 4 — session. The session belongs to the operator the PLAYER ROW does — `tenantId` read back
       // off the upsert, not the SIGN_IN_TENANT_ID we guessed going in. A returning player keeps the

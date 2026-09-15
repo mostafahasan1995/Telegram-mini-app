@@ -12,15 +12,22 @@
 import { createHash } from 'node:crypto';
 
 import { Injectable } from '@nestjs/common';
-import { type TenantStatus } from '@prisma/client';
+import { TenantStatus } from '@prisma/client';
 
 import { CacheService } from '../../cache/cache.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import {
   TENANT_REGISTRY_TTL_SECONDS,
+  TENANT_ZERO_ID,
   tenantRegistryKey,
   tenantWebhookRouteKey,
 } from '../tenant.constants';
+
+/** An operator named by id and slug: enough to act on it and to say which one in a log line. */
+export interface OperatorRef {
+  id: string;
+  slug: string;
+}
 
 /** JSON-safe. Nothing here may become a bigint without revisiting the cache round trip. */
 export interface TenantSummary {
@@ -73,6 +80,24 @@ export class TenantRegistryService {
 
   async exists(tenantId: string): Promise<boolean> {
     return (await this.find(tenantId)) !== null;
+  }
+
+  /**
+   * Every operator that is serving right now: ACTIVE, and never tenant zero, which is the platform
+   * and has no bot, no chats and no players.
+   *
+   * For the few callers with no tenant of their own that must still reach every operator — the
+   * scheduled report, the Ichancy outage alarm, the CLI that re-registers webhooks. Deliberately NOT
+   * cached: those run every few minutes at most, and an operator activated a moment ago must not
+   * miss an outage alarm because a list was thirty seconds old. Ordered by slug so logs and CLI
+   * output read the same way every run.
+   */
+  async listActiveOperators(): Promise<OperatorRef[]> {
+    return this.prisma.tenant.findMany({
+      where: { status: TenantStatus.ACTIVE, id: { not: TENANT_ZERO_ID } },
+      select: { id: true, slug: true },
+      orderBy: { slug: 'asc' },
+    });
   }
 
   /**

@@ -25,12 +25,25 @@ If it says `REAL -> https://…` then money is real. This one line is the safety
 ngrok http 3000
 ```
 
-Copy the `https://xxxx.ngrok-free.app` URL, then:
+Then, in another terminal:
 
-1. Put it in `.env` as `API_BASE_URL=https://xxxx.ngrok-free.app`
-2. `npm run webhook:set`
+```bash
+npm run tunnel:sync                      # every ACTIVE operator
+npm run tunnel:sync -- --tenant <slug>   # just one operator (any status)
+```
 
-⚠️ Free ngrok gives a **new URL on every restart**. New URL = repeat steps 1–2, or the bot is deaf. If the machine sleeps, ngrok's session usually dies too.
+It reads the ngrok URL, writes `API_BASE_URL` to `.env`, and runs `webhook:set` for the operators you
+named. By hand that is: put the URL in `.env` as `API_BASE_URL=…`, then
+`npm run webhook:set -- --all-active` (or `--tenant <slug>`).
+
+There is no global bot. Each operator's bot token, webhook path token, secret and chats are set in the
+dashboard. An operator the dashboard never gave a webhook is refused with that instruction. Restart the
+api after `API_BASE_URL` changes.
+
+⚠️ Free ngrok gives a **new URL on every restart**. New URL = run `tunnel:sync` again, or every bot is deaf. If the machine sleeps, ngrok's session usually dies too.
+
+Only the `default` operator's players can sign in to the **mini app** for now: it does not yet say which
+operator it was opened for. Every operator's bot works in Telegram.
 
 ## Stop
 
@@ -118,7 +131,10 @@ not configured yet; set it from the dashboard, not by editing `.env` and re-seed
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Bot completely silent, health OK | ngrok died or URL changed; Telegram delivers into nothing | restart ngrok, update `API_BASE_URL`, `npm run webhook:set`. Check what Telegram thinks: `getWebhookInfo` (see below) |
+| Bot completely silent, health OK | ngrok died or URL changed; Telegram delivers into nothing | restart ngrok, `npm run tunnel:sync`. Check what Telegram thinks: `npm run webhook:set -- --tenant <slug> --info` |
+| Worker/api log `Ignoring retired environment variables: TELEGRAM_…` | an old env file still has the single-bot keys | harmless; delete those lines. Bot tokens, webhooks and chats are per operator, in the dashboard |
+| Staff get no cards, log says `has no admin chat set` | that operator's `tenants.admin_chat_id` is 0 | set the operator's admin chat in the dashboard |
+| Mini app sign-in answers 503 `INIT_DATA_BOT_UNAVAILABLE` | the `default` operator's bot token is unset or unreadable | set that operator's bot token in the dashboard |
 | Bot ignores NEW commands only | worker is running old code | restart the worker. Look for `Registered N Telegram handler(s)` — N must match expectations (16 as of 2026-08-14) |
 | `EADDRINUSE 0.0.0.0:3000` | an API is already running (maybe a forgotten terminal) | find it: `Get-NetTCPConnection -LocalPort 3000 -State Listen` — kill it or use `PORT=3001` |
 | Boot fails listing missing env vars | `.env` incomplete — the app refuses to start half-configured on purpose | add the listed vars; `.env.example` documents each |
@@ -129,13 +145,13 @@ not configured yet; set it from the dashboard, not by editing `.env` and re-seed
 | A platform admin sees their own (empty) operator everywhere | `X-Tenant-Id` was stripped at CORS preflight, or the row is not in tenant zero | header must be in `allowedHeaders` (it is, in `main.ts`); `PLATFORM_ADMIN` is honoured **only** when homed in tenant zero |
 | A list endpoint returns another operator's rows | a raw-SQL query the Prisma extension cannot see, or a deliberate `acrossTenants()` | `grep acrossTenants` lists every intentional one; anything else with no `tenant_id` predicate is the bug |
 
-Ask Telegram what it believes (replace TOKEN):
+Ask Telegram what it believes about one operator's bot (prints no token, masks the path):
 
-```
-https://api.telegram.org/botTOKEN/getWebhookInfo
+```bash
+npm run webhook:set -- --tenant <slug> --info
 ```
 
-`url` empty → nobody registered. `last_error_message` set → Telegram tried and failed; the date tells you when.
+`url (none)` → nobody registered. `matches_this_deployment: no` → registered for another URL or an old path token. `last_error_message` set → Telegram tried and failed.
 
 ## Where to look when a deposit is stuck
 

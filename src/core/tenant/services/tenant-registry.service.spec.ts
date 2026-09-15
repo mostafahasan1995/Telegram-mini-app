@@ -6,8 +6,28 @@ import { createHash } from 'node:crypto';
 
 import { type CacheService, type GetOrSetOptions } from '../../cache/cache.service';
 import { type PrismaService } from '../../prisma/prisma.service';
-import { tenantWebhookRouteKey } from '../tenant.constants';
+import { TENANT_ZERO_ID, tenantWebhookRouteKey } from '../tenant.constants';
 import { TenantRegistryService } from './tenant-registry.service';
+
+describe('TenantRegistryService.listActiveOperators', () => {
+  it('lists ACTIVE operators by slug, never tenant zero, straight from the database', async () => {
+    const findMany = jest.fn().mockResolvedValue([{ id: 'a', slug: 'alpha' }]);
+    const getOrSet = jest.fn();
+    const registry = new TenantRegistryService(
+      { tenant: { findMany } } as unknown as PrismaService,
+      { getOrSet } as unknown as CacheService,
+    );
+
+    await expect(registry.listActiveOperators()).resolves.toEqual([{ id: 'a', slug: 'alpha' }]);
+    expect(findMany).toHaveBeenCalledWith({
+      where: { status: 'ACTIVE', id: { not: TENANT_ZERO_ID } },
+      select: { id: true, slug: true },
+      orderBy: { slug: 'asc' },
+    });
+    // Not cached: an operator activated a moment ago must not miss an outage alarm.
+    expect(getOrSet).not.toHaveBeenCalled();
+  });
+});
 
 const TOKEN = 'webhook_path_token_ABC-123_xyz';
 const TENANT_ID = '22222222-2222-4222-8222-222222222222';

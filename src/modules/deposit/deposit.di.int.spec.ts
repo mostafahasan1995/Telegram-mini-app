@@ -29,10 +29,6 @@ if (process.env['DATABASE_URL'] === '' || process.env['REDIS_URL'] === '') {
   throw new Error('Set POSTGRES_TEST_URL and REDIS_TEST_URL to a THROWAWAY database and Redis.');
 }
 process.env['JWT_SECRET'] = 'integration-test-secret-value-32-chars';
-process.env['TELEGRAM_BOT_TOKEN'] = '123456:AAtest_token_for_integration_only';
-process.env['TELEGRAM_WEBHOOK_SECRET'] = 'integration_webhook_secret_value';
-process.env['TELEGRAM_WEBHOOK_PATH_TOKEN'] = 'inttestpath';
-process.env['TELEGRAM_ADMIN_CHAT_ID'] = '-1001234567890';
 process.env['MINI_APP_ORIGIN'] = 'http://localhost:5173';
 process.env['ICHANCY_BASE_URL'] = 'http://localhost:9';
 process.env['ICHANCY_USERNAME'] = 'agent';

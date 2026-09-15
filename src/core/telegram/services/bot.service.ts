@@ -25,8 +25,23 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { type Bot, GrammyError } from 'grammy';
 import { type Message, type ParseMode } from 'grammy/types';
-import { AppConfigService } from '../../config/config.service';
+import { PrismaService } from '../../prisma/prisma.service';
 import { TenantBotRegistry } from './tenant-bot-registry.service';
+
+/**
+ * Where an operator's staff and its optional feed are notified, read off `tenants`. Null means "not
+ * set": the column is absent (feed), or holds the 0 that migrations and the platform row write where
+ * no real chat is known yet (admin). Telegram has no chat 0, so 0 is never a destination.
+ */
+export interface TenantChats {
+  adminChatId: bigint | null;
+  feedChatId: bigint | null;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const realChat = (chatId: bigint | null): bigint | null =>
+  chatId === null || chatId === 0n ? null : chatId;
 
 export interface SendOptions {
   parseMode?: ParseMode;
@@ -71,11 +86,32 @@ function describes(error: unknown, needles: string[]): boolean {
 @Injectable()
 export class BotService {
   private readonly logger = new Logger(BotService.name);
+  /** Operators already warned about for having no admin chat, so a busy one logs once. */
+  private readonly warnedNoAdminChat = new Set<string>();
 
   constructor(
     private readonly bots: TenantBotRegistry,
-    private readonly config: AppConfigService,
+    private readonly prisma: PrismaService,
   ) {}
+
+  /**
+   * The operator's admin and feed chats, read fresh from its row.
+   *
+   * WHY NOT CACHED: this runs once per notification, not per request, and a chat changed from the
+   * dashboard (PATCH /v1/admin/tenants/:id) must take effect on the very next card rather than after
+   * a TTL in some other process's memory. `Tenant` is not a tenant-scoped model, so no context is
+   * needed and none is assumed.
+   */
+  async chatsOf(tenantId: string): Promise<TenantChats> {
+    const row = UUID.test(tenantId)
+      ? await this.prisma.tenant.findUnique({
+          where: { id: tenantId },
+          select: { adminChatId: true, feedChatId: true },
+        })
+      : null;
+    if (row === null) return { adminChatId: null, feedChatId: null };
+    return { adminChatId: realChat(row.adminChatId), feedChatId: realChat(row.feedChatId) };
+  }
 
   /**
    * The operator's own Bot, for the few places that genuinely need the raw client (file downloads,
@@ -234,21 +270,36 @@ export class BotService {
   }
 
   /**
-   * Posts to the admin chat through THIS operator's bot — the review queue and the operator's
-   * alerts. The chat id is still the deployment-wide TELEGRAM_ADMIN_CHAT_ID until every operator's
-   * own `tenants.admin_chat_id` is wired in.
+   * Posts to THIS operator's admin chat (`tenants.admin_chat_id`) through THIS operator's bot — the
+   * review queue and the operator's alerts.
+   *
+   * Returns null without touching the Bot API when the operator has no admin chat set yet, exactly
+   * like an unreachable chat, so every caller's existing "not delivered" branch covers it. Warned
+   * once per operator: a card that goes nowhere must be visible in the logs.
    */
   async notifyAdmins(
     tenantId: string,
     text: string,
     options: SendOptions = {},
   ): Promise<Message.TextMessage | null> {
-    return this.sendMessage(tenantId, this.config.telegram.adminChatId, text, options);
+    const { adminChatId } = await this.chatsOf(tenantId);
+    if (adminChatId === null) {
+      if (!this.warnedNoAdminChat.has(tenantId)) {
+        this.warnedNoAdminChat.add(tenantId);
+        this.logger.warn(
+          `Tenant ${tenantId} has no admin chat set; its staff notifications are not delivered ` +
+            'until one is set from the dashboard',
+        );
+      }
+      return null;
+    }
+    this.warnedNoAdminChat.delete(tenantId);
+    return this.sendMessage(tenantId, adminChatId, text, options);
   }
 
   /**
-   * Posts to the OPTIONAL feed chat through this operator's bot — the customer-visible group that
-   * mirrors credited deposits.
+   * Posts to this operator's OPTIONAL feed chat (`tenants.feed_chat_id`) through its bot — the
+   * customer-visible group that mirrors credited deposits.
    *
    * Returns null WITHOUT touching the Bot API when no feed chat is configured, so call sites stay
    * unconditional and the unconfigured case is indistinguishable from the "chat is unreachable"
@@ -262,26 +313,9 @@ export class BotService {
     text: string,
     options: SendOptions = {},
   ): Promise<Message.TextMessage | null> {
-    const feedChatId = this.config.telegram.feedChatId;
+    const { feedChatId } = await this.chatsOf(tenantId);
     if (feedChatId === null) return null;
     return this.sendMessage(tenantId, feedChatId, text, options);
-  }
-
-  /**
-   * An alert about the PLATFORM rather than one operator (an Ichancy outage, a ledger invariant, the
-   * deployment-wide activity report). It is not sent: tenant zero has no bot, no global bot exists,
-   * and where platform alerts should go has not been decided. It returns null, which callers already
-   * treat as "the chat is unreachable", and warns so the missing alert is visible in the logs.
-   */
-  notifyPlatformAdmins(text: string, _options: SendOptions = {}): Promise<null> {
-    this.warnPlatformUndeliverable('admin', text);
-    return Promise.resolve(null);
-  }
-
-  /** The feed-chat twin of notifyPlatformAdmins, with the same answer for the same reason. */
-  notifyPlatformFeed(text: string, _options: SendOptions = {}): Promise<null> {
-    this.warnPlatformUndeliverable('feed', text);
-    return Promise.resolve(null);
   }
 
   /** Registers an operator's webhook URL on that operator's bot. */
@@ -310,16 +344,6 @@ export class BotService {
   ): Promise<Awaited<ReturnType<Bot['api']['getWebhookInfo']>>> {
     const bot = await this.bots.get(tenantId);
     return bot.api.getWebhookInfo();
-  }
-
-  private warnPlatformUndeliverable(target: 'admin' | 'feed', text: string): void {
-    // The first line only: enough to recognise which alert was lost, without copying a report's
-    // figures into the log.
-    const firstLine = text.split('\n', 1)[0] ?? '';
-    this.logger.warn(
-      `Platform ${target} alert not sent: no Telegram bot serves the platform. ` +
-        `First line: ${firstLine.slice(0, 120)}`,
-    );
   }
 
   /**

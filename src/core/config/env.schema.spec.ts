@@ -1,12 +1,10 @@
 /**
- * The optional feed-group variables, end to end: raw string -> zod -> AppConfigService.
+ * The optional Telegram behaviour variables, end to end: raw string -> zod -> AppConfigService.
  *
- * WHY these two get a spec when the required variables do not: a required variable that breaks
- * refuses to boot, loudly, on the first deploy. An OPTIONAL one that breaks boots perfectly and
- * silently does nothing — which is exactly how ICHANCY_FAKE came to be inert while appearing to be
- * set (see the note on it in env.schema.ts). TELEGRAM_FEED_CHAT_ID transforms to bigint, so it has
- * the same shape as the trap that bit us; this locks in that a configured feed is a bigint on the
- * far side and an unconfigured one is null rather than undefined.
+ * WHY these get a spec when the required variables do not: a required variable that breaks refuses
+ * to boot, loudly, on the first deploy. An OPTIONAL one that breaks boots perfectly and silently does
+ * nothing — which is exactly how ICHANCY_FAKE came to be inert while appearing to be set (see the
+ * note on it in env.schema.ts).
  *
  * Note what this does NOT cover: @nestjs/config dropping transformed values from process.env. That
  * hazard lives in config.module.ts, which captures the validated object instead of re-reading
@@ -14,9 +12,9 @@
  */
 import { applyTestEnv } from '../../../test/setup/test-env';
 import { AppConfigService } from './config.service';
-import { validateEnv } from './env.schema';
+import { LEGACY_TELEGRAM_ENV_KEYS, legacyTelegramEnvKeys, validateEnv } from './env.schema';
 
-/** A complete, valid environment plus whatever the case under test wants to say about the feed. */
+/** A complete, valid environment plus whatever the case under test wants to say about Telegram. */
 function telegramConfigFor(feed: Record<string, string>): AppConfigService['telegram'] {
   applyTestEnv({
     DATABASE_URL: 'postgresql://app:app@localhost:5432/ichancy?schema=public',
@@ -25,29 +23,62 @@ function telegramConfigFor(feed: Record<string, string>): AppConfigService['tele
   return new AppConfigService(validateEnv({ ...process.env, ...feed })).telegram;
 }
 
-describe('TELEGRAM_FEED_CHAT_ID / TELEGRAM_FEED_FULL_DETAIL', () => {
-  it('is off, and masked, when nothing is configured', () => {
-    const telegram = telegramConfigFor({});
-    expect(telegram.feedChatId).toBeNull();
-    expect(telegram.feedFullDetail).toBe(false);
-  });
+/** Every value the single-bot deployment's env file held, shaped as that schema demanded. */
+const LEGACY_TELEGRAM_ENV: Record<string, string> = {
+  TELEGRAM_BOT_TOKEN: '123456789:AAF-oldGlobalTokenFromAnOldEnvFile_000',
+  TELEGRAM_WEBHOOK_SECRET: 'old_webhook_secret_0123456789abcdef',
+  TELEGRAM_WEBHOOK_PATH_TOKEN: 'old_webhook_path_token_0123',
+  TELEGRAM_ADMIN_CHAT_ID: '-1001234567890',
+  TELEGRAM_FEED_CHAT_ID: '-1009876543210',
+};
 
-  /** Emptying the line is how an operator turns the feed off; it must not refuse to boot. */
-  it('treats a blank value the same as an absent one', () => {
-    const telegram = telegramConfigFor({
-      TELEGRAM_FEED_CHAT_ID: '   ',
-      TELEGRAM_FEED_FULL_DETAIL: '',
+describe('no Telegram identity in the environment', () => {
+  it('boots with none of the retired TELEGRAM_* variables set', () => {
+    applyTestEnv({
+      DATABASE_URL: 'postgresql://app:app@localhost:5432/ichancy?schema=public',
+      REDIS_URL: 'redis://localhost:6379',
     });
-    expect(telegram.feedChatId).toBeNull();
-    expect(telegram.feedFullDetail).toBe(false);
+    const env = { ...process.env };
+    for (const key of LEGACY_TELEGRAM_ENV_KEYS) delete env[key];
+
+    expect(() => validateEnv(env)).not.toThrow();
   });
 
-  it('survives the transform as a bigint, exactly like the admin chat id', () => {
-    const telegram = telegramConfigFor({ TELEGRAM_FEED_CHAT_ID: '-1009876543210' });
-    expect(telegram.feedChatId).toBe(-1009876543210n);
-    expect(telegram.adminChatId).toBe(-1001234567890n);
-    // The two are distinct groups; nothing may quietly alias one to the other.
-    expect(telegram.feedChatId).not.toBe(telegram.adminChatId);
+  it('still boots an old env file that carries them, and reads none of them', () => {
+    const telegram = telegramConfigFor(LEGACY_TELEGRAM_ENV);
+
+    // The whole Telegram section is behaviour, never identity: no token, path, secret or chat.
+    expect(Object.keys(telegram).sort()).toEqual(['feedFullDetail', 'reportScheduleHours']);
+    expect(JSON.stringify(telegram)).not.toContain('oldGlobalToken');
+  });
+
+  it('keeps booting even when an old value no longer has the shape the old schema demanded', () => {
+    // A leftover line is dead: validating it would turn a harmless leftover into an outage.
+    expect(() =>
+      telegramConfigFor({ TELEGRAM_BOT_TOKEN: 'garbage', TELEGRAM_ADMIN_CHAT_ID: 'not-an-id' }),
+    ).not.toThrow();
+  });
+
+  it('names the retired keys that are present — names only — for the boot warning', () => {
+    expect(legacyTelegramEnvKeys({ ...LEGACY_TELEGRAM_ENV, JWT_SECRET: 'x' })).toEqual([
+      'TELEGRAM_BOT_TOKEN',
+      'TELEGRAM_WEBHOOK_SECRET',
+      'TELEGRAM_WEBHOOK_PATH_TOKEN',
+      'TELEGRAM_ADMIN_CHAT_ID',
+      'TELEGRAM_FEED_CHAT_ID',
+    ]);
+    expect(legacyTelegramEnvKeys({ TELEGRAM_FEED_FULL_DETAIL: 'true' })).toEqual([]);
+  });
+});
+
+describe('TELEGRAM_FEED_FULL_DETAIL', () => {
+  it('is masked when nothing is configured', () => {
+    expect(telegramConfigFor({}).feedFullDetail).toBe(false);
+  });
+
+  /** Emptying the line is how an operator turns the feature off; it must not refuse to boot. */
+  it('treats a blank value the same as an absent one', () => {
+    expect(telegramConfigFor({ TELEGRAM_FEED_FULL_DETAIL: '' }).feedFullDetail).toBe(false);
   });
 
   it('only unmasks the feed when asked to, in any of the spellings an operator might type', () => {
@@ -60,9 +91,6 @@ describe('TELEGRAM_FEED_CHAT_ID / TELEGRAM_FEED_FULL_DETAIL', () => {
   });
 
   it('refuses to start on a malformed value rather than silently disabling the feature', () => {
-    expect(() => telegramConfigFor({ TELEGRAM_FEED_CHAT_ID: 'not-an-id' })).toThrow(
-      /TELEGRAM_FEED_CHAT_ID/,
-    );
     expect(() => telegramConfigFor({ TELEGRAM_FEED_FULL_DETAIL: 'maybe' })).toThrow(
       /TELEGRAM_FEED_FULL_DETAIL/,
     );
@@ -101,7 +129,6 @@ describe('REPORT_SCHEDULE_HOURS', () => {
   });
 });
 
-
 /** A complete, valid environment plus whatever the case under test wants to say about Ichancy. */
 function ichancyEnvFor(overrides: Record<string, string>): ReturnType<typeof validateEnv> {
   applyTestEnv({
@@ -123,7 +150,9 @@ describe('ICHANCY_USER_AGENT / ICHANCY_COOKIE', () => {
   });
 
   it('treats whitespace the same way', () => {
-    expect(ichancyEnvFor({ ICHANCY_USER_AGENT: '   ' }).ICHANCY_USER_AGENT).toContain('Mozilla/5.0');
+    expect(ichancyEnvFor({ ICHANCY_USER_AGENT: '   ' }).ICHANCY_USER_AGENT).toContain(
+      'Mozilla/5.0',
+    );
   });
 
   it('keeps an explicit User-Agent, trimmed', () => {

@@ -14,6 +14,7 @@ export { TenantOverrideInterceptor } from './tenant-override.interceptor';
 export { TenantModule } from './tenant.module';
 export {
   TenantRegistryService,
+  type OperatorRef,
   type TenantSummary,
   type TenantWebhookRoute,
 } from './services/tenant-registry.service';

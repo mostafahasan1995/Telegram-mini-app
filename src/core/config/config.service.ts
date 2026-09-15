@@ -45,36 +45,26 @@ export interface JwtSettings {
   readonly refreshTtlMs: number;
 }
 
+/**
+ * Deployment-wide Telegram BEHAVIOUR. There is deliberately no bot identity here: no token, no
+ * webhook path or secret, no chat id. Each operator's are columns on its tenant row, set from the
+ * dashboard, and are read per tenant by TenantBotRegistry, BotService and the webhook controller.
+ * A webhook URL is `<app.baseUrl>/telegram/webhook/<that tenant's path token>`.
+ */
 export interface TelegramSettings {
-  readonly botToken: string;
-  /** Compared against the X-Telegram-Bot-Api-Secret-Token header on every update. */
-  readonly webhookSecret: string;
-  /** Unguessable path segment for the webhook endpoint. */
-  readonly webhookPathToken: string;
-  /** Full webhook path, e.g. /telegram/webhook/<token>. */
-  readonly webhookPath: string;
-  /** Absolute URL to hand to setWebhook. */
-  readonly webhookUrl: string;
-  readonly adminChatId: bigint;
   /**
-   * OPTIONAL second group that also receives the credited-deposit card. Null = the feature is off
-   * and BotService.notifyFeed is a no-op. Never used for operational alerts: this group may contain
-   * customers, so only the masked credit card goes there.
-   */
-  readonly feedChatId: bigint | null;
-  /**
-   * True => the feed group gets the FULL card (cashier float + player identifiers) instead of the
-   * masked one. Defaults to false: masked is the only safe default for a group we do not control
-   * the membership of.
+   * True => an operator's feed group (`tenants.feed_chat_id`) gets the FULL card (cashier float +
+   * player identifiers) instead of the masked one. Defaults to false: masked is the only safe
+   * default for a group we do not control the membership of.
    */
   readonly feedFullDetail: boolean;
   /**
    * Hours between automatic postings of the activity report. 0 = the schedule is OFF (the /report
    * command is unaffected).
    *
-   * The schedule posts to `feedChatId ?? adminChatId` — the feed group when there is one, the admin
-   * group when there is not, so the feature is never silent just because the OPTIONAL feed group was
-   * never configured. See modules/admin/services/report-schedule.cron.ts.
+   * Each ACTIVE operator gets its own report through its own bot: in its feed group when that is
+   * declared staff-only by `feedFullDetail`, in its admin group otherwise. See
+   * modules/admin/services/report-schedule.cron.ts.
    */
   readonly reportScheduleHours: number;
 }
@@ -178,15 +168,7 @@ export class AppConfigService {
       refreshTtlMs: env.REFRESH_TTL_DAYS * 24 * 60 * 60 * 1000,
     });
 
-    const webhookPath = `/telegram/webhook/${env.TELEGRAM_WEBHOOK_PATH_TOKEN}`;
     this._telegram = Object.freeze({
-      botToken: env.TELEGRAM_BOT_TOKEN,
-      webhookSecret: env.TELEGRAM_WEBHOOK_SECRET,
-      webhookPathToken: env.TELEGRAM_WEBHOOK_PATH_TOKEN,
-      webhookPath,
-      webhookUrl: `${env.API_BASE_URL}${webhookPath}`,
-      adminChatId: env.TELEGRAM_ADMIN_CHAT_ID,
-      feedChatId: env.TELEGRAM_FEED_CHAT_ID ?? null,
       // Unset => masked. The unsafe variant must always be an explicit choice.
       feedFullDetail: env.TELEGRAM_FEED_FULL_DETAIL ?? false,
       // Already defaulted (6) and range-checked by the schema; 0 means the operator turned it off.

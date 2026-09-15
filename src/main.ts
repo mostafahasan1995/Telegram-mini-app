@@ -13,7 +13,6 @@ import helmet from 'helmet';
 import { Logger as PinoLogger } from 'nestjs-pino';
 
 import { GlobalExceptionFilter } from '@common/filters/global-exception.filter';
-import { redactWebhookPathToken } from '@common/helpers/request-url-redaction.util';
 import {
   CorrelationIdInterceptor,
   CORRELATION_ID_HEADER,
@@ -283,15 +282,15 @@ export async function bootstrapApi(): Promise<void> {
   // NOTE ON THE ABSENT GLOBAL PREFIX: the spec asks for '/v1', and every feature controller already
   // declares it in its own @Controller('v1/...') path. Calling setGlobalPrefix('v1') here would
   // produce /v1/v1/deposits and break every documented endpoint and every module's tests. The two
-  // routes that are deliberately NOT versioned — /health/* and the Telegram webhook, whose URL is
-  // built by AppConfigService — confirm the intent: versioning is per-controller in this codebase.
+  // routes that are deliberately NOT versioned — /health/* and the Telegram webhook, whose URL each
+  // operator's bot is registered under (telegramWebhookUrl) — confirm the intent: versioning is
+  // per-controller in this codebase.
 
   await app.listen(config.app.port, '0.0.0.0');
 
   logger.log(`API listening on port ${config.app.port} (${config.app.nodeEnv})`);
-  // Masked: this banner is printed at every start and shipped to Loki, and the path token is one of the
-  // webhook's two locks. The route shape is what an operator needs to see here, not the token.
-  logger.log(`Telegram webhook path: ${redactWebhookPathToken(config.telegram.webhookPath)}`);
+  // No webhook banner: there is no deployment-wide webhook path any more. Each operator's bot is
+  // registered at /telegram/webhook/<its own path token>, which belongs in no startup log.
   if (!config.app.isProduction) logger.log(`OpenAPI UI: ${config.app.baseUrl}/docs`);
 }
 

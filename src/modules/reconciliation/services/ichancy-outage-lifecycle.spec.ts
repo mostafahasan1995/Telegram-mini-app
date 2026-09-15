@@ -25,6 +25,7 @@ import { type IchancyClassification } from '@core/ichancy/error-map';
 import { ICHANCY_DOWN_THRESHOLD, IchancyHealthService } from '@core/ichancy/ichancy-health.service';
 import { type PrismaService } from '@core/prisma/prisma.service';
 import { type BotService } from '@core/telegram/services/bot.service';
+import { type TenantRegistryService } from '@core/tenant';
 
 import { ICHANCY_HEALTH_ANNOUNCE_TTL_SECONDS } from '../reconciliation.constants';
 import { IchancyHealthAlertCron } from './ichancy-health.cron';
@@ -84,17 +85,27 @@ class FakeRedis {
     return Promise.resolve(fields.length);
   }
 
+  /** `SET key value EX ttl [NX]`: the claim uses NX, the "sent" rewrite does not. */
   set(
     key: string,
     value: string,
     _ex: string,
     ttlSeconds: number,
-    _nx: string,
+    nx?: string,
   ): Promise<'OK' | null> {
     const existing = this.strings.get(key);
-    if (existing !== undefined && existing.expiresAtMs > this.now()) return Promise.resolve(null);
+    if (nx !== undefined && existing !== undefined && existing.expiresAtMs > this.now()) {
+      return Promise.resolve(null);
+    }
     this.strings.set(key, { value, expiresAtMs: this.now() + ttlSeconds * 1000 });
     return Promise.resolve('OK');
+  }
+
+  get(key: string): Promise<string | null> {
+    const existing = this.strings.get(key);
+    return Promise.resolve(
+      existing !== undefined && existing.expiresAtMs > this.now() ? existing.value : null,
+    );
   }
 
   del(key: string): Promise<number> {
@@ -129,21 +140,29 @@ function build(): Harness {
   const health = new IchancyHealthService(redis as unknown as RedisService, config);
 
   const posts: string[] = [];
-  const notifyAdmins = jest.fn((text: string) => {
+  const notifyAdmins = jest.fn((_tenantId: string, text: string) => {
     posts.push(text);
     return Promise.resolve({ message_id: posts.length });
   });
 
   const cron = new IchancyHealthAlertCron(
     health,
-    // A platform alert: the outage is the agent API's, not one operator's.
-    { notifyPlatformAdmins: notifyAdmins } as unknown as BotService,
+    // Sent to each ACTIVE operator's admin group; one operator keeps the message count readable.
+    {
+      notifyAdmins,
+      chatsOf: jest.fn().mockResolvedValue({ adminChatId: -1001n, feedChatId: null }),
+    } as unknown as BotService,
     {
       acquire: jest.fn().mockResolvedValue(HANDLE),
       release: jest.fn().mockResolvedValue(true),
     } as unknown as LockService,
     redis as unknown as RedisService,
     { player: { count: jest.fn().mockResolvedValue(0) } } as unknown as PrismaService,
+    {
+      listActiveOperators: jest
+        .fn()
+        .mockResolvedValue([{ id: '11111111-1111-4111-8111-111111111111', slug: 'alpha' }]),
+    } as unknown as TenantRegistryService,
     config,
   );
 

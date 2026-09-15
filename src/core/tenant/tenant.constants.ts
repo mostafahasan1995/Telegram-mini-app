@@ -16,17 +16,17 @@ export const TENANT_ZERO_SLUG = 'platform';
 /**
  * The operator every row that existed before multi-tenancy was backfilled into.
  *
- * WHY IT IS A CONSTANT AND NOT A LOOKUP: until phase 6 gives each operator its own bot and resolves
- * the tenant from the webhook path token, there is exactly one bot — the one in TELEGRAM_BOT_TOKEN —
- * and its inbound updates have no tenant on them. The webhook and the bot handlers need an answer
- * synchronously, and "the single non-zero ACTIVE tenant" is a rule that silently breaks the moment
- * a second operator is created.
+ * Telegram updates no longer need it: the webhook resolves each update's operator from its path
+ * token, and every operator has its own bot. What still names it is the Mini App sign-in
+ * (player-auth.service.ts), because the mini app does not yet say which operator it was opened for;
+ * until that is decided, only this operator's players can sign in there. The seeds and a few specs
+ * also target it.
  *
  * Its rows are NOT tenant zero's: tenant zero is the platform and holds PLATFORM_ADMIN logins;
  * this is the operator that was actually taking deposits. Collapsing the two would give every
  * existing player a platform login's tenant.
  *
- * DELETE THIS in phase 6, once `webhookPathToken` resolves the tenant per update.
+ * DELETE THIS once the mini app identifies its operator and the seeds stop targeting it.
  */
 export const TENANT_BOOTSTRAP_ID = '00000000-0000-0000-0000-000000000001';
 

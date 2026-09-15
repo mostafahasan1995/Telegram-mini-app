@@ -60,9 +60,9 @@ Redis is ~10 MB of RAM. Keep it.
 
 ## Do we need `webhook:set`? Only when the URL changes
 
-`webhook:set` is not a running process. It is one HTTP call that tells Telegram: *"send updates to this address."* You run it:
+`webhook:set` is not a running process. It is one HTTP call per operator's bot that tells Telegram: *"send this bot's updates to this address."* There is no global bot: every operator's bot token, webhook path token and secret are on its tenant row, set in the dashboard, so the command always names its target (`--tenant <slug>` or `--all-active`). You run it:
 
-- once per new public URL (every ngrok restart → new URL → run it again)
+- once per new public URL (every ngrok restart → new URL → `npm run tunnel:sync`, which runs it for every ACTIVE operator)
 - once when you deploy to a real domain — then basically never again
 
 The pain in dev is real. Planned fix: a `TELEGRAM_POLLING=true` dev mode (not built yet) so local development needs no ngrok at all.

@@ -362,15 +362,31 @@ Now open http://localhost:3000/docs to see the API.
 
 ### Step 8 — connect Telegram (only when you have a public https URL)
 
+There is **no bot token in `.env`**. Every operator has its own bot: a platform admin pastes its
+token in the dashboard, and the operator's webhook path token, webhook secret, admin chat and feed
+chat are stored on its tenant row. The api and the worker boot with no Telegram settings at all.
+
+The dashboard registers an operator's webhook. These commands re-register existing ones, for
+example after `API_BASE_URL` changed. Each one names its operator(s):
+
 ```bash
-npm run webhook:set
-npm run webhook:set -- --info          # just look, change nothing
-npm run webhook:set -- --drop-pending  # after a long outage
-npm run bot:setup                      # push command menus, bot description and menu button (safe to re-run)
+npm run webhook:set -- --tenant <slug>                 # one operator (any status)
+npm run webhook:set -- --all-active                    # every ACTIVE operator
+npm run webhook:set -- --tenant <slug> --info          # just look, change nothing
+npm run webhook:set -- --all-active --drop-pending     # after a long outage
+npm run bot:setup -- --tenant <slug>                   # push that bot's menus, description and menu button (safe to re-run)
+npm run tunnel:sync                                    # laptop: ngrok URL -> API_BASE_URL -> webhook:set --all-active
 ```
 
-This is a **manual** step on purpose. It is a global change to your bot. It must not happen
+`webhook:set` never creates a path token or secret. An operator without them gets a clear refusal:
+generate its webhook from the dashboard first.
+
+This is a **manual** step on purpose. It is a global change to each bot. It must not happen
 automatically on every deploy.
+
+**Mini App sign-in, for now:** only the bootstrap operator's (`default`) players can sign in to the
+mini app. The mini app does not yet say which operator it was opened for, so initData is checked
+against that one operator's bot token. Other operators' bots work fully in Telegram.
 
 ---
 
@@ -411,6 +427,11 @@ looks wrong, and it prints **all** the problems at once, not just the first.
 
 That is on purpose. A cashier that starts half-configured takes money it cannot deliver.
 
+**Retired, and ignored if still present:** `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`,
+`TELEGRAM_WEBHOOK_PATH_TOKEN`, `TELEGRAM_ADMIN_CHAT_ID`, `TELEGRAM_FEED_CHAT_ID`. An old env file that
+still has them boots fine and logs one warning naming them. Each operator's bot token, webhook and
+chats are set in the dashboard and stored on its tenant row. Delete the lines.
+
 ### The main ones
 
 | Variable                                | What it is                                                                           |
@@ -418,17 +439,12 @@ That is on purpose. A cashier that starts half-configured takes money it cannot 
 | `APP_ROLE`                              | `api` or `worker`. Nothing else.                                                     |
 | `NODE_ENV`                              | `development`, `test`, or `production`.                                              |
 | `PORT`                                  | HTTP port for the api.                                                               |
-| `API_BASE_URL`                          | Public URL of this service. Used to build the webhook URL.                           |
+| `API_BASE_URL`                          | Public URL of this service. Each operator's webhook is `<this>/telegram/webhook/<its path token>`. |
 | `DATABASE_URL`                          | PostgreSQL. Must be a **non-owner** role, or `003_app_role_grants.sql` does nothing. |
 | `REDIS_URL`                             | Redis. Used for queues, locks, sessions, and rate limits.                            |
 | `JWT_SECRET`                            | At least 16 characters. At least 32 in production.                                   |
-| `TELEGRAM_BOT_TOKEN`                    | From `@BotFather`.                                                                   |
-| `TELEGRAM_WEBHOOK_SECRET`               | We check this header on every update.                                                |
-| `TELEGRAM_WEBHOOK_PATH_TOKEN`           | Random text in the webhook URL, so nobody can guess it.                              |
-| `TELEGRAM_ADMIN_CHAT_ID`                | The group that gets the review cards. Negative for supergroups.                      |
-| `TELEGRAM_FEED_CHAT_ID`                 | Optional. A second group that also gets the credit card, **masked**. Empty = off.    |
-| `TELEGRAM_FEED_FULL_DETAIL`             | Optional. `true` posts the full card to the feed. Default `false` = masked.          |
-| `REPORT_SCHEDULE_HOURS`                 | Hours between automatic `/report` posts. Default `6`. `0` or empty = off.            |
+| `TELEGRAM_FEED_FULL_DETAIL`             | Optional. `true` posts the full card to operators' feed groups. Default `false` = masked. |
+| `REPORT_SCHEDULE_HOURS`                 | Hours between automatic `/report` posts, per operator. Default `6`. `0` or empty = off. |
 | `MINI_APP_ORIGIN`                       | Comma-separated. CORS allow-list. Must be `https` in production.                     |
 | `ICHANCY_BASE_URL`                      | The agent API.                                                                       |
 | `ICHANCY_USERNAME` / `ICHANCY_PASSWORD` | Agent login. **Only the worker uses these.**                                         |

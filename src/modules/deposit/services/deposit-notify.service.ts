@@ -108,7 +108,7 @@ export class DepositNotifyService {
     });
     if (message === null) {
       this.logger.error(
-        `admin chat ${this.config.telegram.adminChatId.toString()} is unreachable; ` +
+        `the admin chat of tenant ${deposit.tenantId} is unset or unreachable; ` +
           `deposit ${deposit.shortId} has no review card`,
       );
       return;
@@ -246,7 +246,7 @@ export class DepositNotifyService {
         // Permanently unreachable admin chat — same terminal outcome as the review card path.
         await this.idempotency.release(begun.lease, 'admin chat unreachable');
         this.logger.error(
-          `admin chat ${this.config.telegram.adminChatId.toString()} is unreachable; ` +
+          `the admin chat of tenant ${deposit.tenantId} is unset or unreachable; ` +
             `deposit ${deposit.shortId} has no ops card`,
         );
         return;
@@ -263,11 +263,11 @@ export class DepositNotifyService {
   }
 
   /**
-   * The same credit, mirrored into the OPTIONAL feed group.
+   * The same credit, mirrored into the operator's OPTIONAL feed group (`tenants.feed_chat_id`).
    *
    * MASKED BY DEFAULT: the feed group may contain CUSTOMERS. renderOpsCardPublic drops the cashier
    * float entirely and reduces the player's identifiers to their last characters. The full card is
-   * only reused when TELEGRAM_FEED_FULL_DETAIL says the group is staff-only — an explicit act.
+   * only reused when TELEGRAM_FEED_FULL_DETAIL says feed groups are staff-only — an explicit act.
    *
    * NEVER THROWS. A credited deposit is already money that moved; failing the outbox job because a
    * secondary group did not get its copy would re-run a notification path for no gain and leave the
@@ -279,23 +279,26 @@ export class DepositNotifyService {
     card: OpsCardInput,
     adminText: string,
   ): Promise<void> {
-    // No feed configured: nothing to do, and nothing to say about it once per deposit either.
-    const feedChatId = this.config.telegram.feedChatId;
-    if (feedChatId === null) return;
-
-    // Feed pointed at the SAME chat as the admin group: postAdminOpsCard already delivered this
-    // exact deposit there, so a second send is a duplicate card, not a feed. This is not a
-    // hypothetical misconfiguration — an operator running a single group naturally sets both ids to
-    // it, and the two would then differ only in that the feed copy is the masked one, which reads
-    // as a bug. One group is a perfectly good setup; it just does not need the feed half.
-    if (feedChatId === this.config.telegram.adminChatId) {
-      this.logger.debug(
-        `feed card for ${deposit.shortId} skipped: feed chat is the admin chat (already posted)`,
-      );
-      return;
-    }
-
     try {
+      // Read from the operator's row inside the try: this method never throws, and a database blip
+      // costs the mirror, not the credit job.
+      const { adminChatId, feedChatId } = await this.bot.chatsOf(deposit.tenantId);
+
+      // No feed configured: nothing to do, and nothing to say about it once per deposit either.
+      if (feedChatId === null) return;
+
+      // Feed pointed at the SAME chat as the admin group: postAdminOpsCard already delivered this
+      // exact deposit there, so a second send is a duplicate card, not a feed. This is not a
+      // hypothetical misconfiguration — an operator running a single group naturally sets both ids
+      // to it, and the two would then differ only in that the feed copy is the masked one, which
+      // reads as a bug. One group is a perfectly good setup; it just does not need the feed half.
+      if (feedChatId === adminChatId) {
+        this.logger.debug(
+          `feed card for ${deposit.shortId} skipped: feed chat is the admin chat (already posted)`,
+        );
+        return;
+      }
+
       const begun = await this.idempotency.begin({
         scope: OPS_CARD_FEED_IDEMPOTENCY_SCOPE,
         key: deposit.id,
@@ -313,7 +316,9 @@ export class DepositNotifyService {
       const text = this.config.telegram.feedFullDetail ? adminText : renderOpsCardPublic(card);
 
       try {
-        const message = await this.bot.notifyFeed(deposit.tenantId, text, {
+        // The chat just read, not notifyFeed(): a second read could see a chat changed in between
+        // and send the card somewhere the admin-chat comparison above never looked at.
+        const message = await this.bot.sendMessage(deposit.tenantId, feedChatId, text, {
           parseMode: 'HTML',
           linkPreview: false,
         });

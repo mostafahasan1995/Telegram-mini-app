@@ -12,6 +12,19 @@
  */
 export const TELEGRAM_API_CLIENT_OPTIONS = 'TELEGRAM_API_CLIENT_OPTIONS';
 
+/** The webhook route, without its per-operator path token. Unversioned on purpose: Telegram holds it. */
+export const TELEGRAM_WEBHOOK_ROUTE = 'telegram/webhook';
+
+/**
+ * The URL an operator's bot is registered under: `<API_BASE_URL>/telegram/webhook/<path token>`.
+ *
+ * One builder, used by the controller's route and by whatever registers a webhook, so the URL
+ * Telegram is given and the route that answers it cannot drift apart. The path token is the
+ * operator's own (`tenants.webhook_path_token`); nothing deployment-wide takes part.
+ */
+export const telegramWebhookUrl = (baseUrl: string, pathToken: string): string =>
+  `${baseUrl.replace(/\/+$/, '')}/${TELEGRAM_WEBHOOK_ROUTE}/${pathToken}`;
+
 /** BullMQ queue carrying inbound updates from the api role to the worker. */
 export const TELEGRAM_UPDATE_QUEUE = 'telegram-updates';
 

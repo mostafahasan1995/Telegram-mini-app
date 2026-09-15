@@ -14,29 +14,11 @@ const bigintMinor = (label: string) =>
     .regex(/^\d+$/, `${label} must be a non-negative integer in MINOR units (no decimal point)`)
     .transform((value) => BigInt(value));
 
-/** Telegram chat/user ids exceed 2^53 in theory and supergroups are negative. */
-const telegramId = (label: string) =>
-  z
-    .string()
-    .regex(/^-?\d+$/, `${label} must be an integer Telegram id`)
-    .transform((value) => BigInt(value));
-
 /**
- * Same validation as telegramId(), but "absent" and "present but blank" both mean *no such chat*.
- *
- * WHY blank counts as absent: an operator turning an optional group off does it by emptying the
- * line in .env, not by deleting it. Refusing to boot over `TELEGRAM_FEED_CHAT_ID=` would punish the
- * exact gesture that disables the feature.
- */
-const optionalTelegramId = (label: string) =>
-  z.preprocess(
-    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
-    telegramId(label).optional(),
-  );
-
-/**
- * The boolean spellings an operator may reasonably type in .env. Blank counts as unset, for the
- * same reason as above. Mirrors the ICHANCY_FAKE pattern below, which is deliberately left inline:
+ * The boolean spellings an operator may reasonably type in .env. Blank counts as unset: an operator
+ * turning an optional feature off does it by emptying the line, not by deleting it, and refusing to
+ * boot over `KEY=` would punish the exact gesture that disables the feature. Mirrors the
+ * ICHANCY_FAKE pattern below, which is deliberately left inline:
  * it is the switch that stops real money moving and is not worth refactoring for four shared lines.
  */
 const optionalFlag = () =>
@@ -50,7 +32,7 @@ const optionalFlag = () =>
 
 /**
  * A whole number of hours where 0 is a REAL value meaning "off", and blank means the same thing —
- * emptying the line is how an operator disables a feature in this file (see optionalTelegramId).
+ * emptying the line is how an operator disables a feature in this file (see optionalFlag).
  *
  * The asymmetry that follows is deliberate and is the whole point of this helper: an ABSENT variable
  * falls through to the caller's `.default()` ("nobody has said anything, use the documented
@@ -128,40 +110,18 @@ export const envSchema = z
     REFRESH_TTL_DAYS: z.coerce.number().int().min(1).max(365).default(30),
 
     // ---- TELEGRAM -----------------------------------------------------------
-    TELEGRAM_BOT_TOKEN: z
-      .string()
-      .regex(/^\d+:[A-Za-z0-9_-]{20,}$/, 'TELEGRAM_BOT_TOKEN must look like 123456:AA...'),
-    TELEGRAM_WEBHOOK_SECRET: z
-      .string()
-      .min(16, 'TELEGRAM_WEBHOOK_SECRET must be at least 16 characters')
-      .regex(
-        /^[A-Za-z0-9_-]+$/,
-        'TELEGRAM_WEBHOOK_SECRET may only contain A-Z a-z 0-9 _ - (Telegram restriction)',
-      ),
-    TELEGRAM_WEBHOOK_PATH_TOKEN: z
-      .string()
-      .min(8, 'TELEGRAM_WEBHOOK_PATH_TOKEN must be at least 8 characters')
-      .regex(/^[A-Za-z0-9_-]+$/, 'TELEGRAM_WEBHOOK_PATH_TOKEN must be URL-safe'),
-    TELEGRAM_ADMIN_CHAT_ID: telegramId('TELEGRAM_ADMIN_CHAT_ID'),
-
-    /**
-     * OPTIONAL second group that also receives the credited-deposit card — the "feed".
-     *
-     * SAFETY: this group may contain CUSTOMERS, so what goes there is the MASKED card
-     * (renderOpsCardPublic): no cashier float, identifiers reduced to their last characters. Unset
-     * (or blank) = the feature is off and nothing is ever posted anywhere but the admin group.
-     *
-     * Like TELEGRAM_ADMIN_CHAT_ID this TRANSFORMS to bigint, so it is absent from process.env after
-     * @nestjs/config copies the validated result back — read it through AppConfigService only. See
-     * config.module.ts for the full story.
-     */
-    TELEGRAM_FEED_CHAT_ID: optionalTelegramId('TELEGRAM_FEED_CHAT_ID'),
+    // NO BOT IDENTITY LIVES HERE. Every operator's bot token, webhook path token, webhook secret,
+    // admin chat and feed chat are columns on its own tenant row, entered in the dashboard. See
+    // LEGACY_TELEGRAM_ENV_KEYS below for what an old env file may still carry, and why it is ignored.
 
     /**
      * Opt-in to posting the FULL admin card (cashier float, Telegram id, Ichancy login and player
-     * id) to the feed group. Defaults to FALSE — masked — because the default has to be the safe
-     * one: a mistyped feed chat id then leaks nothing, and turning this on is a deliberate
-     * statement that the feed group contains only staff.
+     * id) to an operator's feed group (`tenants.feed_chat_id`). Defaults to FALSE — masked — because
+     * the default has to be the safe one: a mistyped feed chat id then leaks nothing, and turning
+     * this on is a deliberate statement that the feed groups contain only staff.
+     *
+     * Deployment-wide rather than per operator because the dashboard contract defines no per-tenant
+     * equivalent. It is a safety default, not an identity, so it may stay in the environment.
      */
     TELEGRAM_FEED_FULL_DETAIL: optionalFlag(),
 
@@ -172,13 +132,13 @@ export const envSchema = z
      * to remember to type /report ends up never seeing the numbers. 0, or a BLANK value, turns it
      * off; /report keeps working either way. See optionalHours() for why blank and absent differ.
      *
-     * WHERE the report is posted is NOT configured here: it is TELEGRAM_FEED_CHAT_ID when that is
-     * set and the admin group otherwise, so a single-group deployment still gets it. That also means
-     * a configured feed group receives the cashier float — see the SAFETY note above and
-     * services/report-schedule.cron.ts.
+     * WHERE the report is posted is NOT configured here: each ACTIVE operator gets its own report,
+     * through its own bot, in its feed group when that group is declared staff-only
+     * (TELEGRAM_FEED_FULL_DETAIL) and in its admin group otherwise. See
+     * modules/admin/services/report-schedule.cron.ts.
      *
-     * Unlike the two variables above this does NOT transform to another type, so it survives into
-     * process.env — read it through AppConfigService anyway, like everything else.
+     * This does NOT transform to another type, so it survives into process.env — read it through
+     * AppConfigService anyway, like everything else.
      */
     REPORT_SCHEDULE_HOURS: optionalHours('REPORT_SCHEDULE_HOURS', 168).default(6),
 
@@ -336,7 +296,9 @@ export const envSchema = z
       // tells operators to leave this empty when the server IP is allowlisted, "present but blank"
       // is the COMMON case and has to mean "use the default", not "crash".
       .transform((value) =>
-        value === undefined || value.trim().length === 0 ? DEFAULT_ICHANCY_USER_AGENT : value.trim(),
+        value === undefined || value.trim().length === 0
+          ? DEFAULT_ICHANCY_USER_AGENT
+          : value.trim(),
       ),
     /**
      * Route every Ichancy call to the in-memory fake instead of the real agent API.
@@ -372,8 +334,6 @@ export const envSchema = z
 
     const secrets: Array<[keyof typeof env, string, number]> = [
       ['JWT_SECRET', env.JWT_SECRET, 32],
-      ['TELEGRAM_WEBHOOK_SECRET', env.TELEGRAM_WEBHOOK_SECRET, 32],
-      ['TELEGRAM_WEBHOOK_PATH_TOKEN', env.TELEGRAM_WEBHOOK_PATH_TOKEN, 16],
       ['ICHANCY_PASSWORD', env.ICHANCY_PASSWORD, 8],
       ['S3_SECRET_KEY', env.S3_SECRET_KEY, 8],
     ];
@@ -405,6 +365,32 @@ export const envSchema = z
   });
 
 export type Env = z.infer<typeof envSchema>;
+
+/**
+ * Variables an env file written for the single-bot deployment still carries. None of them is read.
+ *
+ * WHY THEY ARE IGNORED AND NOT REFUSED: the schema above is a strict parse of known keys and strips
+ * everything else, so an old `.env` or `env/backend.env` boots unchanged. Refusing to boot over a
+ * dead line would turn a harmless leftover into an outage on the next deploy. What an operator does
+ * need is to know the line does nothing, because a bot token sitting in a file looks like it matters:
+ * `legacyTelegramEnvKeys()` names the ones present (names only, never values) for a boot warning.
+ *
+ * WHERE EACH ONE WENT: the bot token, webhook path token and webhook secret are sealed or stored on
+ * the operator's tenant row (`bot_token_enc`, `webhook_path_token`, `webhook_secret_enc`), and the two
+ * chats are `tenants.admin_chat_id` / `tenants.feed_chat_id`. All five are set from the dashboard.
+ */
+export const LEGACY_TELEGRAM_ENV_KEYS = Object.freeze([
+  'TELEGRAM_BOT_TOKEN',
+  'TELEGRAM_WEBHOOK_SECRET',
+  'TELEGRAM_WEBHOOK_PATH_TOKEN',
+  'TELEGRAM_ADMIN_CHAT_ID',
+  'TELEGRAM_FEED_CHAT_ID',
+] as const);
+
+/** The retired keys present in `raw`, in a stable order. Reads key names only. */
+export function legacyTelegramEnvKeys(raw: Record<string, unknown>): string[] {
+  return LEGACY_TELEGRAM_ENV_KEYS.filter((key) => Object.prototype.hasOwnProperty.call(raw, key));
+}
 
 /**
  * Parses process.env (or any record) and throws ONE error listing every problem.

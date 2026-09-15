@@ -1,30 +1,37 @@
 /**
- * BotService's routing: every send goes through the bot of the operator it names, and the platform
- * sends that have no bot answer null without touching any operator's bot.
+ * BotService's routing: every send goes through the bot of the operator it names, and the staff and
+ * feed chats are that operator's own, read off its tenant row. No chat id comes from anywhere else.
  */
 import { Logger } from '@nestjs/common';
 import { type Bot, GrammyError } from 'grammy';
 
-import { type AppConfigService } from '../../config/config.service';
+import { type PrismaService } from '../../prisma/prisma.service';
 import { TenantBotErrorCodes, TenantBotUnavailableError } from '../tenant-bot.errors';
 import { BotService } from './bot.service';
 import { type TenantBotRegistry } from './tenant-bot-registry.service';
 
 const TENANT_A = '11111111-1111-4111-8111-111111111111';
 const TENANT_B = '22222222-2222-4222-8222-222222222222';
-const ADMIN_CHAT = -1001234567890n;
+/** An operator created before anybody chose its groups: the migration's 0, and no feed. */
+const TENANT_NO_CHATS = '33333333-3333-4333-8333-333333333333';
+
+const ADMIN_CHAT_A = -1001111111111n;
+const ADMIN_CHAT_B = -1002222222222n;
+const FEED_CHAT_B = -1002222222299n;
 
 describe('BotService', () => {
   let apis: Map<string, { sendMessage: jest.Mock; answerCallbackQuery: jest.Mock }>;
   let get: jest.Mock<Promise<Bot>, [string]>;
+  let findUnique: jest.Mock;
   let service: BotService;
+  let warnSpy: jest.SpyInstance;
 
   beforeEach(() => {
-    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     jest.spyOn(Logger.prototype, 'debug').mockImplementation(() => undefined);
 
     apis = new Map();
-    for (const tenantId of [TENANT_A, TENANT_B]) {
+    for (const tenantId of [TENANT_A, TENANT_B, TENANT_NO_CHATS]) {
       apis.set(tenantId, {
         sendMessage: jest.fn().mockResolvedValue({ message_id: 1, chat: { id: 1 } }),
         answerCallbackQuery: jest.fn().mockResolvedValue(true),
@@ -34,9 +41,18 @@ describe('BotService', () => {
       Promise.resolve({ api: apis.get(tenantId) } as unknown as Bot),
     );
 
+    const rows = new Map<string, { adminChatId: bigint; feedChatId: bigint | null }>([
+      [TENANT_A, { adminChatId: ADMIN_CHAT_A, feedChatId: null }],
+      [TENANT_B, { adminChatId: ADMIN_CHAT_B, feedChatId: FEED_CHAT_B }],
+      [TENANT_NO_CHATS, { adminChatId: 0n, feedChatId: null }],
+    ]);
+    findUnique = jest.fn((args: { where: { id: string } }) =>
+      Promise.resolve(rows.get(args.where.id) ?? null),
+    );
+
     service = new BotService(
       { get } as unknown as TenantBotRegistry,
-      { telegram: { adminChatId: ADMIN_CHAT, feedChatId: null } } as unknown as AppConfigService,
+      { tenant: { findUnique } } as unknown as PrismaService,
     );
   });
 
@@ -44,16 +60,62 @@ describe('BotService', () => {
     jest.restoreAllMocks();
   });
 
-  it('sends through the named operator’s bot and no other', async () => {
+  it('sends a staff notification through the named operator’s bot, to that operator’s admin chat', async () => {
     await service.notifyAdmins(TENANT_B, 'card');
 
     expect(get).toHaveBeenCalledWith(TENANT_B);
     expect(apis.get(TENANT_B)?.sendMessage).toHaveBeenCalledWith(
-      ADMIN_CHAT.toString(),
+      ADMIN_CHAT_B.toString(),
       'card',
       expect.any(Object),
     );
     expect(apis.get(TENANT_A)?.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('gives two operators two different admin chats', async () => {
+    await service.notifyAdmins(TENANT_A, 'a');
+    await service.notifyAdmins(TENANT_B, 'b');
+
+    expect(apis.get(TENANT_A)?.sendMessage.mock.calls[0]?.[0]).toBe(ADMIN_CHAT_A.toString());
+    expect(apis.get(TENANT_B)?.sendMessage.mock.calls[0]?.[0]).toBe(ADMIN_CHAT_B.toString());
+  });
+
+  it('answers null without touching any bot when the operator has no admin chat yet', async () => {
+    await expect(service.notifyAdmins(TENANT_NO_CHATS, 'card')).resolves.toBeNull();
+    await expect(service.notifyAdmins(TENANT_NO_CHATS, 'card')).resolves.toBeNull();
+
+    expect(get).not.toHaveBeenCalled();
+    // Visible once, not once per card.
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('posts to the operator’s own feed chat, and to nothing when it has none', async () => {
+    await service.notifyFeed(TENANT_B, 'masked card');
+    expect(apis.get(TENANT_B)?.sendMessage).toHaveBeenCalledWith(
+      FEED_CHAT_B.toString(),
+      'masked card',
+      expect.any(Object),
+    );
+
+    await expect(service.notifyFeed(TENANT_A, 'masked card')).resolves.toBeNull();
+    expect(apis.get(TENANT_A)?.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('reports an operator’s chats, with 0 and unknown operators reading as unset', async () => {
+    await expect(service.chatsOf(TENANT_B)).resolves.toEqual({
+      adminChatId: ADMIN_CHAT_B,
+      feedChatId: FEED_CHAT_B,
+    });
+    await expect(service.chatsOf(TENANT_NO_CHATS)).resolves.toEqual({
+      adminChatId: null,
+      feedChatId: null,
+    });
+    await expect(service.chatsOf('not-a-uuid')).resolves.toEqual({
+      adminChatId: null,
+      feedChatId: null,
+    });
+    // A malformed id never reaches Postgres, where it would raise instead of matching nothing.
+    expect(findUnique).toHaveBeenCalledTimes(2);
   });
 
   it('still answers null for a chat that blocked the operator’s bot', async () => {
@@ -87,12 +149,5 @@ describe('BotService', () => {
     get.mockRejectedValueOnce(new Error('no bot'));
 
     await expect(service.answerCallback(TENANT_A, 'cbq-1', 'ok')).resolves.toBeUndefined();
-  });
-
-  it('answers null for platform alerts without touching any operator’s bot', async () => {
-    await expect(service.notifyPlatformAdmins('🚨 ledger')).resolves.toBeNull();
-    await expect(service.notifyPlatformFeed('report')).resolves.toBeNull();
-
-    expect(get).not.toHaveBeenCalled();
   });
 });

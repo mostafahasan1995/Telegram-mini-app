@@ -63,10 +63,7 @@ import { AppConfigService } from '@core/config/config.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { RedisService } from '@core/cache/redis.service';
 import { AdminIdentityService } from '@core/auth/services/admin-identity.service';
-import {
-  LoginCodeService,
-  LOGIN_CODE_TTL_MINUTES,
-} from '@core/auth/services/login-code.service';
+import { LoginCodeService, LOGIN_CODE_TTL_MINUTES } from '@core/auth/services/login-code.service';
 import { OnCallback, OnCommand } from '@core/telegram/decorators/handlers.decorator';
 import {
   CALLBACK_DATA_MAX_BYTES,
@@ -404,8 +401,8 @@ export class PlayerTelegramHandlers {
 
     if (ctx.chat?.type !== 'private') {
       await ctx.reply(
-        'Not here — a login code must never be posted in a group. '
-          + 'Open a direct chat with me and send /login there.',
+        'Not here — a login code must never be posted in a group. ' +
+          'Open a direct chat with me and send /login there.',
       );
       return;
     }
@@ -417,12 +414,12 @@ export class PlayerTelegramHandlers {
     try {
       const { code } = await this.loginCodes.mint('player', BigInt(from.id));
       await ctx.reply(
-        `<b>تسجيل الدخول للتطبيق</b>\n\n`
-          + `<code>${code}</code>\n\n`
-          + `صالح ${LOGIN_CODE_TTL_MINUTES} دقائق، ولمرة واحدة فقط.\n`
-          + `أدخله في شاشة تسجيل الدخول بالتطبيق.\n\n`
-          + `إذا لم تطلب هذا الرمز، تجاهله — الرمز بلا فائدة بدون التطبيق، `
-          + `وإرسال /login مرة أخرى يلغي هذا الرمز.`,
+        `<b>تسجيل الدخول للتطبيق</b>\n\n` +
+          `<code>${code}</code>\n\n` +
+          `صالح ${LOGIN_CODE_TTL_MINUTES} دقائق، ولمرة واحدة فقط.\n` +
+          `أدخله في شاشة تسجيل الدخول بالتطبيق.\n\n` +
+          `إذا لم تطلب هذا الرمز، تجاهله — الرمز بلا فائدة بدون التطبيق، ` +
+          `وإرسال /login مرة أخرى يلغي هذا الرمز.`,
         { parse_mode: 'HTML' },
       );
     } catch (error: unknown) {
@@ -626,6 +623,24 @@ export class PlayerTelegramHandlers {
     const from = ctx.from;
     if (from === undefined) return;
 
+    // WHERE: this operator's own admin group, read off its tenant row. `Tenant` is not a scoped
+    // model, so the id is named explicitly; 0 is what an operator with no admin group yet holds.
+    const tenantId = requireEffectiveTenantId();
+    const adminChat = await this.prisma.tenant
+      .findUnique({ where: { id: tenantId }, select: { adminChatId: true } })
+      .catch((error: unknown) => {
+        this.logger.warn(
+          `Could not read the admin chat of tenant ${tenantId}: ${describeError(error)}`,
+        );
+        return null;
+      });
+    if (adminChat === null || adminChat.adminChatId === 0n) {
+      this.logger.debug(
+        `No admin chat set for tenant ${tenantId}; new player ${playerId} not announced`,
+      );
+      return;
+    }
+
     const ordinal = await this.prisma.player.count().catch((error: unknown) => {
       this.logger.debug(`Could not count players for the arrivals card: ${describeError(error)}`);
       return null;
@@ -669,7 +684,7 @@ export class PlayerTelegramHandlers {
     );
 
     try {
-      await ctx.api.sendMessage(this.config.telegram.adminChatId.toString(), lines.join('\n'), {
+      await ctx.api.sendMessage(adminChat.adminChatId.toString(), lines.join('\n'), {
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
         // The group is watching a review queue, not an arrivals board: this must not buzz phones.
@@ -809,8 +824,8 @@ export class PlayerTelegramHandlers {
         [
           'حسابك قيد التجهيز — أرسل /start مرة أخرى بعد قليل.',
           '',
-          'Your gaming account is still being prepared. Send /start again in a moment;'
-            + ' it is also created automatically with your first deposit.',
+          'Your gaming account is still being prepared. Send /start again in a moment;' +
+            ' it is also created automatically with your first deposit.',
         ].join('\n'),
         this.miniAppKeyboard(),
       );

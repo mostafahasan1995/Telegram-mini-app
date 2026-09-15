@@ -91,8 +91,8 @@ export class InvariantCheckCron {
     if (handle === null) return;
 
     try {
-      const report = await this.runOnce();
-      if (!report.ok) await this.alert(report);
+      const { report, owners } = await this.sweep();
+      if (!report.ok) await this.alert(report, owners);
     } catch (cause) {
       this.logger.error(
         `invariant check failed: ${cause instanceof Error ? cause.message : String(cause)}`,
@@ -104,6 +104,14 @@ export class InvariantCheckCron {
 
   /** Exposed for the admin endpoint and for tests. */
   async runOnce(): Promise<LedgerInvariantReport> {
+    return (await this.sweep()).report;
+  }
+
+  /** The report, plus which operator owns each violation in it (null when nothing names one). */
+  private async sweep(): Promise<{
+    report: LedgerInvariantReport;
+    owners: ReadonlyMap<LedgerInvariantViolation, string | null>;
+  }> {
     const report = await this.prisma.runInTransaction((tx) =>
       this.invariants.checkAll(tx, INVARIANT_ROW_LIMIT),
     );
@@ -113,10 +121,12 @@ export class InvariantCheckCron {
     // on which operators' breaks this run may touch.
     const scope = getEffectiveTenantId();
     const visible: LedgerInvariantViolation[] = [];
+    const owners = new Map<LedgerInvariantViolation, string | null>();
     let unattributed = 0;
 
     for (const violation of report.violations) {
       const tenantId = await this.ownerOf(violation);
+      owners.set(violation, tenantId);
 
       if (tenantId === null) {
         // I2, or a subject row that has since been deleted. Nothing to file it against, and
@@ -144,10 +154,13 @@ export class InvariantCheckCron {
     // Rebuilt rather than returned as-is: `ok` has to agree with the violations actually being
     // handed back, or a narrowed report would say "failed" while listing nothing.
     return {
-      ok: visible.length === 0,
-      checkedAt: report.checkedAt,
-      violations: visible,
-      truncated: report.truncated,
+      report: {
+        ok: visible.length === 0,
+        checkedAt: report.checkedAt,
+        violations: visible,
+        truncated: report.truncated,
+      },
+      owners,
     };
   }
 
@@ -228,30 +241,75 @@ export class InvariantCheckCron {
   }
 
   /**
-   * One message, not one per violation: a broken ledger can produce a hundred rows and a hundred
-   * alerts is an alert nobody reads. Sent through BotService directly rather than through a queue —
-   * an alert that waits behind a backlog of review cards is an alert that arrives too late.
+   * One message PER OPERATOR, not one per violation: a broken ledger can produce a hundred rows and
+   * a hundred alerts is an alert nobody reads. Sent through BotService directly rather than through a
+   * queue — an alert that waits behind a backlog of review cards is an alert that arrives too late.
+   *
+   * WHO IS TOLD: the operator that owns the offending rows, in its own admin group, through its own
+   * bot, and about its own violations only. That is the same owner the break was filed against, so
+   * the alert points at a break its staff can actually see; the dashboard files SYSTEM_ALERT under an
+   * operator's destinations, and there is no platform chat or platform bot. Sent whatever the
+   * operator's status, because a suspended operator's books still have to add up.
+   *
+   * WHAT IS NOT SENT ANYWHERE: a violation with no owner (I2's cross-operator sum, or a subject row
+   * that has gone). Naming it to any one operator would disclose a figure computed over the others'
+   * entries, so it stays in the error log above, and a warning says it was not delivered.
    */
-  private async alert(report: LedgerInvariantReport): Promise<void> {
-    const worst = report.violations.filter(
-      (violation) => violation.invariant !== 'I3_ACCOUNT_BALANCE_MATCHES_ENTRIES',
-    );
-    const lines = [
-      `🚨 <b>LEDGER INVARIANTS FAILED</b>`,
-      `${report.violations.length} violation(s)${report.truncated ? ' (truncated)' : ''}`,
-      '',
-      ...report.violations.slice(0, 8).map((violation) => `• ${violation.detail}`),
-    ];
-    if (worst.length > 0) {
-      lines.push('', '<b>At least one is a real imbalance, not a cache drift.</b>');
+  private async alert(
+    report: LedgerInvariantReport,
+    owners: ReadonlyMap<LedgerInvariantViolation, string | null>,
+  ): Promise<void> {
+    const byOwner = new Map<string, LedgerInvariantViolation[]>();
+    let ownerless = 0;
+    for (const violation of report.violations) {
+      const tenantId = owners.get(violation) ?? null;
+      if (tenantId === null) {
+        ownerless += 1;
+        continue;
+      }
+      byOwner.set(tenantId, [...(byOwner.get(tenantId) ?? []), violation]);
     }
-    // Admins ONLY — never the feed: "our books do not add up" is an internal engineering signal, and
-    // in a group that may contain customers it reads as "your money is missing". A PLATFORM alert:
-    // one check spans every operator's ledger, so no single operator's bot is the sender, and it is
-    // not delivered until platform alerts are given a destination. The error log above still fires.
-    await this.bot.notifyPlatformAdmins(lines.join('\n'), {
-      parseMode: 'HTML',
-      linkPreview: false,
-    });
+
+    if (ownerless > 0) {
+      this.logger.warn(
+        `${ownerless} ledger violation(s) with no owning operator were not sent to any Telegram ` +
+          'chat: there is no platform destination, and no single operator may see them',
+      );
+    }
+
+    for (const [tenantId, violations] of byOwner) {
+      const worst = violations.filter(
+        (violation) => violation.invariant !== 'I3_ACCOUNT_BALANCE_MATCHES_ENTRIES',
+      );
+      const lines = [
+        `🚨 <b>LEDGER INVARIANTS FAILED</b>`,
+        `${violations.length} violation(s)${report.truncated ? ' (truncated)' : ''}`,
+        '',
+        ...violations.slice(0, 8).map((violation) => `• ${violation.detail}`),
+      ];
+      if (worst.length > 0) {
+        lines.push('', '<b>At least one is a real imbalance, not a cache drift.</b>');
+      }
+      try {
+        // Admins ONLY — never the feed: "our books do not add up" is an internal signal, and in a
+        // group that may contain customers it reads as "your money is missing".
+        const sent = await this.bot.notifyAdmins(tenantId, lines.join('\n'), {
+          parseMode: 'HTML',
+          linkPreview: false,
+        });
+        if (sent === null) {
+          this.logger.warn(
+            `ledger invariant alert for tenant ${tenantId} not delivered: its admin chat is ` +
+              'unset or unreachable (the break is still recorded)',
+          );
+        }
+      } catch (cause) {
+        // One operator's broken bot must not cost the next operator its alert.
+        this.logger.error(
+          `ledger invariant alert for tenant ${tenantId} failed: ` +
+            `${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+    }
   }
 }

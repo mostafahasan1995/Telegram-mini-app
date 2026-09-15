@@ -90,7 +90,9 @@ export const REPORT_SCHEDULE_LOCK_TTL_MS = 9 * 60_000;
  * TTL is the interval, so the fact survives a restart (which is what stops a redeploy re-posting)
  * and is shared by every replica (which is what stops two of them posting the same report).
  *
- * Not namespaced by period or by chat: there is exactly ONE scheduled report in this system, and a
- * key that quietly varies is a key that stops de-duplicating the moment a setting changes.
+ * Namespaced by OPERATOR and by nothing else: each operator gets one scheduled report of its own
+ * numbers, so one operator's post must never count as another's. Not by period or by chat: a key
+ * that quietly varies with a setting is a key that stops de-duplicating the moment it changes.
  */
-export const REPORT_LAST_POSTED_KEY = 'admin:report:last-posted';
+export const reportLastPostedKey = (tenantId: string): string =>
+  `admin:report:last-posted:${tenantId}`;

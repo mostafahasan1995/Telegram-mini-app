@@ -29,11 +29,13 @@ const SECOND_OPERATOR_ID = '22222222-2222-4222-8222-222222222222';
 const TELEGRAM_USER_ID = 912911246;
 const PLAYER_ID = '9f3c1e58-0000-4000-8000-00000000aaaa';
 const AGENT_ID = '2372020';
+const ADMIN_CHAT_ID = -1004382350658n;
 
 interface Harness {
   handlers: PlayerTelegramHandlers;
   ensureLinked: jest.Mock;
   upsertFromTelegram: jest.Mock;
+  tenantLookup: jest.Mock;
   replies: string[];
   adminMessages: { chatId: string; text: string }[];
 }
@@ -43,7 +45,9 @@ interface Harness {
  * asserts what /start DOES, and a DI container would only add a way for the test to fail for
  * reasons that have nothing to do with the requirement.
  */
-function harness(options: { isNew?: boolean; alreadyLinked?: boolean } = {}): Harness {
+function harness(
+  options: { isNew?: boolean; alreadyLinked?: boolean; adminChatId?: bigint } = {},
+): Harness {
   const isNew = options.isNew ?? true;
   const created = !(options.alreadyLinked ?? false);
 
@@ -69,6 +73,12 @@ function harness(options: { isNew?: boolean; alreadyLinked?: boolean } = {}): Ha
   const prisma = {
     runInTransaction: (callback: (tx: unknown) => unknown) => callback({}),
     player: { count: jest.fn().mockResolvedValue(91) },
+    // The operator's own admin group, read off its tenant row. 0 is "none set yet".
+    tenant: {
+      findUnique: jest.fn((args: { where: { id: string } }) =>
+        Promise.resolve({ id: args.where.id, adminChatId: options.adminChatId ?? ADMIN_CHAT_ID }),
+      ),
+    },
   };
 
   const credentialsFor = jest.fn().mockReturnValue({
@@ -87,7 +97,6 @@ function harness(options: { isNew?: boolean; alreadyLinked?: boolean } = {}): Ha
     } as never,
     {
       ichancy: { currency: 'NSP', agentId: AGENT_ID, playerSiteUrl: 'https://ichancy.com' },
-      telegram: { adminChatId: -1004382350658n },
       app: { baseUrl: 'https://app.example.com' },
     } as never,
     {} as never,
@@ -118,7 +127,14 @@ function harness(options: { isNew?: boolean; alreadyLinked?: boolean } = {}): Ha
   // The ctx travels with the harness through the single call each test makes.
   (handlers as unknown as { __ctx: Context }).__ctx = ctx;
 
-  return { handlers, ensureLinked, upsertFromTelegram, replies, adminMessages };
+  return {
+    handlers,
+    ensureLinked,
+    upsertFromTelegram,
+    tenantLookup: prisma.tenant.findUnique,
+    replies,
+    adminMessages,
+  };
 }
 
 const ctxOf = (handlers: PlayerTelegramHandlers): Context =>
@@ -184,12 +200,31 @@ describe('/start registers the player under our agent', () => {
 
     expect(h.adminMessages).toHaveLength(1);
     const card = h.adminMessages[0];
-    expect(card?.chatId).toBe('-1004382350658');
+    expect(card?.chatId).toBe(ADMIN_CHAT_ID.toString());
     expect(card?.text).toContain('New player');
     expect(card?.text).toContain(String(TELEGRAM_USER_ID));
     // The two ids that let an operator find this person in the Ichancy panel.
     expect(card?.text).toContain('p7k3mq9x2vn4bcd');
     expect(card?.text).toContain('414402262');
+  });
+
+  it('sends the arrivals card to the admin group of the operator whose bot received /start', async () => {
+    const h = harness({ adminChatId: -1009999999999n });
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)), SECOND_OPERATOR_ID);
+
+    expect(h.tenantLookup).toHaveBeenCalledWith({
+      where: { id: SECOND_OPERATOR_ID },
+      select: { adminChatId: true },
+    });
+    expect(h.adminMessages[0]?.chatId).toBe('-1009999999999');
+  });
+
+  it('posts no arrivals card, and still greets the player, when the operator has no admin group', async () => {
+    const h = harness({ adminChatId: 0n });
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
+
+    expect(h.adminMessages).toHaveLength(0);
+    expect(h.replies.some((text) => text.includes('تم إنشاء حساب اللعب'))).toBe(true);
   });
 
   it('registers nothing new when the same player presses Start again', async () => {
@@ -301,7 +336,6 @@ describe('👤 حسابي shows an existing account its sign-in details', () => 
       {} as never,
       {
         ichancy: { currency: 'NSP', agentId: AGENT_ID, playerSiteUrl: 'https://ichancy.com' },
-        telegram: { adminChatId: -1004382350658n },
         app: { baseUrl: 'https://app.example.com' },
       } as never,
       {} as never,
