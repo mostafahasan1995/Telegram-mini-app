@@ -27,15 +27,12 @@ import {
   IsMinorUnits,
   isDefined,
   trimString,
+  upperCaseTrimmed,
 } from './field-validators';
 
 const EXPIRY_MESSAGE =
   `depositExpiryMinutes must be whole minutes between ${MIN_DEPOSIT_EXPIRY_MINUTES} ` +
   `and ${MAX_DEPOSIT_EXPIRY_MINUTES}`;
-
-/** Upper-cased before validation, as the create form does: "nsp" is a typing accident, not a code. */
-const upperCaseTrimmed = ({ value }: { value: unknown }): unknown =>
-  typeof value === 'string' ? value.trim().toUpperCase() : value;
 
 export class UpdatePlatformDefaultsDto {
   @ValidateIf(isDefined)

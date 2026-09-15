@@ -25,11 +25,22 @@ export const HTTPS_URL_PATTERN = /^https:\/\/\S+$/;
 /** Ichancy agent ids are numeric. The bound only keeps an absurd value out of the column. */
 export const AGENT_ID_PATTERN = /^\d{1,32}$/;
 export const CURRENCY_CODE_PATTERN = /^[A-Z]{3}$/;
+/**
+ * What BotFather hands out: a numeric bot id, a colon, and at least 30 URL-safe characters. The
+ * dashboard's BOT_TOKEN_RE, so a token the form accepts is never refused here for its shape.
+ */
+export const BOT_TOKEN_PATTERN = /^\d{6,}:[A-Za-z0-9_-]{30,}$/;
+/** A caller-chosen slug: the dashboard's SLUG_RE, 3–32 characters, starting with a letter. */
+export const SLUG_PATTERN = /^[a-z][a-z0-9-]{1,30}[a-z0-9]$/;
 
 export const isDefined = (_object: object, value: unknown): boolean => value !== undefined;
 
 export const trimString = ({ value }: { value: unknown }): unknown =>
   typeof value === 'string' ? value.trim() : value;
+
+/** Upper-cased before validation, as the create form does: "nsp" is a typing accident, not a code. */
+export const upperCaseTrimmed = ({ value }: { value: unknown }): unknown =>
+  typeof value === 'string' ? value.trim().toUpperCase() : value;
 
 function fitsInt64(digits: string): boolean {
   const value = BigInt(digits);

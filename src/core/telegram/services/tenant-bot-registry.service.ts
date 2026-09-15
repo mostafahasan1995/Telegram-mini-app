@@ -80,6 +80,17 @@ interface Failure {
   until: number;
 }
 
+/**
+ * Who a token that is not stored anywhere yet belongs to, as Telegram answers getMe.
+ *
+ * `rejected` separates the two failures a caller must tell apart: a token Telegram refused (the
+ * person typed it wrong, a 400 to them) from a Telegram that could not be asked (retry later).
+ * `reason` never carries the token.
+ */
+export type TokenIdentity =
+  | { ok: true; botInfo: UserFromGetMe }
+  | { ok: false; rejected: boolean; reason: string };
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 @Injectable()
@@ -141,6 +152,41 @@ export class TenantBotRegistry {
     this.loggedFailures.delete(tenantId);
     if (entry !== undefined) {
       await this.forgetBotInfo(tenantId, entry.botId);
+    }
+  }
+
+  /**
+   * One getMe for a token that is not on any tenant row yet: the token pasted into "create operator"
+   * or "replace bot", checked before it is sealed so a bad one never lands.
+   *
+   * WHY HERE AND NOT `new Api(token)` AT THE CALL SITE: the registry holds the client options every
+   * tenant Bot is built with. A token verified through a different client than the one that will use
+   * it verifies nothing about the path it will take, and in tests it would reach api.telegram.org.
+   *
+   * Nothing is cached or built: the token belongs to no operator until the caller stores it, and the
+   * next `get()` for that operator identifies it again through the normal path.
+   */
+  async identifyToken(token: string): Promise<TokenIdentity> {
+    if (botIdFromToken(token) === null) {
+      return { ok: false, rejected: true, reason: 'it is not shaped like a Telegram bot token' };
+    }
+    try {
+      return { ok: true, botInfo: await new Api(token, this.clientOptions).getMe() };
+    } catch (error: unknown) {
+      if (isTokenRejection(error)) {
+        return {
+          ok: false,
+          rejected: true,
+          reason: `Telegram answered ${error.error_code}: ${error.description}`,
+        };
+      }
+      // grammY keeps the request URL, and so the token, out of its messages unless sensitiveLogs is
+      // enabled, which nothing here does.
+      return {
+        ok: false,
+        rejected: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 

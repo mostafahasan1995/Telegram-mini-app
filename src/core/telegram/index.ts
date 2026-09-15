@@ -5,6 +5,7 @@ export * from './tenant-bot.errors';
 export * from './decorators/handlers.decorator';
 export * from './services/bot.service';
 export * from './services/tenant-bot-registry.service';
+export * from './services/tenant-bot-setup.service';
 export * from './services/update-dedupe.service';
 export * from './services/handler-registrar.service';
 export * from './controllers/webhook.controller';

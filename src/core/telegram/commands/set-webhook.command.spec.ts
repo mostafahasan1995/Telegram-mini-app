@@ -10,6 +10,8 @@ import { TenantSecretService } from '../../tenant/services/tenant-secret.service
 import { getEffectiveTenantId } from '../../tenant/tenant.storage';
 import { TENANT_ZERO_ID } from '../../tenant/tenant.constants';
 import { type BotService } from '../services/bot.service';
+import { type TenantBotRegistry } from '../services/tenant-bot-registry.service';
+import { TenantBotSetupService } from '../services/tenant-bot-setup.service';
 import { TELEGRAM_ALLOWED_UPDATES } from '../telegram.constants';
 import { SetupBotCommand } from './setup-bot.command';
 import { SetWebhookCommand } from './set-webhook.command';
@@ -55,8 +57,13 @@ function prismaWith(
 } {
   const findMany = jest.fn().mockResolvedValue(rows.filter((row) => row.status === 'ACTIVE'));
   const adminFindMany = jest.fn().mockResolvedValue(admins);
-  const findUnique = jest.fn((args: { where: { slug: string } }) =>
-    Promise.resolve(rows.find((row) => row.slug === args.where.slug) ?? null),
+  // By slug for the target lookup, by id for the admin chat TenantBotSetupService reads.
+  const findUnique = jest.fn((args: { where: { slug?: string; id?: string } }) =>
+    Promise.resolve(
+      rows.find((row) =>
+        args.where.slug === undefined ? row.id === args.where.id : row.slug === args.where.slug,
+      ) ?? null,
+    ),
   );
   return {
     prisma: {
@@ -270,7 +277,12 @@ describe('bot:setup', () => {
       contexts.push(getEffectiveTenantId());
       return Promise.resolve(admins);
     });
-    const command = new SetupBotCommand(prisma, { forTenant } as unknown as BotService);
+    // The real service over the fakes: the CLI and the dashboard route push through the same code.
+    const setup = new TenantBotSetupService(
+      { get: forTenant } as unknown as TenantBotRegistry,
+      prisma,
+    );
+    const command = new SetupBotCommand(prisma, setup);
     return { command, api, forTenant, adminFindMany, contexts };
   }
 
@@ -289,13 +301,14 @@ describe('bot:setup', () => {
     );
     expect(scopes).toEqual([
       { type: 'default' },
-      { type: 'chat', chat_id: ALPHA.adminChatId.toString() },
+      { type: 'all_private_chats' },
+      { type: 'chat_administrators', chat_id: ALPHA.adminChatId.toString() },
       { type: 'chat', chat_id: '777' },
     ]);
     expect(h.api.setChatMenuButton).toHaveBeenCalledTimes(1);
   });
 
-  it('skips the admin group menu for an operator with no admin chat set', async () => {
+  it('skips the admin chat menu for an operator with no admin chat set', async () => {
     const h = build([BETA]);
 
     await h.command.run([], { tenant: 'beta' });
@@ -303,7 +316,19 @@ describe('bot:setup', () => {
     const scopes = h.api.setMyCommands.mock.calls.map(
       (call) => (call[1] as { scope: unknown }).scope,
     );
-    expect(scopes).toEqual([{ type: 'default' }]);
+    expect(scopes).toEqual([{ type: 'default' }, { type: 'all_private_chats' }]);
+  });
+
+  it('fails an operator whose player menu Telegram refuses, but not for a cosmetic call', async () => {
+    const cosmetic = build([BETA]);
+    cosmetic.api.setMyDescription.mockRejectedValue(new Error('Too Many Requests'));
+    await expect(cosmetic.command.run([], { tenant: 'beta' })).resolves.toBeUndefined();
+
+    const refused = build([BETA]);
+    refused.api.setMyCommands.mockRejectedValueOnce(new Error('Bad Request: commands too long'));
+    await expect(refused.command.run([], { tenant: 'beta' })).rejects.toThrow(
+      /1 of 1 operator\(s\): beta/,
+    );
   });
 
   it('fails naming the operator whose bot cannot be used, after trying the others', async () => {

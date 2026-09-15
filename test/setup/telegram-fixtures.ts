@@ -51,6 +51,20 @@ export interface FakeTelegramCall {
   payload: Record<string, unknown>;
 }
 
+/**
+ * What the fake Telegram holds as a bot's webhook. Keyed by BOT, not by token, as Telegram keeps it:
+ * a token regenerated at BotFather still addresses the same bot and the same registration.
+ */
+export interface FakeWebhookState {
+  url: string;
+  secretToken: string | null;
+  allowedUpdates: string[] | null;
+  pendingUpdateCount: number;
+  lastErrorMessage: string | null;
+  /** Unix seconds, as Telegram reports it. */
+  lastErrorDate: number | null;
+}
+
 export interface FakeTelegram {
   /** Pass to TenantBotRegistry (or a Bot) as its client options. */
   readonly clientOptions: ApiClientOptions;
@@ -63,6 +77,16 @@ export interface FakeTelegram {
   makeUnreachable(token: string): void;
   restore(token: string): void;
   callsFor(token: string, method?: string): FakeTelegramCall[];
+  /**
+   * setWebhook with this token answers 400 with `description` until `allowWebhook`, the way Telegram
+   * refuses a URL it cannot deliver to (a laptop's https://api.localhost, a plain http URL).
+   */
+  refuseWebhook(token: string, description: string): void;
+  allowWebhook(token: string): void;
+  /** The webhook Telegram holds for this token's bot, or null when none is set. */
+  webhookFor(token: string): FakeWebhookState | null;
+  /** Puts a webhook in place without a setWebhook call: another deployment's, or a failing one. */
+  setWebhookState(token: string, state: Partial<FakeWebhookState> & { url: string }): void;
 }
 
 const BOT_API_URL = /\/bot([^/]+)\/([A-Za-z]+)$/;
@@ -75,7 +99,18 @@ export function createFakeTelegram(): FakeTelegram {
   const accepted = new Map<string, UserFromGetMe>();
   const unreachable = new Set<string>();
   const calls: FakeTelegramCall[] = [];
+  /** bot id -> its webhook. */
+  const webhooks = new Map<number, FakeWebhookState>();
+  /** token -> the description setWebhook is refused with. */
+  const webhookRefusals = new Map<string, string>();
   let nextMessageId = 1;
+
+  const botIdOf = (token: string): number | null => accepted.get(token)?.id ?? null;
+
+  const stringArray = (value: unknown): string[] | null =>
+    Array.isArray(value) && value.every((item): item is string => typeof item === 'string')
+      ? value
+      : null;
 
   const respond = (body: unknown): Promise<FakeResponse> =>
     Promise.resolve({ json: () => Promise.resolve(body) });
@@ -100,6 +135,42 @@ export function createFakeTelegram(): FakeTelegram {
     switch (method) {
       case 'getMe':
         return respond({ ok: true, result: botInfo });
+      case 'setWebhook': {
+        const refusal = webhookRefusals.get(token);
+        if (refusal !== undefined) {
+          return respond({ ok: false, error_code: 400, description: refusal });
+        }
+        webhooks.set(botInfo.id, {
+          url: typeof payload['url'] === 'string' ? payload['url'] : '',
+          secretToken: typeof payload['secret_token'] === 'string' ? payload['secret_token'] : null,
+          allowedUpdates: stringArray(payload['allowed_updates']),
+          pendingUpdateCount: 0,
+          lastErrorMessage: null,
+          lastErrorDate: null,
+        });
+        return respond({ ok: true, result: true });
+      }
+      case 'deleteWebhook':
+        webhooks.delete(botInfo.id);
+        return respond({ ok: true, result: true });
+      case 'getWebhookInfo': {
+        const state = webhooks.get(botInfo.id);
+        return respond({
+          ok: true,
+          result: {
+            url: state?.url ?? '',
+            has_custom_certificate: false,
+            pending_update_count: state?.pendingUpdateCount ?? 0,
+            ...(state?.allowedUpdates ? { allowed_updates: state.allowedUpdates } : {}),
+            ...(state?.lastErrorMessage
+              ? {
+                  last_error_message: state.lastErrorMessage,
+                  last_error_date: state.lastErrorDate ?? Math.floor(Date.now() / 1000),
+                }
+              : {}),
+          },
+        });
+      }
       case 'sendMessage':
         return respond({
           ok: true,
@@ -135,5 +206,27 @@ export function createFakeTelegram(): FakeTelegram {
       calls.filter(
         (call) => call.token === token && (method === undefined || call.method === method),
       ),
+    refuseWebhook: (token, description) => {
+      webhookRefusals.set(token, description);
+    },
+    allowWebhook: (token) => {
+      webhookRefusals.delete(token);
+    },
+    webhookFor: (token) => {
+      const botId = botIdOf(token);
+      return botId === null ? null : (webhooks.get(botId) ?? null);
+    },
+    setWebhookState: (token, state) => {
+      const botId = botIdOf(token);
+      if (botId === null) throw new Error('setWebhookState needs a token accepted first');
+      webhooks.set(botId, {
+        secretToken: null,
+        allowedUpdates: null,
+        pendingUpdateCount: 0,
+        lastErrorMessage: null,
+        lastErrorDate: null,
+        ...state,
+      });
+    },
   };
 }

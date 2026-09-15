@@ -33,6 +33,7 @@ import { SetupBotCommand } from './commands/setup-bot.command';
 import { BotService } from './services/bot.service';
 import { TelegramHandlerRegistrar } from './services/handler-registrar.service';
 import { TenantBotRegistry } from './services/tenant-bot-registry.service';
+import { TenantBotSetupService } from './services/tenant-bot-setup.service';
 import { UpdateDedupeService } from './services/update-dedupe.service';
 import { TELEGRAM_UPDATE_QUEUE } from './telegram.constants';
 
@@ -53,6 +54,7 @@ import { TELEGRAM_UPDATE_QUEUE } from './telegram.constants';
   providers: [
     TenantBotRegistry,
     BotService,
+    TenantBotSetupService,
     UpdateDedupeService,
     TelegramHandlerRegistrar,
     SetWebhookCommand,
@@ -60,6 +62,6 @@ import { TELEGRAM_UPDATE_QUEUE } from './telegram.constants';
   ],
   // BullModule is re-exported so a feature module importing TelegramModule can inject the same
   // queue with @InjectQueue(TELEGRAM_UPDATE_QUEUE) instead of registering a second one.
-  exports: [TenantBotRegistry, BotService, UpdateDedupeService, BullModule],
+  exports: [TenantBotRegistry, BotService, TenantBotSetupService, UpdateDedupeService, BullModule],
 })
 export class TelegramModule {}

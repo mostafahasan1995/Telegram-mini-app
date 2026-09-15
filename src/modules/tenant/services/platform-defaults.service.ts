@@ -158,9 +158,12 @@ export class PlatformDefaultsService {
   /**
    * An unknown code and an inactive one are refused with different sentences: the first is a typo,
    * the second is a currency somebody retired on purpose, and they are fixed in different places.
+   *
+   * Public because tenant creation applies the same rule to the currency a new operator gets: it is
+   * a foreign key on `tenants`, so an unchecked code would otherwise fail as a 500 at insert.
    */
-  private async assertCurrencyUsable(tx: Tx, code: string): Promise<void> {
-    const currency = await tx.currency.findUnique({ where: { code }, select: { isActive: true } });
+  async assertCurrencyUsable(db: Pick<Tx, 'currency'>, code: string): Promise<void> {
+    const currency = await db.currency.findUnique({ where: { code }, select: { isActive: true } });
     if (currency === null) {
       throw new ValidationError(undefined, {
         fields: [`currencyCode: there is no currency ${code}`],

@@ -331,8 +331,11 @@ export class TenantAdminService {
     return toTenantView(row, await this.countsOf(row.id));
   }
 
-  /** An explicit tenantId, which the scope extension never overrides. */
-  private async countsOf(id: string): Promise<TenantCounts> {
+  /**
+   * An explicit tenantId, which the scope extension never overrides. Public for GET /:id/health,
+   * which reports the same two numbers.
+   */
+  async countsOf(id: string): Promise<TenantCounts> {
     const [players, deposits] = await Promise.all([
       this.prisma.player.count({ where: { tenantId: id } }),
       this.prisma.depositRequest.count({ where: { tenantId: id } }),

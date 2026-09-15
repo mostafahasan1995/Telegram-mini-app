@@ -303,6 +303,11 @@ model Tenant {
   botTokenEnc      String  @map("bot_token_enc")
   /// Filled from getMe when the token is accepted; null until the bot has answered once.
   botUsername      String? @map("bot_username")
+  /// The bot's public Telegram user id, from getMe, the number a token starts with. Unique because
+  /// Telegram keeps exactly one webhook per bot: two operators on one bot would take each other's
+  /// deliveries, and each re-registration would silently move the other's players. Nullable only for
+  /// rows written before this column existed, whose token is sealed and cannot be read in SQL.
+  botId            BigInt? @unique @map("bot_id")
   /// CSPRNG path segment the webhook is registered under. Unique across operators because it is
   /// what routes an inbound update to THIS tenant before any other identity exists.
   webhookPathToken String? @unique @map("webhook_path_token")

@@ -45,6 +45,24 @@ export const TenantErrorCodes = {
    * cannot make one yet. A 503: the request was right, what is missing is the thing behind it.
    */
   TENANT_ACTIVATION_UNAVAILABLE: 'TENANT_ACTIVATION_UNAVAILABLE',
+  /**
+   * The operator's bot cannot be used for a reason waiting will not fix: no token set, a stored token
+   * that does not open, or one Telegram rejects. A 422: the fix is a new token from the dashboard.
+   * (A bad token SUBMITTED in a request is VALIDATION_FAILED instead, naming `botToken`.)
+   */
+  TENANT_BOT_UNAVAILABLE: 'TENANT_BOT_UNAVAILABLE',
+  /**
+   * Telegram answered a webhook or menu call with an error, for example a webhook URL it refuses. A
+   * 422 whose message carries Telegram's own description, with any path token masked.
+   */
+  TENANT_TELEGRAM_REJECTED: 'TENANT_TELEGRAM_REJECTED',
+  /** Telegram could not be reached, or timed out. A 503: the same request can succeed later. */
+  TENANT_TELEGRAM_UNREACHABLE: 'TENANT_TELEGRAM_UNREACHABLE',
+  /**
+   * This deployment's API_BASE_URL is not https. Telegram delivers webhooks only over TLS, so
+   * registering it could never deliver anything. A 422 that names the setting, not the operator.
+   */
+  TENANT_WEBHOOK_URL_NOT_HTTPS: 'TENANT_WEBHOOK_URL_NOT_HTTPS',
 } as const;
 
 export type TenantErrorCode = (typeof TenantErrorCodes)[keyof typeof TenantErrorCodes];
