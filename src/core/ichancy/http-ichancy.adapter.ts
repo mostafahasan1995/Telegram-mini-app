@@ -13,10 +13,16 @@
  * Registration gets special treatment: `login` is a natural idempotency key, so an ambiguous or
  * "Duplicate login" registerPlayer is settled by looking the player up instead of guessing. And
  * because registerPlayer answers the NUMBER 1 rather than an id, the lookup happens on success too.
+ *
+ * WHOSE AGENT: every public method resolves the agent of the operator in the tenant context FIRST, and
+ * the whole operation — the token, the base URL, the parentId on registration, the currency of the
+ * wallet and of the money move — is made as that one agent. The agent is resolved once per operation,
+ * so a registration and the lookup that settles it can never straddle two agents. No operator in
+ * context throws (a programming error that must not borrow an agent); an operator without a usable
+ * agent is `rejected`, because nothing was sent.
  */
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { type IchancyOperation } from '@prisma/client';
-import { AppConfigService } from '@core/config/config.service';
 import {
   minorToCreditWireAmount,
   minorToDebitWireAmount,
@@ -24,9 +30,24 @@ import {
   tryParseWireMoney,
   IchancyMoneyCodecError,
 } from './money-codec';
-import { IchancyHttpClient, type IchancyAttempt } from './ichancy-http.client';
-import { IchancySessionError, IchancySessionService } from './ichancy-session.service';
 import {
+  ICHANCY_AGENT_RESOLVER,
+  IchancyAgentErrorCodes,
+  isIchancyAgentUnavailableError,
+  type IchancyAgent,
+  type IchancyAgentCandidate,
+  type IchancyAgentResolver,
+} from './ichancy-agent';
+import { IchancyHttpClient, type IchancyAttempt } from './ichancy-http.client';
+import {
+  IchancySessionError,
+  IchancySessionService,
+  type IchancySignedIn,
+} from './ichancy-session.service';
+import {
+  type AgentPlayerPage,
+  type AgentPlayerPageRequest,
+  type AgentPlayerRecord,
   type AgentWallet,
   type EnsurePlayerInput,
   type EnsuredPlayer,
@@ -50,6 +71,7 @@ import {
   IchancyEndpoint,
   LOGIN_FIELDS,
   MoneyStatus,
+  PARENT_ID_FIELDS,
   PLAYER_ID_FIELDS,
   readObjectResult,
   readRecords,
@@ -68,79 +90,88 @@ function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const EMAIL_FIELDS = ['email', 'mail'] as const;
+
 @Injectable()
 export class HttpIchancyAdapter implements IchancyPort {
   private readonly logger = new Logger(HttpIchancyAdapter.name);
 
   constructor(
-    private readonly config: AppConfigService,
     private readonly http: IchancyHttpClient,
     private readonly session: IchancySessionService,
+    @Inject(ICHANCY_AGENT_RESOLVER) private readonly agents: IchancyAgentResolver,
   ) {}
 
   async ensurePlayer(input: EnsurePlayerInput): Promise<IchancyResult<EnsuredPlayer>> {
-    const registered = await this.send(
-      'REGISTER_PLAYER',
-      IchancyEndpoint.REGISTER_PLAYER,
-      {
-        player: {
-          email: input.email,
-          password: input.password,
-          parentId: this.config.ichancy.agentId,
-          login: input.login,
+    return this.asCurrentAgent(async (agent) => {
+      const registered = await this.send(
+        agent,
+        'REGISTER_PLAYER',
+        IchancyEndpoint.REGISTER_PLAYER,
+        {
+          player: {
+            email: input.email,
+            password: input.password,
+            // The OPERATOR's agent: the player hangs off the agent whose float will pay them.
+            parentId: agent.agentId,
+            login: input.login,
+          },
         },
-      },
-      input.context,
-    );
+        input.context,
+      );
 
-    if (isIchancyRejected(registered)) {
-      if (registered.code !== IchancyRejectionCodes.ALREADY_EXISTS) return registered;
-      // "Duplicate login"/"Duplicate email" is a success in disguise: the player exists, we just do
-      // not know their id yet. This is what makes ensurePlayer idempotent.
-      return this.resolveEnsuredPlayer(input, false, `Ichancy said: ${registered.message}`);
-    }
+      if (isIchancyRejected(registered)) {
+        if (registered.code !== IchancyRejectionCodes.ALREADY_EXISTS) return registered;
+        // "Duplicate login"/"Duplicate email" is a success in disguise: the player exists, we just do
+        // not know their id yet. This is what makes ensurePlayer idempotent.
+        return this.resolveEnsuredPlayer(agent, input, false, `Ichancy said: ${registered.message}`);
+      }
 
-    if (!isIchancyOk(registered)) {
-      // We do not know whether the account was created. A lookup settles it without any risk: the
-      // worst case is that it is not there yet and we stay ambiguous.
-      const resolved = await this.resolveEnsuredPlayer(input, false, registered.cause);
-      return isIchancyOk(resolved) ? resolved : ichancyAmbiguous(registered.cause);
-    }
+      if (!isIchancyOk(registered)) {
+        // We do not know whether the account was created. A lookup settles it without any risk: the
+        // worst case is that it is not there yet and we stay ambiguous.
+        const resolved = await this.resolveEnsuredPlayer(agent, input, false, registered.cause);
+        return isIchancyOk(resolved) ? resolved : ichancyAmbiguous(registered.cause);
+      }
 
-    // Success. `result` is the number 1 — never the id — so the id always has to be looked up.
-    return this.resolveEnsuredPlayer(input, true, 'registerPlayer reported success');
+      // Success. `result` is the number 1 — never the id — so the id always has to be looked up.
+      return this.resolveEnsuredPlayer(agent, input, true, 'registerPlayer reported success');
+    });
   }
 
   async getPlayerBalance(
     ichancyPlayerId: string,
     context?: IchancyCallContext,
   ): Promise<IchancyResult<PlayerBalance>> {
-    const response = await this.send(
-      'GET_PLAYER_BALANCE_BY_ID',
-      IchancyEndpoint.GET_PLAYER_BALANCE_BY_ID,
-      { playerId: ichancyPlayerId },
-      context,
-    );
-    if (!isIchancyOk(response)) return response;
-
-    const rows = readRecords(response.data?.result);
-    const wallet = this.pickWallet(rows);
-    if (!wallet) {
-      // An empty `result: []` is NOT "balance zero". Treating it as zero would poison a balance-delta
-      // verification: b0 would read 0, b1 would read the real balance, and a FAILED credit could look
-      // like a successful one. Unknown stays unknown.
-      return ichancyAmbiguous(
-        `getPlayerBalanceById returned no wallet row for player ${ichancyPlayerId}`,
+    return this.asCurrentAgent(async (agent) => {
+      const response = await this.send(
+        agent,
+        'GET_PLAYER_BALANCE_BY_ID',
+        IchancyEndpoint.GET_PLAYER_BALANCE_BY_ID,
+        { playerId: ichancyPlayerId },
+        context,
       );
-    }
+      if (!isIchancyOk(response)) return response;
 
-    try {
-      return ichancyOk({ balanceMinor: parseWireMoney(wallet['balance'], 'balance') });
-    } catch (error) {
-      return ichancyAmbiguous(
-        `getPlayerBalanceById returned an undecodable balance for ${ichancyPlayerId}: ${describeError(error)}`,
-      );
-    }
+      const rows = readRecords(response.data?.result);
+      const wallet = this.pickWallet(rows, agent.currency);
+      if (!wallet) {
+        // An empty `result: []` is NOT "balance zero". Treating it as zero would poison a
+        // balance-delta verification: b0 would read 0, b1 would read the real balance, and a FAILED
+        // credit could look like a successful one. Unknown stays unknown.
+        return ichancyAmbiguous(
+          `getPlayerBalanceById returned no wallet row for player ${ichancyPlayerId}`,
+        );
+      }
+
+      try {
+        return ichancyOk({ balanceMinor: parseWireMoney(wallet['balance'], 'balance') });
+      } catch (error) {
+        return ichancyAmbiguous(
+          `getPlayerBalanceById returned an undecodable balance for ${ichancyPlayerId}: ${describeError(error)}`,
+        );
+      }
+    });
   }
 
   async creditPlayer(input: PlayerMoveInput): Promise<IchancyResult<PlayerMoveOutcome>> {
@@ -152,48 +183,127 @@ export class HttpIchancyAdapter implements IchancyPort {
   }
 
   async getAgentWallet(context?: IchancyCallContext): Promise<IchancyResult<AgentWallet>> {
-    const response = await this.send(
-      'GET_AGENT_ALL_WALLETS',
-      IchancyEndpoint.GET_AGENT_ALL_WALLETS,
-      {},
-      context,
-    );
-    if (!isIchancyOk(response)) return response;
-
-    const rows = readRecords(response.data?.result);
-    const wallet = this.pickWallet(rows);
-    if (!wallet) {
-      return ichancyAmbiguous(
-        `getAgentAllWallets returned no ${this.config.ichancy.currency} wallet for the agent`,
+    return this.asCurrentAgent(async (agent) => {
+      const response = await this.send(
+        agent,
+        'GET_AGENT_ALL_WALLETS',
+        IchancyEndpoint.GET_AGENT_ALL_WALLETS,
+        {},
+        context,
       );
-    }
+      if (!isIchancyOk(response)) return response;
 
-    try {
-      // Every money field here arrives as a STRING. `availableWallet` is what actually limits a
-      // payout; the fallbacks exist because the field set differs between their environments.
-      const balanceMinor = parseWireMoney(wallet['balance'], 'balance');
-      const availableMinor =
-        tryParseWireMoney(wallet['availableWallet']) ??
-        tryParseWireMoney(wallet['currentWallet']) ??
-        tryParseWireMoney(wallet['availability']);
-      if (availableMinor === null) {
-        this.logger.warn(
-          'Agent wallet has no decodable availableWallet/currentWallet/availability; falling back to balance',
+      const rows = readRecords(response.data?.result);
+      const wallet = this.pickWallet(rows, agent.currency);
+      if (!wallet) {
+        return ichancyAmbiguous(
+          `getAgentAllWallets returned no ${agent.currency} wallet for the agent`,
         );
       }
-      return ichancyOk({ balanceMinor, availableMinor: availableMinor ?? balanceMinor });
-    } catch (error) {
-      return ichancyAmbiguous(
-        `getAgentAllWallets returned an undecodable wallet: ${describeError(error)}`,
-      );
-    }
+
+      try {
+        // Every money field here arrives as a STRING. `availableWallet` is what actually limits a
+        // payout; the fallbacks exist because the field set differs between their environments.
+        const balanceMinor = parseWireMoney(wallet['balance'], 'balance');
+        const availableMinor =
+          tryParseWireMoney(wallet['availableWallet']) ??
+          tryParseWireMoney(wallet['currentWallet']) ??
+          tryParseWireMoney(wallet['availability']);
+        if (availableMinor === null) {
+          this.logger.warn(
+            'Agent wallet has no decodable availableWallet/currentWallet/availability; falling back to balance',
+          );
+        }
+        return ichancyOk({ balanceMinor, availableMinor: availableMinor ?? balanceMinor });
+      } catch (error) {
+        return ichancyAmbiguous(
+          `getAgentAllWallets returned an undecodable wallet: ${describeError(error)}`,
+        );
+      }
+    });
   }
 
   async findPlayerByLogin(
     login: string,
     context?: IchancyCallContext,
   ): Promise<IchancyResult<FoundPlayer | null>> {
+    return this.asCurrentAgent((agent) => this.findPlayerByLoginAs(agent, login, context));
+  }
+
+  async listAgentPlayers(
+    page: AgentPlayerPageRequest,
+    context?: IchancyCallContext,
+  ): Promise<IchancyResult<AgentPlayerPage>> {
+    return this.asCurrentAgent(async (agent) => {
+      const response = await this.send(
+        agent,
+        'GET_PLAYERS_FOR_CURRENT_AGENT',
+        IchancyEndpoint.GET_PLAYERS_FOR_CURRENT_AGENT,
+        // No filter: every player under the SIGNED-IN login. That is this operator's tree unless
+        // another operator shares the login under another agent id, which the import sorts out
+        // with each record's parentId.
+        { start: page.start, limit: page.limit, filter: {} },
+        context,
+      );
+      if (!isIchancyOk(response)) return response;
+
+      const rows = readRecords(response.data?.result);
+      const records: AgentPlayerRecord[] = [];
+      for (const row of rows) {
+        const ichancyPlayerId = readStringFieldAny(row, PLAYER_ID_FIELDS);
+        const login = readStringFieldAny(row, LOGIN_FIELDS);
+        // A row without both cannot be matched to anything we hold, and guessing an identity for a
+        // money account is never worth it. It still counts as received.
+        if (ichancyPlayerId === null || login === null) continue;
+        records.push({
+          ichancyPlayerId,
+          login,
+          email: readStringFieldAny(row, EMAIL_FIELDS),
+          parentId: readStringFieldAny(row, PARENT_ID_FIELDS),
+        });
+      }
+      return ichancyOk({ records, received: rows.length });
+    });
+  }
+
+  async signIn(candidate?: IchancyAgentCandidate): Promise<IchancyResult<IchancySignedIn>> {
+    if (candidate !== undefined) {
+      return this.session.signInNow(this.agents.fromCandidate(candidate));
+    }
+    return this.asCurrentAgent((agent) => this.session.signInNow(agent));
+  }
+
+  // --------------------------------------------------------------------------------------------
+
+  /**
+   * Resolves the operator's agent and runs `work` as it. See the file header for why a missing
+   * context throws while an unusable agent is a `rejected` result.
+   */
+  private async asCurrentAgent<T>(
+    work: (agent: IchancyAgent) => Promise<IchancyResult<T>>,
+  ): Promise<IchancyResult<T>> {
+    let agent: IchancyAgent;
+    try {
+      agent = await this.agents.forCurrentTenant();
+    } catch (error: unknown) {
+      if (
+        isIchancyAgentUnavailableError(error) &&
+        error.code !== IchancyAgentErrorCodes.NO_TENANT_CONTEXT
+      ) {
+        return ichancyRejected(error.code, error.message);
+      }
+      throw error;
+    }
+    return work(agent);
+  }
+
+  private async findPlayerByLoginAs(
+    agent: IchancyAgent,
+    login: string,
+    context?: IchancyCallContext,
+  ): Promise<IchancyResult<FoundPlayer | null>> {
     const response = await this.send(
+      agent,
       'GET_PLAYERS_FOR_CURRENT_AGENT',
       IchancyEndpoint.GET_PLAYERS_FOR_CURRENT_AGENT,
       {
@@ -238,8 +348,6 @@ export class HttpIchancyAdapter implements IchancyPort {
     return ichancyOk({ ichancyPlayerId });
   }
 
-  // --------------------------------------------------------------------------------------------
-
   private async movePlayerFunds(
     direction: 'credit' | 'debit',
     input: PlayerMoveInput,
@@ -259,38 +367,42 @@ export class HttpIchancyAdapter implements IchancyPort {
       return ichancyRejected(code, describeError(error));
     }
 
-    const currency = this.config.ichancy.currency;
-    const response = await this.send(
-      direction === 'credit' ? 'DEPOSIT_TO_PLAYER' : 'WITHDRAW_FROM_PLAYER',
-      direction === 'credit'
-        ? IchancyEndpoint.DEPOSIT_TO_PLAYER
-        : IchancyEndpoint.WITHDRAW_FROM_PLAYER,
-      {
-        amount,
-        comment: input.comment,
-        playerId: input.ichancyPlayerId,
-        currencyCode: currency,
-        currency,
-        moneyStatus: MoneyStatus.PLAYER,
-      },
-      input.context,
-    );
-    if (!isIchancyOk(response)) return response;
+    return this.asCurrentAgent(async (agent) => {
+      const currency = agent.currency;
+      const response = await this.send(
+        agent,
+        direction === 'credit' ? 'DEPOSIT_TO_PLAYER' : 'WITHDRAW_FROM_PLAYER',
+        direction === 'credit'
+          ? IchancyEndpoint.DEPOSIT_TO_PLAYER
+          : IchancyEndpoint.WITHDRAW_FROM_PLAYER,
+        {
+          amount,
+          comment: input.comment,
+          playerId: input.ichancyPlayerId,
+          currencyCode: currency,
+          currency,
+          moneyStatus: MoneyStatus.PLAYER,
+        },
+        input.context,
+      );
+      if (!isIchancyOk(response)) return response;
 
-    // Documented success shapes: `{ balance, creditLine, ... }` or a bare `[]`. The empty array is
-    // still a success — it just leaves the resulting balance unknown, which the port models as null.
-    const record = readObjectResult(response.data?.result);
-    const balanceMinor = record ? tryParseWireMoney(record['balance']) : null;
-    return ichancyOk({ balanceMinor });
+      // Documented success shapes: `{ balance, creditLine, ... }` or a bare `[]`. The empty array is
+      // still a success — it just leaves the resulting balance unknown, which the port models as null.
+      const record = readObjectResult(response.data?.result);
+      const balanceMinor = record ? tryParseWireMoney(record['balance']) : null;
+      return ichancyOk({ balanceMinor });
+    });
   }
 
   /** Resolve the Ichancy player id for a login we just registered (or that already existed). */
   private async resolveEnsuredPlayer(
+    agent: IchancyAgent,
     input: EnsurePlayerInput,
     created: boolean,
     reason: string,
   ): Promise<IchancyResult<EnsuredPlayer>> {
-    const found = await this.findPlayerByLogin(input.login, input.context);
+    const found = await this.findPlayerByLoginAs(agent, input.login, input.context);
     if (!isIchancyOk(found)) return found;
     if (found.data === null) {
       return ichancyAmbiguous(
@@ -300,10 +412,13 @@ export class HttpIchancyAdapter implements IchancyPort {
     return ichancyOk({ ichancyPlayerId: found.data.ichancyPlayerId, created });
   }
 
-  /** Prefer our currency, then their "main" flag, then whatever came first. */
-  private pickWallet(rows: Record<string, unknown>[]): Record<string, unknown> | null {
+  /** Prefer the operator's currency, then their "main" flag, then whatever came first. */
+  private pickWallet(
+    rows: Record<string, unknown>[],
+    currencyCode: string,
+  ): Record<string, unknown> | null {
     if (rows.length === 0) return null;
-    const currency = this.config.ichancy.currency.toLowerCase();
+    const currency = currencyCode.toLowerCase();
     const byCurrency = rows.find((row) => {
       const code = row['currencyCode'];
       return typeof code === 'string' && code.toLowerCase() === currency;
@@ -317,6 +432,7 @@ export class HttpIchancyAdapter implements IchancyPort {
    * One attempt, then AT MOST one replay after a token refresh. Never more — see the file header.
    */
   private async send(
+    agent: IchancyAgent,
     operation: IchancyOperation,
     endpoint: IchancyEndpointName,
     body: Record<string, unknown>,
@@ -324,7 +440,7 @@ export class HttpIchancyAdapter implements IchancyPort {
   ): Promise<EnvelopeResult> {
     let accessToken: string;
     try {
-      accessToken = await this.session.getAccessToken();
+      accessToken = await this.session.getAccessToken(agent);
     } catch (error) {
       // Nothing was sent. This is the one auth failure we can honestly call a definite non-event.
       return ichancyRejected(sessionFailureCode(error), describeError(error));
@@ -334,6 +450,7 @@ export class HttpIchancyAdapter implements IchancyPort {
       operation,
       endpoint,
       body,
+      agent,
       accessToken,
       attempt: 1,
       context,
@@ -342,7 +459,7 @@ export class HttpIchancyAdapter implements IchancyPort {
 
     let refreshed: string;
     try {
-      refreshed = await this.session.refreshAfterUnauthorized(accessToken);
+      refreshed = await this.session.refreshAfterUnauthorized(agent, accessToken);
     } catch (error) {
       // A request has already been sent by now. It *looks* like it was refused at the door, but the
       // 201-means-unauthorized quirk means we cannot promise that, so this stays ambiguous.
@@ -355,6 +472,7 @@ export class HttpIchancyAdapter implements IchancyPort {
       operation,
       endpoint,
       body,
+      agent,
       accessToken: refreshed,
       attempt: 2,
       context,

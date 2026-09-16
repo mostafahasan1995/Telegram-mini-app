@@ -54,6 +54,16 @@ describe('buildClaimQuery', () => {
     expect(text).toContain('attempts = m.attempts + 1');
   });
 
+  it('selects the row tenant, because the consumer must not have to guess it', () => {
+    // The claim spans operators by design, so the row is the only place the tenant exists. Without
+    // this column the relay would have to re-read every claimed row to learn whose message it is.
+    expect(text).toContain('m.tenant_id AS "tenantId"');
+  });
+
+  it('does not filter by tenant, which is what makes one relay enough for every operator', () => {
+    expect(text).not.toContain('tenant_id =');
+  });
+
   it('returns an explicit, camelCase-aliased column list rather than m.*', () => {
     expect(text).toContain('RETURNING m.id');
     expect(text).toContain('m.aggregate_type AS "aggregateType"');

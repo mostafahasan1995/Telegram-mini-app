@@ -37,7 +37,16 @@
  * not know whether Telegram delivered it — grammY retries 429/5xx internally, and a timeout on the
  * far side of a successful send looks identical to a failure. Re-posting on a maybe would put the
  * same report in the group twice; staying quiet costs one period of an informational message that
- * any admin can reproduce with /report. So the ambiguous case keeps the claim.
+ * any admin can reproduce with /report. So the ambiguous case keeps the claim. An operator whose bot
+ * cannot be used at all is treated the same way: its report waits for the next window rather than
+ * rebuilding every ten minutes against a token nobody has fixed yet.
+ *
+ * ══ ONE REPORT PER OPERATOR ═══════════════════════════════════════════════════════════════════
+ * The report is an operator's own numbers, posted by that operator's bot into that operator's chat,
+ * exactly like the /report command an admin types into their own group. Each ACTIVE operator is
+ * handled inside its own tenant context, which is what scopes every count in the report to it, and
+ * under its own marker. A report spanning every operator, posted anywhere, would put one operator's
+ * deposits in front of another's staff. One operator failing is logged and never stops the next.
  */
 import { Injectable, Logger } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
@@ -46,12 +55,13 @@ import { LockService } from '@core/cache/lock.service';
 import { RedisService } from '@core/cache/redis.service';
 import { AppConfigService } from '@core/config/config.service';
 import { BotService } from '@core/telegram/services/bot.service';
+import { TenantRegistryService, runWithTenant } from '@core/tenant';
 
 import {
-  REPORT_LAST_POSTED_KEY,
   REPORT_SCHEDULE_INTERVAL_NAME,
   REPORT_SCHEDULE_LOCK_TTL_MS,
   REPORT_SCHEDULE_TICK_MS,
+  reportLastPostedKey,
 } from '../admin.constants';
 import { ActivityReportService, type ReportPeriodKey } from './activity-report.service';
 
@@ -117,6 +127,7 @@ export class ReportScheduleCron {
     private readonly locks: LockService,
     private readonly redis: RedisService,
     private readonly bot: BotService,
+    private readonly tenants: TenantRegistryService,
     private readonly config: AppConfigService,
   ) {}
 
@@ -138,7 +149,7 @@ export class ReportScheduleCron {
     try {
       // Captured ONCE: the same instant is the report's clock and the marker's value, so "last
       // posted at" and the header of the thing that was posted can never disagree.
-      await this.postIfDue(markerTtlSeconds, new Date());
+      await this.postDueReports(markerTtlSeconds, new Date());
     } catch (cause) {
       // A cron that throws is an unhandled rejection. It must be visible, and it must stop here.
       this.logger.error(
@@ -149,10 +160,26 @@ export class ReportScheduleCron {
     }
   }
 
+  /** Every serving operator, each in its own context, none able to stop the others. */
+  async postDueReports(markerTtlSeconds: number, now: Date): Promise<void> {
+    const operators = await this.tenants.listActiveOperators();
+    for (const operator of operators) {
+      try {
+        await runWithTenant(operator.id, () => this.postIfDue(operator.id, markerTtlSeconds, now));
+      } catch (cause) {
+        this.logger.error(
+          `scheduled report for tenant ${operator.slug} (${operator.id}) failed: ` +
+            `${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+    }
+  }
+
   /** Claim the window, or find out somebody already has. See the header for why SET NX EX. */
-  private async postIfDue(markerTtlSeconds: number, now: Date): Promise<void> {
+  private async postIfDue(tenantId: string, markerTtlSeconds: number, now: Date): Promise<void> {
+    const markerKey = reportLastPostedKey(tenantId);
     const claimed = await this.redis.set(
-      REPORT_LAST_POSTED_KEY,
+      markerKey,
       now.toISOString(),
       'EX',
       markerTtlSeconds,
@@ -174,32 +201,35 @@ export class ReportScheduleCron {
       body = await this.reports.buildReport(period, now);
     } catch (cause) {
       // The ONE place the claim is handed back — nothing has been sent, so a retry cannot duplicate.
-      await this.redis.del(REPORT_LAST_POSTED_KEY);
+      await this.redis.del(markerKey);
       throw cause;
     }
 
-    const delivered = await this.post(`${SCHEDULED_REPORT_HEADER}\n\n${body}`);
+    const delivered = await this.post(tenantId, `${SCHEDULED_REPORT_HEADER}\n\n${body}`);
     if (!delivered) {
       // BotService swallows "chat not found" / "not enough rights" and returns null, because for a
       // deposit notification that is not a failure of the deposit. For THIS it is the whole job, and
-      // it means a chat id is wrong or the bot was removed from the group — say so.
-      this.logger.warn('scheduled report was not delivered: the target chat is unreachable');
+      // it means a chat id is wrong or unset, or the bot was removed from the group — say so.
+      this.logger.warn(
+        `scheduled report for tenant ${tenantId} was not delivered: its chat is unset or unreachable`,
+      );
       return;
     }
 
     this.logger.log(
-      `scheduled report posted (${period.key}); next in ${this.config.telegram.reportScheduleHours}h`,
+      `scheduled report posted for tenant ${tenantId} (${period.key}); ` +
+        `next in ${this.config.telegram.reportScheduleHours}h`,
     );
   }
 
   /**
-   * WHERE IT POSTS: the feed group when one is configured, the ADMIN group when none is.
+   * WHERE IT POSTS: this operator's feed group when it has one that may see money, its ADMIN group
+   * otherwise — both read off the operator's own row, through the operator's own bot.
    *
-   * WHY NOT simply notifyFeed(): that call is a NO-OP when TELEGRAM_FEED_CHAT_ID is unset, and the
-   * deployment this was built for runs a SINGLE group. A scheduled report that silently posts
-   * nowhere because an OPTIONAL second group was never configured is a feature that does not exist,
-   * and nothing in the logs would say so. So the target is `feedChatId ?? adminChatId`, spelled as
-   * two calls because BotService is the only thing allowed to know the chat ids.
+   * WHY NOT simply notifyFeed(): that call is a NO-OP when the operator has no feed chat, and most
+   * operators run a SINGLE group. A scheduled report that silently posts nowhere because an OPTIONAL
+   * second group was never configured is a feature that does not exist, and nothing in the logs
+   * would say so. So the target is the feed chat or else the admin chat.
    *
    * THE FLOAT RULE — why the feed branch also requires feedFullDetail:
    * this report contains رصيد الكاشيرة, the ICHANCY_AGENT_FLOAT balance. That is the exact figure
@@ -212,19 +242,18 @@ export class ReportScheduleCron {
    * The two flags therefore mean one coherent thing: feedFullDetail is "this chat may see money",
    * and every float-bearing message honours it.
    *
-   * Returns false when Telegram says the chat cannot receive messages at all. The feed branch is
-   * only taken when a feed chat IS configured, so a false from it means "unreachable" and never
-   * "unconfigured" — the ambiguity notifyFeed() normally carries cannot arise here.
+   * Returns false when the operator has no usable chat, or Telegram says the chat cannot receive
+   * messages at all. Throws when the operator's bot itself cannot be used (TenantBotUnavailableError)
+   * or Telegram fails after its retries; postDueReports logs that and moves on.
    */
-  private async post(text: string): Promise<boolean> {
+  private async post(tenantId: string, text: string): Promise<boolean> {
     const options = { parseMode: 'HTML', linkPreview: false } as const;
-    const { feedChatId, feedFullDetail } = this.config.telegram;
+    const { adminChatId, feedChatId } = await this.bot.chatsOf(tenantId);
 
-    const sent =
-      feedChatId !== null && feedFullDetail
-        ? await this.bot.notifyFeed(text, options)
-        : await this.bot.notifyAdmins(text, options);
+    const target =
+      feedChatId !== null && this.config.telegram.feedFullDetail ? feedChatId : adminChatId;
+    if (target === null) return false;
 
-    return sent !== null;
+    return (await this.bot.sendMessage(tenantId, target, text, options)) !== null;
   }
 }

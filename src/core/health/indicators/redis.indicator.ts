@@ -3,16 +3,25 @@
  * distributed lock, so the Ichancy session cannot be refreshed safely and the per-player credit
  * mutex cannot be held. A process in that state must not receive traffic — it would either stall
  * or, worse, run money operations without the mutex that makes balance-delta verification valid.
+ *
+ * WHY the failure payload is a fixed "redis unreachable": the same reason as database.indicator.ts.
+ * /health/ready is public, and an ioredis message (NOAUTH, ECONNREFUSED redis:6379, an unexpected
+ * PING reply) tells an anonymous caller how the dependency is failing. The real error is logged.
  */
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { HealthIndicatorService, type HealthIndicatorResult } from '@nestjs/terminus';
 import { RedisService } from '../../cache/redis.service';
-import { withTimeout } from './database.indicator';
+import { describeError, withTimeout } from './database.indicator';
 
 const PROBE_TIMEOUT_MS = 1_000;
 
+/** Public, fixed failure message. Deliberately carries nothing from the error itself. */
+export const REDIS_DOWN_MESSAGE = 'redis unreachable';
+
 @Injectable()
 export class RedisHealthIndicator {
+  private readonly logger = new Logger(RedisHealthIndicator.name);
+
   constructor(
     private readonly redis: RedisService,
     private readonly indicator: HealthIndicatorService,
@@ -30,10 +39,11 @@ export class RedisHealthIndicator {
       if (pong !== 'PONG') throw new Error(`Unexpected PING reply: ${pong}`);
       return check.up({ responseTimeMs: Date.now() - startedAt });
     } catch (error: unknown) {
-      return check.down({
-        responseTimeMs: Date.now() - startedAt,
-        message: error instanceof Error ? error.message : String(error),
-      });
+      const responseTimeMs = Date.now() - startedAt;
+      this.logger.warn(
+        `Readiness check "${key}" failed after ${responseTimeMs}ms: ${describeError(error)}`,
+      );
+      return check.down({ responseTimeMs, message: REDIS_DOWN_MESSAGE });
     }
   }
 }

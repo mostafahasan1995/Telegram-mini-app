@@ -23,6 +23,7 @@ import { CommonErrorCodes } from '@common/exceptions/error-codes';
 import { AccountRegistryService, casinoMirrorCode, playerLiabilityCode } from '@core/ledger';
 import { ICHANCY_PORT, type IchancyPort } from '@core/ichancy';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 import { money, type PendingDepositView, type WalletView } from '../dtos/wallet.view';
 
@@ -49,7 +50,8 @@ export class WalletService {
 
   async getWallet(playerId: string): Promise<WalletView> {
     const player = await this.prisma.player.findUnique({
-      where: { id: playerId },
+      // The signed-in player's own operator (the `tid` of their session).
+      where: { id: playerId, tenantId: requireEffectiveTenantId() },
       select: { id: true, currencyCode: true, ichancyPlayerId: true },
     });
     if (player === null) {

@@ -14,6 +14,7 @@ import { PlayerAuth } from '@common/decorators/auth.decorator';
 import { CurrentPlayer } from '@common/decorators/current-principal.decorator';
 import { NotFoundError } from '@common/exceptions/app.exception';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 import { PaymentMethodErrorCodes } from '../payment-method.constants';
 import { PaymentMethodService } from '../services/payment-method.service';
@@ -85,7 +86,8 @@ export class PaymentMethodController {
 
   private async currencyOf(playerId: string): Promise<string> {
     const player = await this.prisma.player.findUnique({
-      where: { id: playerId },
+      // The signed-in player's own operator (the `tid` of their session).
+      where: { id: playerId, tenantId: requireEffectiveTenantId() },
       select: { currencyCode: true },
     });
     if (player === null) {

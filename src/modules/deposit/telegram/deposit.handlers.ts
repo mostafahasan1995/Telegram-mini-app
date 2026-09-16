@@ -36,12 +36,13 @@ import { PrismaService } from '@core/prisma/prisma.service';
 import { OnCallback, OnMessage } from '@core/telegram/decorators/handlers.decorator';
 import { BotService } from '@core/telegram/services/bot.service';
 import { decodeCallbackData } from '@core/telegram/utils/callback-data.util';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 import { DEPOSIT_CALLBACK_NS } from '../deposit.constants';
 import { DepositService } from '../services/deposit.service';
 import { DepositReviewService, type ReviewOutcome } from '../services/deposit-review.service';
 import { DepositRepository } from '../repositories/deposit.repository';
-import { renderAdminCard, renderAdminKeyboard } from './deposit-card.util';
+import { playerLabelOf, renderAdminCard, renderAdminKeyboard } from './deposit-card.util';
 
 /** Statuses a photo can still be attached to. Mirrors DepositService.assertAcceptsProof. */
 const PROOFABLE: readonly DepositStatus[] = Object.freeze([
@@ -79,8 +80,14 @@ export class DepositTelegramHandlers {
     // a payment proof, and attaching it to somebody's deposit would be worse than ignoring it.
     if (ctx.chat?.type !== 'private') return;
 
+    // The operator whose bot received this photo. An update carries nothing that names an operator;
+    // TelegramUpdateProcessor entered it from the webhook path token the update arrived on. A
+    // Telegram id is a player only within one operator, so every lookup below is pinned to it.
+    const tenantId = requireEffectiveTenantId();
     const player = await this.prisma.player.findUnique({
-      where: { telegramUserId: BigInt(from.id) },
+      where: {
+        tenantId_telegramUserId: { tenantId, telegramUserId: BigInt(from.id) },
+      },
       select: { id: true },
     });
     if (player === null) {
@@ -89,7 +96,9 @@ export class DepositTelegramHandlers {
     }
 
     const open = await this.prisma.depositRequest.findMany({
-      where: { playerId: player.id, status: { in: [...PROOFABLE] } },
+      // Spelled out as well as injected by the tenant-scope extension: this is the query that picks
+      // which deposit a receipt lands on, and its operator should be visible where it is decided.
+      where: { tenantId, playerId: player.id, status: { in: [...PROOFABLE] } },
       orderBy: { createdAt: 'desc' },
       take: 5,
       select: { id: true, shortId: true, status: true },
@@ -121,6 +130,7 @@ export class DepositTelegramHandlers {
       // Streamed straight into the bucket — never buffered. Normalization happens on the media
       // queue afterwards; see ProofIngestService.
       const stored = await this.files.fetchToStorage(
+        tenantId,
         largest.file_id,
         rawProofKey(target.id, `${largest.file_unique_id}.jpg`),
       );
@@ -177,22 +187,33 @@ export class DepositTelegramHandlers {
     const from = ctx.from;
     if (query === undefined || from === undefined) return;
 
+    // The operator whose bot carries this button, entered by TelegramUpdateProcessor. Both the reply
+    // and the authority check below belong to it.
+    const tenantId = requireEffectiveTenantId();
+
     const decoded = decodeCallbackData(query.data);
     if (decoded === null || decoded.ns !== DEPOSIT_CALLBACK_NS) {
-      await this.bot.answerCallback(query.id, 'That button is no longer valid.');
+      await this.bot.answerCallback(tenantId, query.id, 'That button is no longer valid.');
       return;
     }
 
     const depositRequestId = decoded.args[0];
     if (depositRequestId === undefined) {
-      await this.bot.answerCallback(query.id, 'That button is missing its deposit.');
+      await this.bot.answerCallback(tenantId, query.id, 'That button is missing its deposit.');
       return;
     }
 
-    // THE authority check. Never the chat, always the tapper — see the header.
-    const admin = await this.admins.resolve(BigInt(from.id));
+    // THE authority check. Never the chat, always the tapper — see the header. It is measured in the
+    // operator that received the tap: staff of another operator are nobody here, even if the same
+    // Telegram account is an admin there.
+    const admin = await this.admins.resolveByTelegram(tenantId, BigInt(from.id));
     if (admin === null) {
-      await this.bot.answerCallback(query.id, 'You are not authorised to act on deposits.', true);
+      await this.bot.answerCallback(
+        tenantId,
+        query.id,
+        'You are not authorised to act on deposits.',
+        true,
+      );
       this.logger.warn(
         `non-admin telegram user ${from.id} tapped a deposit button on ${depositRequestId}`,
       );
@@ -201,14 +222,14 @@ export class DepositTelegramHandlers {
 
     try {
       const outcome = await this.dispatch(decoded.action, depositRequestId, admin);
-      await this.bot.answerCallback(query.id, this.describe(outcome, admin));
+      await this.bot.answerCallback(tenantId, query.id, this.describe(outcome, admin));
     } catch (cause) {
       const message = isAppException(cause) ? cause.message : 'That action could not be completed.';
       this.logger.warn(
         `deposit callback ${decoded.action} on ${depositRequestId} by ${admin.displayName} failed: ` +
           (cause instanceof Error ? cause.message : String(cause)),
       );
-      await this.bot.answerCallback(query.id, message, true);
+      await this.bot.answerCallback(tenantId, query.id, message, true);
     }
 
     // Redraw the SAME message, whatever happened — including on failure, because a failure usually
@@ -271,7 +292,14 @@ export class DepositTelegramHandlers {
     const message = ctx.callbackQuery?.message;
     if (message === undefined) return;
 
-    const deposit = await this.deposits.findByIdWithContext(this.prisma, depositRequestId);
+    // The operator whose bot received the tap. A button naming another operator's deposit — an
+    // operator owns its bot token and can post any callback data it likes — finds nothing here and
+    // the card is left alone, rather than being redrawn with that operator's deposit on it.
+    const deposit = await this.deposits.findByIdWithContextInTenant(
+      this.prisma,
+      requireEffectiveTenantId(),
+      depositRequestId,
+    );
     if (deposit === null) return;
 
     const riskFlags = await this.depositService.riskFlagsFor(this.prisma, deposit.id);
@@ -279,7 +307,7 @@ export class DepositTelegramHandlers {
       deposit.decidedByAdminId === null
         ? null
         : await this.prisma.adminUser.findUnique({
-            where: { id: deposit.decidedByAdminId },
+            where: { id: deposit.decidedByAdminId, tenantId: deposit.tenantId },
             select: { displayName: true },
           });
 
@@ -287,10 +315,7 @@ export class DepositTelegramHandlers {
       deposit,
       proofs: deposit.proofs,
       riskFlags,
-      playerLabel:
-        deposit.player.telegramUsername === null
-          ? `id ${deposit.player.telegramUserId.toString()}`
-          : `@${deposit.player.telegramUsername} (${deposit.player.telegramUserId.toString()})`,
+      playerLabel: playerLabelOf(deposit.player),
       paymentMethodName: deposit.paymentMethod.displayName,
       destinationLabel: deposit.paymentDestination?.label ?? null,
       reviewerLabel:
@@ -298,7 +323,7 @@ export class DepositTelegramHandlers {
       requiresSecondApproval: deposit.status === DepositStatus.PENDING_SECOND_APPROVAL,
     });
 
-    await this.bot.editMessageText(message.chat.id, message.message_id, text, {
+    await this.bot.editMessageText(deposit.tenantId, message.chat.id, message.message_id, text, {
       parseMode: 'HTML',
       replyMarkup: renderAdminKeyboard(deposit),
       linkPreview: false,
@@ -307,7 +332,7 @@ export class DepositTelegramHandlers {
     // Keep the stored coordinates fresh: an admin may be acting on a card posted before a restart,
     // or on one the notifier has never seen (a manually forwarded message).
     if (deposit.adminMessageId === null) {
-      await this.deposits.recordAdminCard(this.prisma, deposit.id, {
+      await this.deposits.recordAdminCard(this.prisma, deposit.tenantId, deposit.id, {
         chatId: BigInt(message.chat.id),
         messageId: BigInt(message.message_id),
         threadId: null,

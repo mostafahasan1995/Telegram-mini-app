@@ -43,8 +43,12 @@ export class AdminApprovalLimitRepository extends BaseRepository<
     return client.adminApprovalLimit;
   }
 
-  findById(id: string, tx?: Tx): Promise<AdminApprovalLimit | null> {
-    return this._findUnique({ id }, tx);
+  /**
+   * Tenant-bound for the same reason as AdminUserRepository.findByIdInTenant: `id` is the whole
+   * primary key, so a bare `findUnique` would let one operator end another operator's ceilings.
+   */
+  findByIdInTenant(tenantId: string, id: string, tx?: Tx): Promise<AdminApprovalLimit | null> {
+    return this._findFirst({ where: { tenantId, id } }, tx);
   }
 
   /**
@@ -96,8 +100,11 @@ export class AdminApprovalLimitRepository extends BaseRepository<
     );
   }
 
-  /** Ends one specific version. */
-  close(id: string, at: Date, tx?: Tx): Promise<AdminApprovalLimit> {
-    return this._update({ id }, { effectiveTo: at }, tx);
+  /**
+   * Ends one specific version. The tenant sits in the unique selector as well as the id, so a
+   * write can never land in an operator the caller did not read it from.
+   */
+  close(tenantId: string, id: string, at: Date, tx?: Tx): Promise<AdminApprovalLimit> {
+    return this._update({ id, tenantId }, { effectiveTo: at }, tx);
   }
 }

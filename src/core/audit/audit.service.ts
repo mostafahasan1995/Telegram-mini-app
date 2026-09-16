@@ -19,6 +19,7 @@ import { uuidv7 } from 'uuidv7';
 import { Prisma } from '@prisma/client';
 
 import { toJsonObject, toNullableJson } from '@core/queue/json.util';
+import { requireEffectiveTenantId } from '@core/tenant';
 import type { Tx } from '@core/prisma/tx.type';
 
 import { AUDIT_AMOUNT_KEY, AUDIT_CONTEXT_KEY, type AuditWriteInput } from './audit.types';
@@ -35,7 +36,7 @@ export class AuditService {
 
   /** Returns the audit row id, so a caller can reference it from a transition or a break. */
   async write(tx: Tx, input: AuditWriteInput): Promise<string> {
-    const data = this.buildRow(input);
+    const data = this.buildRow(requireEffectiveTenantId(), input);
     await tx.auditLog.create({ data, select: { id: true } });
     return data.id;
   }
@@ -46,13 +47,24 @@ export class AuditService {
    */
   async writeMany(tx: Tx, inputs: readonly AuditWriteInput[]): Promise<string[]> {
     if (inputs.length === 0) return [];
-    const rows = inputs.map((input) => this.buildRow(input));
+    // Resolved once for the whole batch: a bulk approval is one decision and its evidence must not
+    // end up split across two operators if the ambient context moves mid-loop.
+    const tenantId = requireEffectiveTenantId();
+    const rows = inputs.map((input) => this.buildRow(tenantId, input));
     await tx.auditLog.createMany({ data: rows });
     return rows.map((row) => row.id);
   }
 
-  private buildRow(input: AuditWriteInput): Prisma.AuditLogCreateManyInput & { id: string } {
+  /**
+   * The EFFECTIVE tenant, never the actor's home one: when platform staff act on operator X, the
+   * evidence has to land in X's log, because X's auditor is the one who will come looking for it.
+   */
+  private buildRow(
+    tenantId: string,
+    input: AuditWriteInput,
+  ): Prisma.AuditLogCreateManyInput & { id: string } {
     return {
+      tenantId,
       // uuidv7 rather than the column default: an append-only log is read in time order, and a
       // time-ordered primary key makes that an index scan instead of a sort.
       id: uuidv7(),

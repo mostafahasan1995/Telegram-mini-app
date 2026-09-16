@@ -19,6 +19,7 @@ import { Injectable } from '@nestjs/common';
 import { uuidv7 } from 'uuidv7';
 
 import { toJsonObject } from '@core/queue/json.util';
+import { requireEffectiveTenantId } from '@core/tenant';
 import type { Tx } from '@core/prisma/tx.type';
 import type { OutboxEnqueueInput, OutboxEnqueueResult } from './outbox.types';
 
@@ -48,8 +49,20 @@ export class OutboxService {
   async enqueueMany(tx: Tx, inputs: readonly OutboxEnqueueInput[]): Promise<OutboxEnqueueResult[]> {
     if (inputs.length === 0) return [];
 
+    // One tenant for the whole batch, and the same one the caller's money write is using: a side
+    // effect belongs to the operator whose row caused it, and the dedupe index is now
+    // UNIQUE(tenant_id, dedupe_key), so the insert and the lookup below must agree on it.
+    //
+    // Throwing when there is no context is the point: the producer always runs inside one (a
+    // request, or a worker that entered runWithTenant), and a row written without an operator could
+    // never be dispatched back into the right one. The relay carries this value forward — it claims
+    // across operators and hands it to the dispatch processor, which is why nothing downstream ever
+    // has to guess.
+    const tenantId = requireEffectiveTenantId();
+
     const rows = inputs.map((input) => ({
       id: uuidv7(),
+      tenantId,
       aggregateType: input.aggregateType,
       aggregateId: input.aggregateId,
       topic: input.topic,
@@ -72,7 +85,7 @@ export class OutboxService {
     const existing =
       dedupeKeys.length > 0
         ? await tx.outboxMessage.findMany({
-            where: { dedupeKey: { in: dedupeKeys } },
+            where: { tenantId, dedupeKey: { in: dedupeKeys } },
             select: { id: true, dedupeKey: true },
           })
         : [];

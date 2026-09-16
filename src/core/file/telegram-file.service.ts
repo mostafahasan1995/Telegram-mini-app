@@ -16,7 +16,6 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { Readable } from 'node:stream';
 import type { ReadableStream as WebReadableStream } from 'node:stream/web';
 
-import { AppConfigService } from '@core/config/config.service';
 import { BotService } from '@core/telegram/services/bot.service';
 
 import { FileErrorCodes, FileStorageError } from './file.errors';
@@ -54,7 +53,6 @@ export class TelegramFileService {
 
   constructor(
     private readonly bot: BotService,
-    private readonly config: AppConfigService,
     @Inject(FILE_STORAGE) private readonly storage: FileStorage,
   ) {}
 
@@ -68,15 +66,30 @@ export class TelegramFileService {
    * Resolve a Telegram file_id and stream it into object storage under `key`.
    * `maxBytes` defaults to MAX_PROOF_BYTES and is enforced twice: against the declared size and
    * against the bytes that actually arrive.
+   *
+   * `tenantId` is the operator whose bot RECEIVED the file. A file_id is only valid for the bot it
+   * was sent to, and the download URL embeds that bot's token, so both the getFile and the download
+   * must use that operator's bot and nobody else's.
    */
   async fetchToStorage(
+    tenantId: string,
     fileId: string,
     key: string,
     maxBytes: number = MAX_PROOF_BYTES,
   ): Promise<FetchedTelegramFile> {
     const cap = Math.min(maxBytes, TELEGRAM_MAX_DOWNLOAD_BYTES);
 
-    const file = await this.bot.api.getFile(fileId).catch((cause: unknown) => {
+    const bot = await this.bot.forTenant(tenantId).catch((cause: unknown) => {
+      throw new FileStorageError(
+        FileErrorCodes.TELEGRAM_FILE_UNAVAILABLE,
+        `No usable Telegram bot for tenant ${tenantId}: ${
+          cause instanceof Error ? cause.message : String(cause)
+        }`,
+        { fileId, tenantId },
+      );
+    });
+
+    const file = await bot.api.getFile(fileId).catch((cause: unknown) => {
       throw new FileStorageError(
         FileErrorCodes.TELEGRAM_FILE_UNAVAILABLE,
         `Telegram refused getFile for ${fileId}: ${
@@ -105,7 +118,7 @@ export class TelegramFileService {
     }
 
     const mimeType = this.mimeTypeFor(filePath);
-    const url = `https://api.telegram.org/file/bot${this.config.telegram.botToken}/${filePath}`;
+    const url = `https://api.telegram.org/file/bot${bot.token}/${filePath}`;
 
     const response = await fetch(url).catch((cause: unknown) => {
       throw new FileStorageError(

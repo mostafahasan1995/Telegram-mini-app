@@ -288,26 +288,63 @@ append-only ledger, no four-eyes check.
 
 ### Step 6 — seed
 
+There are two seeds, and they are for different machines.
+
+**The first admin — any machine, production included:**
+
+```bash
+read -rs SEED_PLATFORM_ADMIN_PASSWORD && export SEED_PLATFORM_ADMIN_PASSWORD   # typed, not echoed
+SEED_PLATFORM_ADMIN_USERNAME=owner npm run seed:platform-admin
+unset SEED_PLATFORM_ADMIN_PASSWORD
+```
+
+This creates **one** `PLATFORM_ADMIN` in tenant zero. You sign into the dashboard with that username
+and password, and do everything else there (create operators, paste their bot tokens, add staff).
+It needs no Telegram bot token and no `JWT_SECRET`. It prints only the username and `created`,
+`updated` or `unchanged`.
+
+Running it again is safe. It re-activates the admin if someone switched it off, but it **does not
+change the password** unless you add `SEED_PLATFORM_ADMIN_RESET_PASSWORD=1`. If the username is
+already used by another role in tenant zero, it refuses. Bad input exits non-zero with a message
+saying what to fix.
+
+With Docker (the `tools` image), a bare `-e NAME` passes your shell's value through, so the
+password never appears in the command or in shell history:
+
+```bash
+read -rs SEED_PLATFORM_ADMIN_PASSWORD && export SEED_PLATFORM_ADMIN_PASSWORD
+docker compose run --rm -e SEED_PLATFORM_ADMIN_USERNAME=owner -e SEED_PLATFORM_ADMIN_PASSWORD \
+  tools npm run seed:platform-admin
+unset SEED_PLATFORM_ADMIN_PASSWORD
+```
+
+PowerShell — read the password as a secure string, put it in the environment for this one command,
+then remove it:
+
+```powershell
+$secure = Read-Host -AsSecureString 'Platform admin password'
+$env:SEED_PLATFORM_ADMIN_PASSWORD = [System.Net.NetworkCredential]::new('', $secure).Password
+docker compose run --rm -e SEED_PLATFORM_ADMIN_USERNAME=owner -e SEED_PLATFORM_ADMIN_PASSWORD tools npm run seed:platform-admin
+Remove-Item Env:SEED_PLATFORM_ADMIN_PASSWORD; Remove-Variable secure
+```
+
+**Development fixtures — your own machine only:**
+
 ```bash
 npm run seed
 ```
 
-This creates: the NSP currency, two payment methods, the ledger accounts, and one owner admin.
-
-To create the owner admin, set this first (your Telegram user id — ask `@userinfobot`):
-
-```bash
-SEED_ADMIN_TELEGRAM_ID=123456789
-SEED_ADMIN_DISPLAY_NAME="Your Name"
-```
+This creates: the NSP currency, the two baseline tenants (when the migration did not), two payment
+methods and the ledger accounts. If `SEED_PLATFORM_ADMIN_USERNAME` and
+`SEED_PLATFORM_ADMIN_PASSWORD` are set, it also runs the platform-admin seed above.
 
 The seed is safe to run again. It never makes copies.
 
 > The seed creates **placeholder** payment destinations. A player who pays into them sends money
 > nowhere. Replace them before you take real money. The seed prints a big warning about this.
 
-The seed **refuses to run** when `NODE_ENV=production`. That is on purpose. If you really mean it:
-`SEED_ALLOW_PRODUCTION=1 npm run seed`.
+`npm run seed` **refuses to run** when `NODE_ENV=production` (the `tools` image sets it). That is on
+purpose. If you really mean it: `SEED_ALLOW_PRODUCTION=1 npm run seed`.
 
 ### Step 7 — run it
 
@@ -325,15 +362,31 @@ Now open http://localhost:3000/docs to see the API.
 
 ### Step 8 — connect Telegram (only when you have a public https URL)
 
+There is **no bot token in `.env`**. Every operator has its own bot: a platform admin pastes its
+token in the dashboard, and the operator's webhook path token, webhook secret, admin chat and feed
+chat are stored on its tenant row. The api and the worker boot with no Telegram settings at all.
+
+The dashboard registers an operator's webhook. These commands re-register existing ones, for
+example after `API_BASE_URL` changed. Each one names its operator(s):
+
 ```bash
-npm run webhook:set
-npm run webhook:set -- --info          # just look, change nothing
-npm run webhook:set -- --drop-pending  # after a long outage
-npm run bot:setup                      # push command menus, bot description and menu button (safe to re-run)
+npm run webhook:set -- --tenant <slug>                 # one operator (any status)
+npm run webhook:set -- --all-active                    # every ACTIVE operator
+npm run webhook:set -- --tenant <slug> --info          # just look, change nothing
+npm run webhook:set -- --all-active --drop-pending     # after a long outage
+npm run bot:setup -- --tenant <slug>                   # push that bot's menus, description and menu button (safe to re-run)
+npm run tunnel:sync                                    # laptop: ngrok URL -> API_BASE_URL -> webhook:set --all-active
 ```
 
-This is a **manual** step on purpose. It is a global change to your bot. It must not happen
+`webhook:set` never creates a path token or secret. An operator without them gets a clear refusal:
+generate its webhook from the dashboard first.
+
+This is a **manual** step on purpose. It is a global change to each bot. It must not happen
 automatically on every deploy.
+
+**Mini App sign-in, for now:** only the bootstrap operator's (`default`) players can sign in to the
+mini app. The mini app does not yet say which operator it was opened for, so initData is checked
+against that one operator's bot token. Other operators' bots work fully in Telegram.
 
 ---
 
@@ -374,6 +427,11 @@ looks wrong, and it prints **all** the problems at once, not just the first.
 
 That is on purpose. A cashier that starts half-configured takes money it cannot deliver.
 
+**Retired, and ignored if still present:** `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`,
+`TELEGRAM_WEBHOOK_PATH_TOKEN`, `TELEGRAM_ADMIN_CHAT_ID`, `TELEGRAM_FEED_CHAT_ID`. An old env file that
+still has them boots fine and logs one warning naming them. Each operator's bot token, webhook and
+chats are set in the dashboard and stored on its tenant row. Delete the lines.
+
 ### The main ones
 
 | Variable                                | What it is                                                                           |
@@ -381,21 +439,16 @@ That is on purpose. A cashier that starts half-configured takes money it cannot 
 | `APP_ROLE`                              | `api` or `worker`. Nothing else.                                                     |
 | `NODE_ENV`                              | `development`, `test`, or `production`.                                              |
 | `PORT`                                  | HTTP port for the api.                                                               |
-| `API_BASE_URL`                          | Public URL of this service. Used to build the webhook URL.                           |
+| `API_BASE_URL`                          | Public URL of this service. Each operator's webhook is `<this>/telegram/webhook/<its path token>`. |
 | `DATABASE_URL`                          | PostgreSQL. Must be a **non-owner** role, or `003_app_role_grants.sql` does nothing. |
 | `REDIS_URL`                             | Redis. Used for queues, locks, sessions, and rate limits.                            |
 | `JWT_SECRET`                            | At least 16 characters. At least 32 in production.                                   |
-| `TELEGRAM_BOT_TOKEN`                    | From `@BotFather`.                                                                   |
-| `TELEGRAM_WEBHOOK_SECRET`               | We check this header on every update.                                                |
-| `TELEGRAM_WEBHOOK_PATH_TOKEN`           | Random text in the webhook URL, so nobody can guess it.                              |
-| `TELEGRAM_ADMIN_CHAT_ID`                | The group that gets the review cards. Negative for supergroups.                      |
-| `TELEGRAM_FEED_CHAT_ID`                 | Optional. A second group that also gets the credit card, **masked**. Empty = off.    |
-| `TELEGRAM_FEED_FULL_DETAIL`             | Optional. `true` posts the full card to the feed. Default `false` = masked.          |
-| `REPORT_SCHEDULE_HOURS`                 | Hours between automatic `/report` posts. Default `6`. `0` or empty = off.            |
+| `TELEGRAM_FEED_FULL_DETAIL`             | Optional. `true` posts the full card to operators' feed groups. Default `false` = masked. |
+| `REPORT_SCHEDULE_HOURS`                 | Hours between automatic `/report` posts, per operator. Default `6`. `0` or empty = off. |
 | `MINI_APP_ORIGIN`                       | Comma-separated. CORS allow-list. Must be `https` in production.                     |
 | `ICHANCY_BASE_URL`                      | The agent API.                                                                       |
-| `ICHANCY_USERNAME` / `ICHANCY_PASSWORD` | Agent login. **Only the worker uses these.**                                         |
-| `ICHANCY_AGENT_ID`                      | Our `affiliateId`. Used as `parentId` when we register a player.                     |
+| `ICHANCY_USERNAME` / `ICHANCY_PASSWORD` | Optional, seed-only. **No Ichancy call uses them**: each operator's agent login lives on its tenant row, set in the dashboard. |
+| `ICHANCY_AGENT_ID`                      | Optional, seed-only (PlatformDefaults). Each operator's `parentId` is the agent id on its own tenant row. |
 | `ICHANCY_TRANSPORT`                     | `browser` (default) or `fetch`. See Step 1. `browser` needs Chromium or boot fails.  |
 | `ICHANCY_BROWSER_HEADLESS`              | Default `true`. `false` on a desktop when a challenge refuses to clear headless.      |
 | `ICHANCY_COOKIE`                        | Fetch mode: the full cookie jar. Browser mode: only the panel half is seeded.         |
@@ -414,12 +467,12 @@ These are read straight from the environment. They all have safe defaults.
 | `ICHANCY_FAKE`                  | fake when `NODE_ENV=test`  | `1` = use the fake casino. No real money moves.                             |
 | `FILE_STORAGE_DRIVER`           | `local` in test, else `s3` | `local` writes photos to disk.                                              |
 | `FILE_STORAGE_LOCAL_DIR`        | temp folder                | Where `local` writes.                                                       |
-| `SEED_ADMIN_TELEGRAM_ID`        | —                          | Telegram id of the first admin. No value = no admin is created.             |
+| `SEED_PLATFORM_ADMIN_USERNAME`  | —                          | `seed:platform-admin`: the console login. 3–64 of `A-Z a-z 0-9 . _ @ + -`.  |
+| `SEED_PLATFORM_ADMIN_PASSWORD`  | —                          | `seed:platform-admin`: 8–72 characters. Never printed. See Step 6.          |
+| `SEED_PLATFORM_ADMIN_RESET_PASSWORD` | —                     | `1` = replace the password of an existing platform admin.                   |
 | `SEED_ADMIN_DISPLAY_NAME`       | `Owner`                    | Name shown in the panel.                                                    |
-| `SEED_ADMIN_USERNAME`           | —                          | Telegram `@username`, without the `@`.                                      |
-| `SEED_ADMIN_SINGLE_LIMIT_MINOR` | `500000000`                | Most the first admin may approve at once.                                   |
-| `SEED_ADMIN_DAILY_LIMIT_MINOR`  | `5000000000`               | Most the first admin may approve per day.                                   |
-| `SEED_ALLOW_PRODUCTION`         | —                          | `1` lets the seed run with `NODE_ENV=production`.                           |
+| `SEED_ADMIN_TELEGRAM_ID`        | —                          | Optional, digits. Adopts a platform admin left by the old Telegram-id seed. It does not give this admin the bot: the bot only knows its own operator's staff. |
+| `SEED_ALLOW_PRODUCTION`         | —                          | `1` lets the fixture seed (`npm run seed`) run with `NODE_ENV=production`.  |
 | `SEED_DATABASE_URL`             | `DATABASE_URL`             | Seed with a different (owner) connection.                                   |
 | `MIGRATE_DATABASE_URL`          | `DATABASE_URL`             | Migrate as the schema owner.                                                |
 | `POSTGRES_TEST_URL`             | —                          | Integration tests use this database instead of starting a container.        |

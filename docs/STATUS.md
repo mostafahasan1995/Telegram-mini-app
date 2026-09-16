@@ -1,6 +1,43 @@
 # Status — where we are, what is left
 
-Last updated: **2026-08-14**. Update this file when something big changes.
+Last updated: **2026-09-11**. Update this file when something big changes.
+
+## ⚠️ Read this first — the rebuild (2026-09-11)
+
+Work done on this backend between **2026-08-20 and 2026-09-09 was never pushed**, and the machine
+holding it has since crashed. It is gone. The dashboard's work of the same period *was* pushed, and
+because the dashboard is an API client, its contract doc, MSW mocks and types state exactly what the
+missing backend must do — so the rebuild is transcription, not guesswork.
+
+- **[`RECOVERY-PLAN.md`](./RECOVERY-PLAN.md)** — the dependency-ordered map, 11 phases.
+- **[`RECOVERY-GAPS.json`](./RECOVERY-GAPS.json)** — all 255 audited gaps with concrete
+  request/response shapes. This is the input when rebuilding an endpoint.
+
+**Everything below this section predates that and describes the 2026-08-14 single-tenant world.**
+Treat any specific count in it (endpoints, tests, handlers) as historical. Two lines in it are now
+simply wrong and are left in place rather than quietly edited, because the reason they were written
+still matters: "Nothing is committed to git" — it is now, on GitHub, which is the only reason this
+much survived; and "the whole project is uncommitted files on one machine" — that is precisely the
+failure that happened.
+
+### Phase 1 — multi-tenant core: DONE (2026-09-11)
+
+| What | Proof |
+|---|---|
+| `Tenant` + `PlatformDefaults`, `TenantStatus` / `DepositMode` / `WithdrawalMode`, `AdminRole.PLATFORM_ADMIN` | `prisma validate` clean; migration applies with zero drift |
+| 20 models tenant-scoped; former global uniques are now composite | the composite keys make `findUnique`/`update`/`delete` **impossible to call without a tenant** — that is the primary control, not the extension |
+| HOME (signed `tid`) vs EFFECTIVE (`X-Tenant-Id`) kept as two separate things | `src/core/tenant/tenant.storage.ts` |
+| List/aggregate queries scoped at runtime, **including inside `$transaction`** | `scripts/verify-tenant-scope.ts` — 6/6 against live postgres:17 |
+| Migration safe on a database that already holds data | tested on one with players, deposits, admins and rails: nullable → backfill → `NOT NULL` |
+| Cross-tenant references impossible at the database | `prisma/sql/006_tenant_isolation.sql` — 13 composite FKs, verified |
+| Workers, crons and processors carry a tenant | each job names its own; `grep acrossTenants` lists every deliberate cross-operator read |
+
+Verified at the close of the phase: `tsc` 0 errors · eslint 0 · **897/898 unit tests**. The one
+failure, `image.util.spec.ts`, is a pre-existing `sharp` timeout unrelated to this work.
+
+**Known gap carried forward:** invariant **I2** ("all entries in a currency sum to zero") is computed
+across every operator and names no owner, so it is logged and alerted but cannot be filed as a
+reconciliation break. Closing it needs `InvariantsService` to group by tenant.
 
 ## ✅ Done and verified
 

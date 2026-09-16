@@ -12,20 +12,19 @@
  * module would be providing its own — which is precisely the duplicate-implementation failure the
  * ports exist to prevent.
  *
- * Run with:  npx jest --runInBand src/modules/deposit/deposit.di.int.spec.ts
- * Requires the dev containers (docker compose up -d postgres redis).
+ * Postgres and Redis come from the shared harness (test/setup): throwaway containers under
+ * `npm run test:int`, or the escape hatch when both variables are set:
+ *   POSTGRES_TEST_URL=... REDIS_TEST_URL=... npx jest --config jest-int.config.cjs \
+ *     --runInBand src/modules/deposit/deposit.di.int.spec.ts
  */
 process.env['APP_ROLE'] = 'api';
 process.env['NODE_ENV'] = 'test';
 process.env['PORT'] = '3000';
 process.env['API_BASE_URL'] = 'http://localhost:3000';
-process.env['DATABASE_URL'] ??= 'postgresql://ichancy:ichancy@localhost:55432/ichancy';
-process.env['REDIS_URL'] ??= 'redis://localhost:6379';
+// DATABASE_URL and REDIS_URL are NOT set here: they are the harness's addresses, applied in beforeAll
+// before the graph is imported. No address is guessed, and a developer's DATABASE_URL is never used:
+// localhost:55432 is also where a live cashier stack publishes Postgres on a developer machine.
 process.env['JWT_SECRET'] = 'integration-test-secret-value-32-chars';
-process.env['TELEGRAM_BOT_TOKEN'] = '123456:AAtest_token_for_integration_only';
-process.env['TELEGRAM_WEBHOOK_SECRET'] = 'integration_webhook_secret_value';
-process.env['TELEGRAM_WEBHOOK_PATH_TOKEN'] = 'inttestpath';
-process.env['TELEGRAM_ADMIN_CHAT_ID'] = '-1001234567890';
 process.env['MINI_APP_ORIGIN'] = 'http://localhost:5173';
 process.env['ICHANCY_BASE_URL'] = 'http://localhost:9';
 process.env['ICHANCY_USERNAME'] = 'agent';
@@ -46,34 +45,11 @@ process.env['FILE_STORAGE_DRIVER'] = 'local';
 import { Global, Module } from '@nestjs/common';
 import { Test, type TestingModule } from '@nestjs/testing';
 
-import { ActorContextModule } from '@core/actor-context/actor-context.module';
-import { AuditModule } from '@core/audit/audit.module';
-import { CacheModule } from '@core/cache/cache.module';
-import { AppConfigModule } from '@core/config/config.module';
-import { IdempotencyModule } from '@core/idempotency/idempotency.module';
-import { LedgerModule } from '@core/ledger';
-import { OutboxModule } from '@core/outbox/outbox.module';
-import { PrismaModule } from '@core/prisma/prisma.module';
-import { QueueModule } from '@core/queue/queue.module';
+import { applyTestEnv } from '../../../test/setup/test-env';
+import { startPostgres, stopPostgres } from '../../../test/setup/postgres-container';
+import { startRedis, stopRedis } from '../../../test/setup/redis-container';
 
-import { DepositModule } from './deposit.module';
-import { DepositStateMachine } from './deposit-state.machine';
-import { DepositOutboxHandler } from './outbox/deposit-outbox.handler';
-import { CreditDepositProcessor } from './processors/credit-deposit.processor';
-import { IngestProofProcessor } from './processors/ingest-proof.processor';
-import { NotifyProcessor } from './processors/notify.processor';
-import { DepositRepository } from './repositories/deposit.repository';
-import { DepositCreditService } from './services/deposit-credit.service';
-import { DepositExpiryCron } from './services/deposit-expiry.cron';
-import { DepositSweepService } from './services/deposit-sweep.service';
-import { DepositNotifyService } from './services/deposit-notify.service';
-import { DepositPolicyService } from './services/deposit-policy.service';
-import { DepositRetryService } from './services/deposit-retry.service';
-import { DepositReviewService } from './services/deposit-review.service';
-import { DepositService } from './services/deposit.service';
-import { ProofDuplicateService } from './services/proof-duplicate.service';
-import { ProofIngestService } from './services/proof-ingest.service';
-import { DepositTelegramHandlers } from './telegram/deposit.handlers';
+// Tokens and structural interfaces only: nothing here evaluates a Nest module.
 import {
   APPROVAL_LIMIT_PORT,
   PAYMENT_METHOD_PORT,
@@ -83,17 +59,104 @@ import {
   type PlayerLinkPort,
 } from './ports';
 
-import { WalletModule } from '../wallet/wallet.module';
-import { WalletService } from '../wallet/services/wallet.service';
-
-import { ReconciliationModule } from '../reconciliation/reconciliation.module';
-import { AgentFloatSyncService } from '../reconciliation/services/agent-float-sync.service';
-import { InvariantCheckCron } from '../reconciliation/services/invariant-check.cron';
-import { RailAgeingService } from '../reconciliation/services/rail-ageing.service';
-import { ReconciliationBreakService } from '../reconciliation/services/reconciliation-break.service';
-import { ReconProcessor } from '../reconciliation/processors/recon.processor';
-
 jest.setTimeout(60_000);
+
+/** Starting the containers and pushing the schema on a cold runner; the int config's own default. */
+const BOOT_TIMEOUT_MS = 120_000;
+
+/**
+ * The graph under test, imported once the environment is complete. @nestjs/config validates the
+ * environment when config.module.ts is EVALUATED, so a static import would validate it before the
+ * harness has given DATABASE_URL and REDIS_URL a value.
+ */
+async function loadGraph() {
+  const { ActorContextModule } = await import('@core/actor-context/actor-context.module');
+  const { AuditModule } = await import('@core/audit/audit.module');
+  const { CacheModule } = await import('@core/cache/cache.module');
+  const { AppConfigModule } = await import('@core/config/config.module');
+  const { IdempotencyModule } = await import('@core/idempotency/idempotency.module');
+  const { LedgerModule } = await import('@core/ledger');
+  const { OutboxModule } = await import('@core/outbox/outbox.module');
+  const { PrismaModule } = await import('@core/prisma/prisma.module');
+  const { QueueModule } = await import('@core/queue/queue.module');
+
+  const { DepositModule } = await import('./deposit.module');
+  const { DepositStateMachine } = await import('./deposit-state.machine');
+  const { DepositOutboxHandler } = await import('./outbox/deposit-outbox.handler');
+  const { CreditDepositProcessor } = await import('./processors/credit-deposit.processor');
+  const { IngestProofProcessor } = await import('./processors/ingest-proof.processor');
+  const { NotifyProcessor } = await import('./processors/notify.processor');
+  const { DepositRepository } = await import('./repositories/deposit.repository');
+  const { DepositCreditService } = await import('./services/deposit-credit.service');
+  const { DepositExpiryCron } = await import('./services/deposit-expiry.cron');
+  const { DepositSweepService } = await import('./services/deposit-sweep.service');
+  const { DepositNotifyService } = await import('./services/deposit-notify.service');
+  const { DepositPolicyService } = await import('./services/deposit-policy.service');
+  const { DepositRetryService } = await import('./services/deposit-retry.service');
+  const { DepositReviewService } = await import('./services/deposit-review.service');
+  const { DepositService } = await import('./services/deposit.service');
+  const { ProofDuplicateService } = await import('./services/proof-duplicate.service');
+  const { ProofIngestService } = await import('./services/proof-ingest.service');
+  const { DepositTelegramHandlers } = await import('./telegram/deposit.handlers');
+
+  const { WalletModule } = await import('../wallet/wallet.module');
+  const { WalletService } = await import('../wallet/services/wallet.service');
+
+  const { ReconciliationModule } = await import('../reconciliation/reconciliation.module');
+  const { AgentFloatSyncService } = await import('../reconciliation/services/agent-float-sync.service');
+  const { InvariantCheckCron } = await import('../reconciliation/services/invariant-check.cron');
+  const { RailAgeingService } = await import('../reconciliation/services/rail-ageing.service');
+  const { ReconciliationBreakService } =
+    await import('../reconciliation/services/reconciliation-break.service');
+  const { ReconProcessor } = await import('../reconciliation/processors/recon.processor');
+
+  return {
+    // The core every composition below stands on, in the order the root imports it.
+    core: [
+      AppConfigModule,
+      PrismaModule,
+      ActorContextModule,
+      CacheModule,
+      AuditModule,
+      QueueModule,
+      LedgerModule,
+      // @Idempotent() on POST /v1/deposits expands to UseInterceptors(IdempotencyInterceptor), which
+      // Nest resolves from the module declaring the controller. Without this the deposit controller
+      // fails to build — a boot-time crash on the endpoint that opens deposits.
+      IdempotencyModule,
+      StubFeaturePortsModule,
+    ],
+    OutboxModule,
+    DepositModule,
+    DepositStateMachine,
+    DepositOutboxHandler,
+    CreditDepositProcessor,
+    IngestProofProcessor,
+    NotifyProcessor,
+    DepositRepository,
+    DepositCreditService,
+    DepositExpiryCron,
+    DepositSweepService,
+    DepositNotifyService,
+    DepositPolicyService,
+    DepositRetryService,
+    DepositReviewService,
+    DepositService,
+    ProofDuplicateService,
+    ProofIngestService,
+    DepositTelegramHandlers,
+    WalletModule,
+    WalletService,
+    ReconciliationModule,
+    AgentFloatSyncService,
+    InvariantCheckCron,
+    RailAgeingService,
+    ReconciliationBreakService,
+    ReconProcessor,
+  };
+}
+
+type Graph = Awaited<ReturnType<typeof loadGraph>>;
 
 /** Stand-ins for the three modules the root binds. Never exercised — only resolved. */
 const playerLinkStub: PlayerLinkPort = {
@@ -149,28 +212,34 @@ const paymentMethodStub: PaymentMethodPort = {
 })
 class StubFeaturePortsModule {}
 
-const CORE = [
-  AppConfigModule,
-  PrismaModule,
-  ActorContextModule,
-  CacheModule,
-  AuditModule,
-  QueueModule,
-  LedgerModule,
-  // @Idempotent() on POST /v1/deposits expands to UseInterceptors(IdempotencyInterceptor), which
-  // Nest resolves from the module declaring the controller. Without this the deposit controller
-  // fails to build — a boot-time crash on the endpoint that opens deposits.
-  IdempotencyModule,
-  StubFeaturePortsModule,
-];
-
 describe('deposit spine — dependency injection graph', () => {
+  let graph: Graph;
+
+  beforeAll(async () => {
+    const [postgres, redis] = await Promise.all([startPostgres(), startRedis()]);
+    // The values above stay as this suite set them. The addresses are the harness's, and any other
+    // variable the schema requires comes from the shared test defaults: CI has no .env to fill a gap.
+    applyTestEnv({ DATABASE_URL: postgres.url, REDIS_URL: redis.url });
+    graph = await loadGraph();
+  }, BOOT_TIMEOUT_MS);
+
+  afterAll(async () => {
+    // After both compositions have closed their modules, so nothing is still connected.
+    await Promise.all([stopPostgres(), stopRedis()]);
+  });
+
   describe('api composition', () => {
     let moduleRef: TestingModule;
 
     beforeAll(async () => {
       moduleRef = await Test.createTestingModule({
-        imports: [...CORE, OutboxModule, DepositModule, WalletModule, ReconciliationModule],
+        imports: [
+          ...graph.core,
+          graph.OutboxModule,
+          graph.DepositModule,
+          graph.WalletModule,
+          graph.ReconciliationModule,
+        ],
       }).compile();
     });
 
@@ -179,27 +248,33 @@ describe('deposit spine — dependency injection graph', () => {
     });
 
     it('resolves every deposit service', () => {
-      expect(moduleRef.get(DepositService)).toBeInstanceOf(DepositService);
-      expect(moduleRef.get(DepositReviewService)).toBeInstanceOf(DepositReviewService);
-      expect(moduleRef.get(DepositCreditService)).toBeInstanceOf(DepositCreditService);
-      expect(moduleRef.get(DepositRetryService)).toBeInstanceOf(DepositRetryService);
-      expect(moduleRef.get(DepositPolicyService)).toBeInstanceOf(DepositPolicyService);
-      expect(moduleRef.get(DepositNotifyService)).toBeInstanceOf(DepositNotifyService);
-      expect(moduleRef.get(ProofDuplicateService)).toBeInstanceOf(ProofDuplicateService);
-      expect(moduleRef.get(ProofIngestService)).toBeInstanceOf(ProofIngestService);
-      expect(moduleRef.get(DepositStateMachine)).toBeInstanceOf(DepositStateMachine);
-      expect(moduleRef.get(DepositRepository)).toBeInstanceOf(DepositRepository);
-      expect(moduleRef.get(DepositOutboxHandler)).toBeInstanceOf(DepositOutboxHandler);
+      expect(moduleRef.get(graph.DepositService)).toBeInstanceOf(graph.DepositService);
+      expect(moduleRef.get(graph.DepositReviewService)).toBeInstanceOf(graph.DepositReviewService);
+      expect(moduleRef.get(graph.DepositCreditService)).toBeInstanceOf(graph.DepositCreditService);
+      expect(moduleRef.get(graph.DepositRetryService)).toBeInstanceOf(graph.DepositRetryService);
+      expect(moduleRef.get(graph.DepositPolicyService)).toBeInstanceOf(graph.DepositPolicyService);
+      expect(moduleRef.get(graph.DepositNotifyService)).toBeInstanceOf(graph.DepositNotifyService);
+      expect(moduleRef.get(graph.ProofDuplicateService)).toBeInstanceOf(
+        graph.ProofDuplicateService,
+      );
+      expect(moduleRef.get(graph.ProofIngestService)).toBeInstanceOf(graph.ProofIngestService);
+      expect(moduleRef.get(graph.DepositStateMachine)).toBeInstanceOf(graph.DepositStateMachine);
+      expect(moduleRef.get(graph.DepositRepository)).toBeInstanceOf(graph.DepositRepository);
+      expect(moduleRef.get(graph.DepositOutboxHandler)).toBeInstanceOf(graph.DepositOutboxHandler);
       // Present in the api role even though its CRON is not — the admin panel can sweep on demand.
-      expect(moduleRef.get(DepositSweepService)).toBeInstanceOf(DepositSweepService);
+      expect(moduleRef.get(graph.DepositSweepService)).toBeInstanceOf(graph.DepositSweepService);
     });
 
     it('resolves the wallet and reconciliation services', () => {
-      expect(moduleRef.get(WalletService)).toBeInstanceOf(WalletService);
-      expect(moduleRef.get(ReconciliationBreakService)).toBeInstanceOf(ReconciliationBreakService);
-      expect(moduleRef.get(AgentFloatSyncService)).toBeInstanceOf(AgentFloatSyncService);
-      expect(moduleRef.get(RailAgeingService)).toBeInstanceOf(RailAgeingService);
-      expect(moduleRef.get(InvariantCheckCron)).toBeInstanceOf(InvariantCheckCron);
+      expect(moduleRef.get(graph.WalletService)).toBeInstanceOf(graph.WalletService);
+      expect(moduleRef.get(graph.ReconciliationBreakService)).toBeInstanceOf(
+        graph.ReconciliationBreakService,
+      );
+      expect(moduleRef.get(graph.AgentFloatSyncService)).toBeInstanceOf(
+        graph.AgentFloatSyncService,
+      );
+      expect(moduleRef.get(graph.RailAgeingService)).toBeInstanceOf(graph.RailAgeingService);
+      expect(moduleRef.get(graph.InvariantCheckCron)).toBeInstanceOf(graph.InvariantCheckCron);
     });
 
     it('does NOT provide the cross-module ports itself', () => {
@@ -212,12 +287,12 @@ describe('deposit spine — dependency injection graph', () => {
 
     it('starts NO queue consumer and NO cron in the api role', () => {
       // `strict: false` so this asks "is it in the graph at all?", not "is it in this module?".
-      expect(() => moduleRef.get(CreditDepositProcessor, { strict: false })).toThrow();
-      expect(() => moduleRef.get(IngestProofProcessor, { strict: false })).toThrow();
-      expect(() => moduleRef.get(NotifyProcessor, { strict: false })).toThrow();
-      expect(() => moduleRef.get(ReconProcessor, { strict: false })).toThrow();
-      expect(() => moduleRef.get(DepositExpiryCron, { strict: false })).toThrow();
-      expect(() => moduleRef.get(DepositTelegramHandlers, { strict: false })).toThrow();
+      expect(() => moduleRef.get(graph.CreditDepositProcessor, { strict: false })).toThrow();
+      expect(() => moduleRef.get(graph.IngestProofProcessor, { strict: false })).toThrow();
+      expect(() => moduleRef.get(graph.NotifyProcessor, { strict: false })).toThrow();
+      expect(() => moduleRef.get(graph.ReconProcessor, { strict: false })).toThrow();
+      expect(() => moduleRef.get(graph.DepositExpiryCron, { strict: false })).toThrow();
+      expect(() => moduleRef.get(graph.DepositTelegramHandlers, { strict: false })).toThrow();
     });
   });
 
@@ -227,13 +302,16 @@ describe('deposit spine — dependency injection graph', () => {
     beforeAll(async () => {
       // ONE shared instance, exactly as worker.module.ts composes it: the handler classes must
       // resolve inside OutboxModule (which declares OUTBOX_HANDLERS), not in the root.
-      const depositWorker = DepositModule.forWorker('worker');
+      const depositWorker = graph.DepositModule.forWorker('worker');
       moduleRef = await Test.createTestingModule({
         imports: [
-          ...CORE,
-          OutboxModule.forWorker({ imports: [depositWorker], handlers: [DepositOutboxHandler] }),
+          ...graph.core,
+          graph.OutboxModule.forWorker({
+            imports: [depositWorker],
+            handlers: [graph.DepositOutboxHandler],
+          }),
           depositWorker,
-          ReconciliationModule.forWorker('worker'),
+          graph.ReconciliationModule.forWorker('worker'),
         ],
       }).compile();
     });
@@ -243,18 +321,24 @@ describe('deposit spine — dependency injection graph', () => {
     });
 
     it('adds the queue consumers, the sweeper and the bot handlers', () => {
-      expect(moduleRef.get(CreditDepositProcessor)).toBeInstanceOf(CreditDepositProcessor);
-      expect(moduleRef.get(IngestProofProcessor)).toBeInstanceOf(IngestProofProcessor);
-      expect(moduleRef.get(NotifyProcessor)).toBeInstanceOf(NotifyProcessor);
-      expect(moduleRef.get(DepositExpiryCron)).toBeInstanceOf(DepositExpiryCron);
-      expect(moduleRef.get(DepositTelegramHandlers)).toBeInstanceOf(DepositTelegramHandlers);
-      expect(moduleRef.get(ReconProcessor)).toBeInstanceOf(ReconProcessor);
+      expect(moduleRef.get(graph.CreditDepositProcessor)).toBeInstanceOf(
+        graph.CreditDepositProcessor,
+      );
+      expect(moduleRef.get(graph.IngestProofProcessor)).toBeInstanceOf(graph.IngestProofProcessor);
+      expect(moduleRef.get(graph.NotifyProcessor)).toBeInstanceOf(graph.NotifyProcessor);
+      expect(moduleRef.get(graph.DepositExpiryCron)).toBeInstanceOf(graph.DepositExpiryCron);
+      expect(moduleRef.get(graph.DepositTelegramHandlers)).toBeInstanceOf(
+        graph.DepositTelegramHandlers,
+      );
+      expect(moduleRef.get(graph.ReconProcessor)).toBeInstanceOf(graph.ReconProcessor);
     });
 
     it('still resolves everything the api role had', () => {
-      expect(moduleRef.get(DepositService)).toBeInstanceOf(DepositService);
-      expect(moduleRef.get(DepositCreditService)).toBeInstanceOf(DepositCreditService);
-      expect(moduleRef.get(AgentFloatSyncService)).toBeInstanceOf(AgentFloatSyncService);
+      expect(moduleRef.get(graph.DepositService)).toBeInstanceOf(graph.DepositService);
+      expect(moduleRef.get(graph.DepositCreditService)).toBeInstanceOf(graph.DepositCreditService);
+      expect(moduleRef.get(graph.AgentFloatSyncService)).toBeInstanceOf(
+        graph.AgentFloatSyncService,
+      );
     });
 
     it('binds exactly ONE consumer per queue', () => {
@@ -262,10 +346,10 @@ describe('deposit spine — dependency injection graph', () => {
       // random half — the failure mode that looks like everything working until half the credits
       // disappear. One class per queue is the invariant; this pins the mapping.
       const consumers = [
-        CreditDepositProcessor,
-        IngestProofProcessor,
-        NotifyProcessor,
-        ReconProcessor,
+        graph.CreditDepositProcessor,
+        graph.IngestProofProcessor,
+        graph.NotifyProcessor,
+        graph.ReconProcessor,
       ];
       const queues = consumers.map(
         (consumer) =>

@@ -29,6 +29,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import type { Prisma } from '@prisma/client';
 
 import type { Tx } from '@core/prisma/tx.type';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 import { parseAccountCode, satisfiesSignPolicy, ACCOUNT_KIND_SPECS } from './account-codes';
 import { AccountRegistryService } from './account-registry.service';
@@ -144,10 +145,15 @@ export class LedgerRepository {
   async post(tx: Tx, posting: Posting): Promise<PostedTransaction> {
     assertValidPosting(posting);
 
-    await this.acquireIdempotencyLock(tx, posting.idempotencyKey);
+    // Read ONCE, at the top of the posting. Everything written below — transaction, entries, the
+    // idempotency record — has to name this same operator, and the idempotency key is only a fence
+    // against a double credit if the replay lookup searches the tenant the original was written in.
+    const tenantId = requireEffectiveTenantId();
+
+    await this.acquireIdempotencyLock(tx, tenantId, posting.idempotencyKey);
 
     const requestHash = hashPosting(posting);
-    const replay = await this.findReplay(tx, posting, requestHash);
+    const replay = await this.findReplay(tx, tenantId, posting, requestHash);
     if (replay !== null) return replay;
 
     const refToAccountId = await this.resolveAccounts(tx, posting);
@@ -171,6 +177,7 @@ export class LedgerRepository {
 
     const created = await tx.ledgerTransaction.create({
       data: {
+        tenantId,
         kind: posting.kind,
         currencyCode: posting.currency,
         occurredAt,
@@ -182,7 +189,7 @@ export class LedgerRepository {
         reversesTxId: posting.reversesTxId ?? null,
         metadata,
       },
-      select: { id: true, postedAt: true },
+      select: { id: true, postedAt: true, tenantId: true },
     });
 
     await tx.ledgerEntry.createMany({
@@ -193,6 +200,10 @@ export class LedgerRepository {
           throw new LedgerError('LEDGER_ACCOUNT_NOT_FOUND', `Entry ${index} lost its account`);
         }
         return {
+          // Read back off the row we just wrote rather than from the ambient context: the zero-sum
+          // trigger groups by transaction, so a posting whose entries landed in a different tenant
+          // than their transaction would be a balanced movement torn across two operators.
+          tenantId: created.tenantId,
           ledgerTransactionId: created.id,
           ledgerAccountId: snapshot.accountId,
           currencyCode: posting.currency,
@@ -208,13 +219,16 @@ export class LedgerRepository {
     const cachedAt = new Date();
     for (const [accountId, balance] of finalBalances) {
       await tx.ledgerAccount.update({
-        where: { id: accountId },
+        // The posting's own tenant: computeBalances resolved every account in it.
+        where: { id: accountId, tenantId: created.tenantId },
         data: { cachedBalanceMinor: balance, cachedAt },
       });
     }
 
     await tx.idempotencyKey.create({
       data: {
+        // Same source as the entries: the fence has to live beside the transaction it protects.
+        tenantId: created.tenantId,
         scope: LEDGER_IDEMPOTENCY_SCOPE,
         key: posting.idempotencyKey,
         requestHash,
@@ -256,8 +270,15 @@ export class LedgerRepository {
    * Serialise everyone replaying the same key. Released automatically at COMMIT or ROLLBACK, so a
    * crashed worker cannot leave the key locked.
    */
-  private async acquireIdempotencyLock(tx: Tx, idempotencyKey: string): Promise<void> {
-    const key = advisoryLockKey(`${LEDGER_IDEMPOTENCY_SCOPE}:${idempotencyKey}`);
+  private async acquireIdempotencyLock(
+    tx: Tx,
+    tenantId: string,
+    idempotencyKey: string,
+  ): Promise<void> {
+    // The tenant is part of the lock input because it is part of the uniqueness the lock stands in
+    // for: idempotency_keys is UNIQUE(tenant_id, scope, key), so two operators posting the same
+    // natural key are not a race and must not queue behind each other.
+    const key = advisoryLockKey(`${tenantId}:${LEDGER_IDEMPOTENCY_SCOPE}:${idempotencyKey}`);
     // The lock function is called in FROM position and a real boolean is selected instead of its
     // return value: pg_advisory_xact_lock() returns `void`, and the Prisma driver adapter cannot
     // deserialize a void column ("UnsupportedNativeDataType").
@@ -267,11 +288,18 @@ export class LedgerRepository {
   /** Return the original transaction when this exact posting already ran; null when it is new. */
   private async findReplay(
     tx: Tx,
+    tenantId: string,
     posting: Posting,
     requestHash: string,
   ): Promise<PostedTransaction | null> {
     const existing = await tx.idempotencyKey.findUnique({
-      where: { scope_key: { scope: LEDGER_IDEMPOTENCY_SCOPE, key: posting.idempotencyKey } },
+      where: {
+        tenantId_scope_key: {
+          tenantId,
+          scope: LEDGER_IDEMPOTENCY_SCOPE,
+          key: posting.idempotencyKey,
+        },
+      },
       select: { requestHash: true, resultRef: true },
     });
     if (existing === null) return null;
@@ -292,7 +320,9 @@ export class LedgerRepository {
     }
 
     const original = await tx.ledgerTransaction.findUnique({
-      where: { id: existing.resultRef },
+      // The same operator the idempotency key was found in: a replay can only ever return a
+      // transaction of the operator that posted it.
+      where: { id: existing.resultRef, tenantId },
       select: {
         id: true,
         kind: true,

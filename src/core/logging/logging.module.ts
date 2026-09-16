@@ -17,6 +17,7 @@ import {
   getCorrelationId,
   resolveCorrelationId,
 } from '@common/interceptors/correlation-id.interceptor';
+import { redactRequestUrl } from '@common/helpers/request-url-redaction.util';
 import { AppConfigService } from '../config/config.service';
 import { REDACTED, REDACT_PATHS } from './redaction';
 
@@ -53,11 +54,15 @@ const HEALTH_PATHS = new Set(['/health/live', '/health/ready']);
 
           // Default serializers dump every header, which re-introduces the secrets `redact` just
           // removed via paths we did not anticipate. Allow-list instead.
+          //
+          // The URL goes through redactRequestUrl because the webhook route carries its path token
+          // IN the URL: every Telegram update would otherwise write that token into a log line that
+          // Loki keeps. `redact.paths` cannot help here, since it censors whole values, not segments.
           serializers: {
             req: (req: IncomingMessage & { id?: string; params?: unknown }) => ({
               id: req.id,
               method: req.method,
-              url: (req.url ?? '').split('?')[0],
+              url: redactRequestUrl(req.url),
             }),
             res: (res: ServerResponse) => ({ statusCode: res.statusCode }),
           },

@@ -1,5 +1,6 @@
 /**
- * IS THE ICHANCY INTEGRATION UP? — a consecutive-failure breaker, shared cluster-wide via Redis.
+ * IS THIS OPERATOR'S ICHANCY INTEGRATION UP? — a consecutive-failure breaker per operator, shared
+ * across replicas via Redis.
  *
  * ══ WHY THIS EXISTS ═══════════════════════════════════════════════════════════════════════════
  * On 2026-08-20 every agent-API call answered `AMBIGUOUS / http=403 / CLOUDFLARE_CHALLENGE` for
@@ -13,6 +14,15 @@
  * integration is healthy, because something on the far side read our request and formed an opinion
  * about it. Only `ambiguous` means we never got an answer at all, and only a RUN of those means the
  * integration rather than the request is broken.
+ *
+ * ══ WHY ONE BREAKER PER OPERATOR ══════════════════════════════════════════════════════════════
+ * Every operator calls Ichancy with its own agent — its own host, credentials and session — so one
+ * operator's blocked or misconfigured agent says nothing about another's. With one shared hash, an
+ * operator whose agent failed three times paused every other operator's player-link backfill and
+ * sent its own `lastEndpoint` and error text to every other operator's admin group, and a healthy
+ * call from another operator reset the count and hid a real outage. The key names the tenant, the
+ * HTTP client records under the tenant of the agent it called with, and every reader asks about one
+ * operator.
  *
  * ══ WHY IT LIVES IN core AND HAS NO BotService ════════════════════════════════════════════════
  * It is fed from IchancyHttpClient, which is core, and core may not import modules. So this half is
@@ -32,8 +42,8 @@ import { AppConfigService } from '@core/config/config.service';
 
 import { type IchancyClassification } from './error-map';
 
-/** One hash, one key: the verdict is cluster-wide, so both roles read and write the same fields. */
-export const ICHANCY_HEALTH_KEY = 'ichancy:health';
+/** One hash per operator: both roles read and write the same fields for that operator. */
+export const ichancyHealthKey = (tenantId: string): string => `ichancy:health:tenant:${tenantId}`;
 
 /**
  * How many consecutive unanswered calls before we call the integration DOWN.
@@ -102,8 +112,8 @@ export class IchancyHealthService {
   ) {}
 
   /**
-   * Fold one classified call into the verdict. Called from the single choke point every agent-API
-   * call passes through, in both roles.
+   * Fold one classified call into that operator's verdict. Called from the single choke point every
+   * agent-API call passes through, in both roles, with the tenant of the agent the call was made as.
    *
    * The outcome mapping is the whole design:
    *   ok / rejected / already_exists / token_expired  -> their application answered  -> HEALTHY
@@ -112,17 +122,23 @@ export class IchancyHealthService {
    * `token_expired` counts as healthy on purpose: it is Ichancy's own 401/201 telling us the token
    * is stale, which is a conversation, not a blackout.
    */
-  async record(endpoint: string, classification: IchancyClassification): Promise<void> {
+  async record(
+    tenantId: string,
+    endpoint: string,
+    classification: IchancyClassification,
+  ): Promise<void> {
     // In fake mode nothing real is contacted, so a verdict here would be a verdict about a fixture,
     // and every dev boot and test run would carry a live breaker.
     if (this.config.ichancy.fake) return;
 
+    const key = ichancyHealthKey(tenantId);
     try {
       if (classification.outcome !== 'ambiguous') {
-        await this.markHealthy();
+        await this.markHealthy(key);
         return;
       }
       await this.markFailure(
+        key,
         endpoint,
         classification.rule ?? UNCLASSIFIED_KIND,
         classification.message,
@@ -137,21 +153,21 @@ export class IchancyHealthService {
   }
 
   /**
-   * The gate the player-link backfill asks before issuing anything.
+   * The gate the player-link backfill asks, per operator, before issuing anything for it.
    *
    * Failing OPEN (false when we cannot tell) is the right default: a Redis outage must not silently
    * pause player registrations, and the backfill has per-player backoff underneath this anyway.
    */
-  async isDown(): Promise<boolean> {
-    return (await this.snapshot()).state === 'DOWN';
+  async isDown(tenantId: string): Promise<boolean> {
+    return (await this.snapshot(tenantId)).state === 'DOWN';
   }
 
-  async snapshot(): Promise<IchancyHealthSnapshot> {
+  async snapshot(tenantId: string): Promise<IchancyHealthSnapshot> {
     if (this.config.ichancy.fake) return HEALTHY;
 
     let raw: Record<string, string>;
     try {
-      raw = await this.redis.hgetall(ICHANCY_HEALTH_KEY);
+      raw = await this.redis.hgetall(ichancyHealthKey(tenantId));
     } catch (error: unknown) {
       this.logger.debug(
         `could not read Ichancy health: ${error instanceof Error ? error.message : String(error)}`,
@@ -171,7 +187,7 @@ export class IchancyHealthService {
   }
 
   /**
-   * "The recovery for THIS timestamp has been delivered to a human; stop offering it."
+   * "The recovery for THIS timestamp has been delivered to this operator's staff; stop offering it."
    *
    * WHY THIS IS NEEDED AT ALL: `recoveredAt` is what tells the alert cron a transition is pending,
    * and nothing else ever cleared it. The cron's own "announce once" marker is a Redis key with a
@@ -186,12 +202,13 @@ export class IchancyHealthService {
    * was in flight is not silently swallowed — worst case we re-announce once, which is the correct
    * direction to fail in for an alarm.
    */
-  async acknowledgeRecovery(recoveredAt: Date): Promise<void> {
+  async acknowledgeRecovery(tenantId: string, recoveredAt: Date): Promise<void> {
     if (this.config.ichancy.fake) return;
+    const key = ichancyHealthKey(tenantId);
     try {
-      const stored = await this.redis.hget(ICHANCY_HEALTH_KEY, 'recoveredAt');
+      const stored = await this.redis.hget(key, 'recoveredAt');
       if (stored !== recoveredAt.toISOString()) return;
-      await this.redis.hdel(ICHANCY_HEALTH_KEY, 'recoveredAt', 'since');
+      await this.redis.hdel(key, 'recoveredAt', 'since');
     } catch (error: unknown) {
       // Same rule as everything else in here: instrumentation may not throw at its caller.
       this.logger.debug(
@@ -204,13 +221,13 @@ export class IchancyHealthService {
 
   // ── internals ────────────────────────────────────────────────────────────────────────────────
 
-  private async markHealthy(): Promise<void> {
-    const previous = await this.redis.hget(ICHANCY_HEALTH_KEY, 'state');
+  private async markHealthy(key: string): Promise<void> {
+    const previous = await this.redis.hget(key, 'state');
     if (previous === 'DOWN') {
       // `since` is deliberately left in place: the recovery message quotes how long the outage
       // lasted, and it can only compute that from the timestamp the DOWN state was carrying. It is
       // dropped by acknowledgeRecovery() once that message has actually been delivered.
-      await this.redis.hset(ICHANCY_HEALTH_KEY, {
+      await this.redis.hset(key, {
         state: 'UP',
         consecutive: '0',
         recoveredAt: new Date().toISOString(),
@@ -220,16 +237,21 @@ export class IchancyHealthService {
       // `since`. Leaving a resolved outage's kind behind meant the NEXT outage inherited the
       // PREVIOUS outage's start time, which reproduced the alert marker key that outage had already
       // claimed — so the second outage of the day was announced to nobody at all.
-      await this.redis.hdel(ICHANCY_HEALTH_KEY, 'kind', 'lastEndpoint', 'lastMessage');
+      await this.redis.hdel(key, 'kind', 'lastEndpoint', 'lastMessage');
       return;
     }
     // The steady-state path: one round trip that writes nothing when there is nothing to clear. An
     // HDEL of absent fields is free; an HSET of five fields on every single credit is not.
-    await this.redis.hdel(ICHANCY_HEALTH_KEY, 'consecutive', 'kind', 'lastEndpoint', 'lastMessage');
+    await this.redis.hdel(key, 'consecutive', 'kind', 'lastEndpoint', 'lastMessage');
   }
 
-  private async markFailure(endpoint: string, kind: string, message: string): Promise<void> {
-    const raw = await this.redis.hgetall(ICHANCY_HEALTH_KEY);
+  private async markFailure(
+    key: string,
+    endpoint: string,
+    kind: string,
+    message: string,
+  ): Promise<void> {
+    const raw = await this.redis.hgetall(key);
     const sameKind = raw['kind'] === kind;
     const alreadyDown = raw['state'] === 'DOWN';
 
@@ -255,6 +277,6 @@ export class IchancyHealthService {
     };
     if (consecutive >= ICHANCY_DOWN_THRESHOLD) fields['state'] = 'DOWN';
 
-    await this.redis.hset(ICHANCY_HEALTH_KEY, fields);
+    await this.redis.hset(key, fields);
   }
 }

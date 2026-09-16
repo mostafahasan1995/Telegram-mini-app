@@ -15,12 +15,32 @@
  * Note the inversion in the first line: the STRING "WebAppData" is the HMAC key and the BOT TOKEN
  * is the message. Swapping them produces a stable, plausible-looking digest that never matches a
  * real client — and, worse, would match a forged one built the same wrong way.
+ *
+ * ══ WHOSE BOT TOKEN ═════════════════════════════════════════════════════════════════════════════
+ * initData is signed with the token of the bot whose web app the player opened, and every operator
+ * has its own bot, sealed in `tenants.bot_token_enc`. There is no deployment-wide token. So the
+ * caller names the operator, and the key is derived from THAT operator's token.
+ *
+ * WHY NOTHING HAPPENS AT CONSTRUCTION: AuthModule is loaded by the api AND the worker. Deriving a key
+ * in the constructor meant a missing or unreadable token stopped both processes from booting, for a
+ * route the worker never serves. The key is resolved on the first request that needs it, and a
+ * token that cannot be opened fails THAT request with a 503, not the process.
+ *
+ * CACHED PER TENANT, EVICTED ON TOKEN CHANGE: the derived key is kept with the sealed value it came
+ * from. At most every INIT_DATA_KEY_RECHECK_SECONDS the sealed column is re-read (one primary-key
+ * lookup); a different value — the token was changed in the dashboard, possibly through another
+ * process — drops the old key before it can verify anything else. `invalidate()` does the same at
+ * once for a change made in this process.
  */
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { UnauthorizedError } from '@common/exceptions/app.exception';
+import { ServiceUnavailableError, UnauthorizedError } from '@common/exceptions/app.exception';
 import { CommonErrorCodes } from '@common/exceptions/error-codes';
-import { AppConfigService } from '../../config/config.service';
+import { PrismaService } from '../../prisma/prisma.service';
+import {
+  TenantSecretService,
+  isTenantSecretError,
+} from '../../tenant/services/tenant-secret.service';
 import {
   INIT_DATA_CLOCK_SKEW_SECONDS,
   INIT_DATA_MAX_AGE_SECONDS,
@@ -30,6 +50,15 @@ import { type TelegramInitDataUser, type VerifiedInitData } from '../auth.types'
 
 /** A sha256 hex digest and nothing else. */
 const HEX_64 = /^[0-9a-f]{64}$/i;
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * How long a derived key is trusted before its sealed token is re-read. The same bound, for the same
+ * reason, as TENANT_BOT_RECHECK_SECONDS: a token changed from the dashboard lands in another process.
+ * Restated rather than imported, because core/auth has no business depending on core/telegram.
+ */
+export const INIT_DATA_KEY_RECHECK_SECONDS = 30;
 
 interface RawTelegramUser {
   id?: unknown;
@@ -43,28 +72,48 @@ interface RawTelegramUser {
   photo_url?: unknown;
 }
 
+interface DerivedKey {
+  /** The `bot_token_enc` value the key was derived from; a different value means a new token. */
+  sealedToken: string;
+  key: Buffer;
+  /** Date.now() when the sealed value was last confirmed unchanged. */
+  verifiedAt: number;
+}
+
 @Injectable()
 export class InitDataService {
+  private readonly logger = new Logger(InitDataService.name);
+
+  private readonly keys = new Map<string, DerivedKey>();
+  private readonly loading = new Map<string, Promise<Buffer>>();
   /**
-   * Derived once at construction: it depends only on the bot token, and re-deriving it per request
-   * would be pure waste on the hottest auth path.
+   * tenantId -> how many times invalidate() was called for it. A load that started before an
+   * invalidate() read the row BEFORE the change, so it must not put its key back into `keys`
+   * afterwards; comparing generations is how it knows.
    */
-  private readonly secretKey: Buffer;
+  private readonly generations = new Map<string, number>();
+  /** tenantId -> the failure already logged, so a misconfigured operator logs once, not per tap. */
+  private readonly loggedFailures = new Map<string, string>();
 
-  constructor(config: AppConfigService) {
-    this.secretKey = createHmac('sha256', TELEGRAM_HMAC_KEY)
-      .update(config.telegram.botToken)
-      .digest();
-  }
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly secrets: TenantSecretService,
+  ) {}
 
   /**
-   * Verifies raw initData and returns its authenticated contents.
-   * Throws UnauthorizedError with a stable code on every failure path — never returns a partial or
-   * "probably fine" result.
+   * Verifies raw initData against the bot of `tenantId` and returns its authenticated contents.
+   * Throws UnauthorizedError with a stable code on every verification failure — never returns a
+   * partial or "probably fine" result — and ServiceUnavailableError (INIT_DATA_BOT_UNAVAILABLE) when
+   * that operator has no bot token this process can use.
    *
    * @param raw the exact `Telegram.WebApp.initData` string, untouched by the client.
+   * @param tenantId the operator whose bot's web app produced it.
    */
-  verify(raw: string, maxAgeSeconds: number = INIT_DATA_MAX_AGE_SECONDS): VerifiedInitData {
+  async verify(
+    raw: string,
+    tenantId: string,
+    maxAgeSeconds: number = INIT_DATA_MAX_AGE_SECONDS,
+  ): Promise<VerifiedInitData> {
     if (typeof raw !== 'string' || raw.length === 0) {
       throw new UnauthorizedError(
         CommonErrorCodes.INIT_DATA_MALFORMED,
@@ -112,9 +161,11 @@ export class InitDataService {
       .map(([key, value]) => `${key}=${value}`)
       .join('\n');
 
-    // STEP 5 + 6 — secret is HMAC(key="WebAppData", msg=botToken) (done once, in the constructor);
-    // expected is HMAC(key=secret, msg=dataCheckString), hex encoded.
-    const expected = createHmac('sha256', this.secretKey).update(dataCheckString).digest();
+    // STEP 5 + 6 — secret is HMAC(key="WebAppData", msg=this operator's bot token), resolved only
+    // now: everything above rejects garbage without a database read. Expected is
+    // HMAC(key=secret, msg=dataCheckString), hex encoded.
+    const secretKey = await this.secretKeyFor(tenantId);
+    const expected = createHmac('sha256', secretKey).update(dataCheckString).digest();
     const provided = Buffer.from(hash, 'hex');
 
     // STEP 7 — Constant-time comparison. `===` on the hex strings leaks, through timing, how many
@@ -184,6 +235,101 @@ export class InitDataService {
     if (chatInstance !== null) result.chatInstance = chatInstance;
 
     return result;
+  }
+
+  /**
+   * Forget the key derived for this operator. MUST be called by whatever changes its bot token in
+   * this process; other processes notice within INIT_DATA_KEY_RECHECK_SECONDS.
+   */
+  invalidate(tenantId: string): void {
+    this.generations.set(tenantId, this.generationOf(tenantId) + 1);
+    this.keys.delete(tenantId);
+    // A load already in flight read the old row; the next request must not join it.
+    this.loading.delete(tenantId);
+    this.loggedFailures.delete(tenantId);
+  }
+
+  private generationOf(tenantId: string): number {
+    return this.generations.get(tenantId) ?? 0;
+  }
+
+  private secretKeyFor(tenantId: string): Promise<Buffer> {
+    const cached = this.keys.get(tenantId);
+    if (
+      cached !== undefined &&
+      Date.now() - cached.verifiedAt < INIT_DATA_KEY_RECHECK_SECONDS * 1_000
+    ) {
+      return Promise.resolve(cached.key);
+    }
+
+    // Concurrent sign-ins for one operator share one read.
+    const pending = this.loading.get(tenantId);
+    if (pending !== undefined) return pending;
+
+    const load = this.loadKey(tenantId, this.generationOf(tenantId)).finally(() => {
+      // Only its own entry: after an invalidate() the slot may already hold a newer load.
+      if (this.loading.get(tenantId) === load) this.loading.delete(tenantId);
+    });
+    this.loading.set(tenantId, load);
+    return load;
+  }
+
+  private async loadKey(tenantId: string, generation: number): Promise<Buffer> {
+    // A malformed id would make Postgres raise 22P02 instead of returning no row.
+    const row = UUID.test(tenantId)
+      ? await this.prisma.tenant.findUnique({
+          where: { id: tenantId },
+          select: { botTokenEnc: true },
+        })
+      : null;
+
+    // invalidate() ran while the row was being read. This request began before it, so it may finish
+    // with what it read — but nothing it read is cached, and the key cache is left as invalidate()
+    // left it. The next request loads afresh.
+    const superseded = generation !== this.generationOf(tenantId);
+
+    if (row === null) {
+      if (!superseded) this.keys.delete(tenantId);
+      throw this.unavailable(tenantId, 'NO_TENANT', `there is no tenant ${tenantId}`);
+    }
+
+    const cached = superseded ? undefined : this.keys.get(tenantId);
+    if (cached !== undefined && cached.sealedToken === row.botTokenEnc) {
+      cached.verifiedAt = Date.now();
+      return cached.key;
+    }
+    // A different sealed value is a different token: the old key must not verify one more request.
+    if (!superseded) this.keys.delete(tenantId);
+
+    let token: string;
+    try {
+      token = this.secrets.openBotToken({ id: tenantId, botTokenEnc: row.botTokenEnc });
+    } catch (error: unknown) {
+      if (!isTenantSecretError(error)) throw error;
+      // TenantSecretError messages name the field and the tenant, never a value.
+      throw this.unavailable(tenantId, error.code, error.message);
+    }
+
+    const key = createHmac('sha256', TELEGRAM_HMAC_KEY).update(token).digest();
+    if (!superseded) {
+      this.keys.set(tenantId, { sealedToken: row.botTokenEnc, key, verifiedAt: Date.now() });
+      this.loggedFailures.delete(tenantId);
+    }
+    return key;
+  }
+
+  private unavailable(tenantId: string, reason: string, detail: string): ServiceUnavailableError {
+    if (this.loggedFailures.get(tenantId) !== reason) {
+      this.loggedFailures.set(tenantId, reason);
+      this.logger.error(
+        `Mini App sign-in is unavailable for tenant ${tenantId} (${reason}): ${detail}. ` +
+          'Set that operator’s bot token from the dashboard. Logged once until it changes.',
+      );
+    }
+    return new ServiceUnavailableError(
+      CommonErrorCodes.INIT_DATA_BOT_UNAVAILABLE,
+      'Sign-in through Telegram is not available for this operator right now.',
+    );
   }
 
   private parseUser(userRaw: string): TelegramInitDataUser {

@@ -8,9 +8,18 @@
  * into a TTL, including the one-tick subtraction that stops the report walking later around the
  * clock every period. That is what this file pins.
  */
-import { REPORT_SCHEDULE_TICK_MS } from '../admin.constants';
+import { Logger } from '@nestjs/common';
+
+import { type LockService } from '@core/cache/lock.service';
+import { type RedisService } from '@core/cache/redis.service';
+import { type AppConfigService } from '@core/config/config.service';
+import { type BotService, type TenantChats } from '@core/telegram/services/bot.service';
+import { type OperatorRef, type TenantRegistryService, getEffectiveTenantId } from '@core/tenant';
+
+import { REPORT_SCHEDULE_TICK_MS, reportLastPostedKey } from '../admin.constants';
 import { ActivityReportService } from './activity-report.service';
 import {
+  ReportScheduleCron,
   reportMarkerTtlSeconds,
   SCHEDULED_REPORT_HEADER,
   SCHEDULED_REPORT_PERIOD,
@@ -96,5 +105,156 @@ describe('what the schedule posts', () => {
     expect(SCHEDULED_REPORT_HEADER).toContain('تقرير دوري');
     // HTML parse mode, like every other bold line this bot sends.
     expect(SCHEDULED_REPORT_HEADER).toContain('<b>');
+  });
+});
+
+/**
+ * WHERE it goes, and whose numbers. Redis here is a set of keys with SET NX semantics — the
+ * atomicity is Redis's, as the header says; what is ours is which key each operator claims.
+ */
+describe('one report per operator', () => {
+  const OPERATOR_A: OperatorRef = { id: '11111111-1111-4111-8111-111111111111', slug: 'alpha' };
+  const OPERATOR_B: OperatorRef = { id: '22222222-2222-4222-8222-222222222222', slug: 'beta' };
+
+  function build(options: { feedFullDetail?: boolean; chats?: Record<string, TenantChats> } = {}): {
+    cron: ReportScheduleCron;
+    sendMessage: jest.Mock;
+    buildReport: jest.Mock;
+    keys: Set<string>;
+    builtIn: Array<string | undefined>;
+  } {
+    const keys = new Set<string>();
+    const redis = {
+      set: jest.fn((key: string) => {
+        if (keys.has(key)) return Promise.resolve(null);
+        keys.add(key);
+        return Promise.resolve('OK');
+      }),
+      del: jest.fn((key: string) => Promise.resolve(keys.delete(key) ? 1 : 0)),
+    };
+    const builtIn: Array<string | undefined> = [];
+    const buildReport = jest.fn(() => {
+      builtIn.push(getEffectiveTenantId());
+      return Promise.resolve(`numbers of ${getEffectiveTenantId() ?? 'nobody'}`);
+    });
+    const chats = options.chats ?? {
+      [OPERATOR_A.id]: { adminChatId: -1001n, feedChatId: null },
+      [OPERATOR_B.id]: { adminChatId: -1002n, feedChatId: -1092n },
+    };
+    const sendMessage = jest.fn().mockResolvedValue({ message_id: 1 });
+
+    const cron = new ReportScheduleCron(
+      {
+        resolveReportPeriod: () => ({ key: 'day', label: 'اليوم' }),
+        buildReport,
+      } as unknown as ActivityReportService,
+      {
+        acquire: jest.fn().mockResolvedValue({ key: 'k', token: 't', acquiredAt: 0, ttlMs: 1 }),
+        release: jest.fn().mockResolvedValue(true),
+      } as unknown as LockService,
+      redis as unknown as RedisService,
+      {
+        chatsOf: (tenantId: string) =>
+          Promise.resolve(chats[tenantId] ?? { adminChatId: null, feedChatId: null }),
+        sendMessage,
+      } as unknown as BotService,
+      {
+        listActiveOperators: jest.fn().mockResolvedValue([OPERATOR_A, OPERATOR_B]),
+      } as unknown as TenantRegistryService,
+      {
+        app: { isWorker: true },
+        telegram: { reportScheduleHours: 6, feedFullDetail: options.feedFullDetail ?? false },
+      } as unknown as AppConfigService,
+    );
+    return { cron, sendMessage, buildReport, keys, builtIn };
+  }
+
+  beforeEach(() => {
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('builds each operator’s report in that operator’s context and posts it through its own bot', async () => {
+    const h = build();
+
+    await h.cron.tick();
+
+    expect(h.builtIn).toEqual([OPERATOR_A.id, OPERATOR_B.id]);
+    expect((h.sendMessage.mock.calls as unknown[][]).map((call) => [call[0], call[1]])).toEqual([
+      [OPERATOR_A.id, -1001n],
+      // A masked feed may contain customers, and the report carries the float: admin group.
+      [OPERATOR_B.id, -1002n],
+    ]);
+    expect(h.sendMessage.mock.calls[1]?.[2]).toContain(`numbers of ${OPERATOR_B.id}`);
+    expect([...h.keys].sort()).toEqual(
+      [reportLastPostedKey(OPERATOR_A.id), reportLastPostedKey(OPERATOR_B.id)].sort(),
+    );
+  });
+
+  it('uses an operator’s feed group only when feed groups are declared staff-only', async () => {
+    const h = build({ feedFullDetail: true });
+
+    await h.cron.tick();
+
+    expect((h.sendMessage.mock.calls as unknown[][]).map((call) => call[1])).toEqual([
+      -1001n,
+      -1092n,
+    ]);
+  });
+
+  it('posts once per window per operator', async () => {
+    const h = build();
+
+    await h.cron.tick();
+    await h.cron.tick();
+
+    expect(h.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let one operator’s failed send stop the next, and keeps the failed claim', async () => {
+    const h = build();
+    h.sendMessage.mockImplementation((tenantId: string) =>
+      tenantId === OPERATOR_A.id
+        ? Promise.reject(new Error('bot token revoked'))
+        : Promise.resolve({}),
+    );
+
+    await h.cron.tick();
+    await h.cron.tick();
+
+    // A was tried once (a maybe-sent report is never re-posted); B was posted.
+    expect((h.sendMessage.mock.calls as unknown[][]).map((call) => call[0])).toEqual([
+      OPERATOR_A.id,
+      OPERATOR_B.id,
+    ]);
+  });
+
+  it('skips an operator with no chat set, without touching its bot', async () => {
+    const h = build({
+      chats: {
+        [OPERATOR_A.id]: { adminChatId: null, feedChatId: null },
+        [OPERATOR_B.id]: { adminChatId: -1002n, feedChatId: null },
+      },
+    });
+
+    await h.cron.tick();
+
+    expect((h.sendMessage.mock.calls as unknown[][]).map((call) => call[0])).toEqual([
+      OPERATOR_B.id,
+    ]);
+  });
+
+  it('hands back only the claim of the operator whose report could not be built', async () => {
+    const h = build();
+    h.buildReport.mockImplementationOnce(() => Promise.reject(new Error('database is slow')));
+
+    await h.cron.tick();
+
+    expect([...h.keys]).toEqual([reportLastPostedKey(OPERATOR_B.id)]);
   });
 });

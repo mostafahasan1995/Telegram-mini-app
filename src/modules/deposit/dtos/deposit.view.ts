@@ -95,7 +95,8 @@ export interface DepositViewContext {
   requiresSecondApproval?: boolean;
   proofs?: readonly DepositProof[];
   player?: {
-    telegramUserId: bigint;
+    /** Null for a player that was never a Telegram account (an imported one). */
+    telegramUserId: bigint | null;
     telegramUsername: string | null;
   } | null;
 }
@@ -141,7 +142,7 @@ export function toAdminDepositView(
     id: deposit.id,
     playerId: deposit.playerId,
     // Telegram ids exceed 2^53; they leave as strings or not at all.
-    playerTelegramUserId: context.player?.telegramUserId.toString() ?? null,
+    playerTelegramUserId: context.player?.telegramUserId?.toString() ?? null,
     playerTelegramUsername: context.player?.telegramUsername ?? null,
     paymentMethodId: deposit.paymentMethodId,
     reviewStartedAt: iso(deposit.reviewStartedAt),

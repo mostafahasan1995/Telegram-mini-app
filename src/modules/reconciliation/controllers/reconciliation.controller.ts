@@ -31,6 +31,7 @@ import { ValidationError } from '@common/exceptions/app.exception';
 import { AppConfigService } from '@core/config/config.service';
 import type { LedgerInvariantReport } from '@core/ledger';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { requireEffectiveTenantId } from '@core/tenant/tenant.storage';
 
 import { CorrectFloatDto, ListBreaksQueryDto, ResolveBreakDto } from '../dtos/break-query.dto';
 import { toBreakView, type BreakView } from '../dtos/break.view';
@@ -106,8 +107,7 @@ export class ReconciliationController {
   @Get('breaks/:id')
   @AdminAuth(...VIEW_ROLES)
   async detail(@Param('id', ParseUUIDPipe) id: string): Promise<BreakView> {
-    const row = await this.prisma.reconciliationBreak.findUniqueOrThrow({ where: { id } });
-    return toBreakView(row);
+    return toBreakView(await this.breaks.getInTenant(id));
   }
 
   /** POST /v1/admin/reconciliation/breaks/:id/resolve */
@@ -156,8 +156,16 @@ export class ReconciliationController {
     deltaMinor: string | null;
     breakId: string | null;
     belowWatermark: boolean;
+    ichancyFake: boolean;
   }> {
-    const result: FloatSyncResult = await this.floatSync.sync(this.config.ichancy.currency);
+    // The OPERATOR's currency, as the sweep uses: its float account and its agent wallet are in the
+    // currency it trades in, which is not necessarily the deployment's.
+    const operator = await this.prisma.tenant.findUnique({
+      where: { id: requireEffectiveTenantId() },
+      select: { currencyCode: true },
+    });
+    const currencyCode = operator?.currencyCode ?? this.config.ichancy.currency;
+    const result: FloatSyncResult = await this.floatSync.sync(currencyCode);
     return {
       currencyCode: result.currencyCode,
       ledgerMinor: result.ledgerMinor.toString(),
@@ -165,6 +173,7 @@ export class ReconciliationController {
       deltaMinor: result.deltaMinor?.toString() ?? null,
       breakId: result.breakId,
       belowWatermark: result.belowWatermark,
+      ichancyFake: result.ichancyFake,
     };
   }
 

@@ -18,6 +18,9 @@ logs/
 npm-debug.log*
 tmp/
 uploads/
+# The local file-storage driver's default directory (DEFAULT_LOCAL_STORAGE_DIR). It holds deposit proof
+# images, which are players' financial documents, so it must never be committed; test runs write here too.
+.storage/
 
 # editors / OS
 .idea/

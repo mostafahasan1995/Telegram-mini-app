@@ -36,6 +36,14 @@ export const ICHANCY_HEALTH_ALERT_LOCK_TTL_MS = 55_000;
  */
 export const ICHANCY_HEALTH_ANNOUNCE_TTL_SECONDS = 24 * 60 * 60;
 
+/**
+ * How long a claim lives while its message is still being SENT. Far longer than one send, retries
+ * included, so a slow send is never announced twice. Far shorter than a day, so a process that dies
+ * mid-send leaves an operator unalerted for minutes, not until tomorrow. A completed send rewrites
+ * the marker with ICHANCY_HEALTH_ANNOUNCE_TTL_SECONDS.
+ */
+export const ICHANCY_HEALTH_IN_FLIGHT_TTL_SECONDS = 10 * 60;
+
 /** Only one replica sweeps per tick. Slightly under the interval so a tick is never skipped. */
 export const RECON_LOCK_TTL_MS = 4 * 60_000;
 

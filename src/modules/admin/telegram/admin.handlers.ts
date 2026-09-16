@@ -39,18 +39,16 @@ import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { AdminRole, BreakStatus } from '@prisma/client';
 import type { Context } from 'grammy';
 
-import type { AuthenticatedAdmin } from '@common/decorators/auth.types';
+import type { TelegramAuthenticatedAdmin } from '@common/decorators/auth.types';
 import { formatMinorToDecimal } from '@common/helpers/money.util';
+import { holdsAnyRole } from '@core/auth/admin-authority';
 import { AdminIdentityService } from '@core/auth/services/admin-identity.service';
 import { AppConfigService } from '@core/config/config.service';
 import { ICHANCY_PORT, type IchancyPort, isIchancyOk } from '@core/ichancy';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { OnCommand } from '@core/telegram/decorators/handlers.decorator';
+import { requireEffectiveTenantId } from '@core/tenant/tenant.storage';
 
-import {
-  AdminLoginCodeService,
-  LOGIN_CODE_TTL_MINUTES,
-} from '../services/admin-login-code.service';
 import {
   ActivityReportService,
   REPORT_USAGE,
@@ -137,71 +135,12 @@ export class AdminTelegramHandlers {
     private readonly admins: AdminIdentityService,
     private readonly activityReport: ActivityReportService,
     private readonly config: AppConfigService,
-    private readonly loginCodes: AdminLoginCodeService,
     @Inject(ICHANCY_PORT) private readonly ichancy: IchancyPort,
     // @Optional because this module is booted WITHOUT the composition root in
     // src/modules/modules.int.spec.ts. Undefined there, bound in both real graphs; /register says so
     // rather than failing to construct the whole handler class.
     @Optional() @Inject(PLAYER_LINK_PORT) private readonly playerLink: PlayerLinkPort | null,
   ) {}
-
-  // ---------------------------------------------------------------------------------------------
-  // /login — hand this Telegram account a one-time code for the manager console
-  // ---------------------------------------------------------------------------------------------
-
-  /**
-   * WHY THIS COMMAND EXISTS: the native admin console cannot produce Telegram initData, so it has no
-   * way to prove who it is. This bot already knows — Telegram signed the update, and
-   * AdminIdentityService mapped it to active staff. The code carries that proof to the app.
-   *
-   * WHY IT IS `/console` AND NOT `/login`: `/login` belongs to the PLAYER app, which every user of
-   * this bot can reach. grammY's `bot.command()` registers middleware, so two handlers on the same
-   * command means only the first-registered one ever runs — and since this handler returns silently
-   * for non-admins, a player sending /login would have got nothing at all. Most people here are
-   * players, so they keep the obvious verb; staff type a word that names the thing they are opening.
-   * A person who is BOTH (the owner is) then gets to say which credential they want, instead of the
-   * bot guessing.
-   *
-   * WHY IT REFUSES OUTSIDE A PRIVATE CHAT, LOUDLY: a login code posted in the admin supergroup is a
-   * credential handed to everyone in it, and `ctx.reply` answers wherever the command was sent. The
-   * group check is therefore not politeness, it is the security boundary. This is also the ONE place
-   * in this file that answers a non-private chat instead of returning silently — the caller is
-   * already a confirmed admin, so there is no surface to leak, and silence here would read as "the
-   * bot is broken" and get retried in the group.
-   */
-  @OnCommand('console')
-  async onConsoleLogin(ctx: Context): Promise<void> {
-    const admin = await this.requireAdmin(ctx);
-    if (admin === null) return;
-
-    if (ctx.chat?.type !== 'private') {
-      await ctx.reply(
-        'Not here — a login code must never be posted in a group. ' +
-          // /console, not /login: /login is the PLAYER command and would hand an admin a player
-          // code, redeemable only on the player route (LoginCodeService scopes the two apart).
-          'Open a direct chat with me and send /console there.',
-      );
-      return;
-    }
-
-    try {
-      const { code } = await this.loginCodes.mint(admin);
-
-      await ctx.reply(
-        `<b>Manager console login</b>\n\n` +
-          `<code>${esc(code)}</code>\n\n` +
-          `Valid for ${LOGIN_CODE_TTL_MINUTES} minutes, once. ` +
-          `Type it into the console's sign-in screen.\n\n` +
-          `If you did not ask for this, ignore it — a code is useless without the app, ` +
-          `and sending /console again cancels this one.`,
-        { parse_mode: 'HTML' },
-      );
-    } catch (error: unknown) {
-      // Same contract as every handler here: never throw, always leave the operator an answer.
-      this.logger.error(`/login failed for ${admin.adminUserId}: ${describeError(error)}`);
-      await ctx.reply('Could not issue a code right now. Try again in a moment.');
-    }
-  }
 
   // ---------------------------------------------------------------------------------------------
   // /register <telegram id> — open a player's Ichancy account (mirrors POST /v1/admin/players/:id/ichancy-account)
@@ -227,7 +166,7 @@ export class AdminTelegramHandlers {
   async onRegister(ctx: Context): Promise<void> {
     const admin = await this.requireAdmin(ctx);
     if (admin === null) return;
-    if (!REGISTER_ROLES.includes(admin.role)) return;
+    if (!holdsAnyRole(admin, REGISTER_ROLES)) return;
 
     if (this.playerLink === null) {
       // Only reachable in a graph without the composition root, i.e. never in production.
@@ -249,8 +188,16 @@ export class AdminTelegramHandlers {
       return;
     }
 
+    // A Telegram id identifies a player only WITHIN an operator, and an inbound update carries no
+    // tenant of its own. The operator is the one whose bot received this command, which
+    // TelegramUpdateProcessor entered from the webhook path token.
     const player = await this.prisma.player.findUnique({
-      where: { telegramUserId: BigInt(raw) },
+      where: {
+        tenantId_telegramUserId: {
+          tenantId: requireEffectiveTenantId(),
+          telegramUserId: BigInt(raw),
+        },
+      },
       select: { id: true, ichancyPlayerId: true },
     });
     if (player === null) {
@@ -264,6 +211,11 @@ export class AdminTelegramHandlers {
 
     try {
       const link = await this.playerLink.ensureLinked(player.id, `telegram:/register:${admin.adminUserId}`);
+      // The operator's own agent, which is the one ensureLinked registered under. Never the env's.
+      const operator = await this.prisma.tenant.findUnique({
+        where: { id: requireEffectiveTenantId() },
+        select: { ichancyAgentId: true },
+      });
       await this.reply(
         ctx,
         [
@@ -274,7 +226,7 @@ export class AdminTelegramHandlers {
           `Ichancy login: <code>${esc(link.ichancyLogin)}</code>`,
           `Ichancy id: <code>${esc(link.ichancyPlayerId)}</code>`,
           '',
-          `<i>Registered under agent ${esc(this.config.ichancy.agentId)}.</i>`,
+          `<i>Registered under agent ${esc(operator?.ichancyAgentId ?? '—')}.</i>`,
         ].join('\n'),
       );
     } catch (error: unknown) {
@@ -348,10 +300,14 @@ export class AdminTelegramHandlers {
       // Waiting starts when the player submitted, not when the draft was opened: an abandoned draft
       // that was finished an hour later has not been ignored for a day.
       const since = row.submittedAt ?? row.createdAt;
+      // An imported player has no Telegram account until one is attached, and cannot open a
+      // deposit before that, but a queue line must never throw on the row it describes.
       const who =
-        row.player.telegramUsername === null
-          ? `id ${row.player.telegramUserId.toString()}`
-          : `@${row.player.telegramUsername}`;
+        row.player.telegramUsername !== null
+          ? `@${row.player.telegramUsername}`
+          : row.player.telegramUserId === null
+            ? 'no Telegram account'
+            : `id ${row.player.telegramUserId.toString()}`;
 
       lines.push(
         `<code>${esc(row.shortId)}</code> · <b>${formatMinorToDecimal(amountMinor)} ${esc(row.currencyCode)}</b>`,
@@ -566,12 +522,18 @@ export class AdminTelegramHandlers {
    * cannot identify, for someone who is not staff, and for a lookup that failed — and the caller
    * answers all four the same way, with silence. See the header for why.
    */
-  private async requireAdmin(ctx: Context): Promise<AuthenticatedAdmin | null> {
+  private async requireAdmin(ctx: Context): Promise<TelegramAuthenticatedAdmin | null> {
     const from = ctx.from;
     if (from === undefined || from.is_bot) return null;
 
     try {
-      return await this.admins.resolve(BigInt(from.id));
+      // Authority is measured in a tenant: the operator whose bot received this update, entered by
+      // TelegramUpdateProcessor. Staff of another operator are nobody here, even when the same
+      // Telegram account is an admin there. Inside the try, so a missing context fails closed too.
+      //
+      // The Telegram door, never the id door: a console-only admin (no Telegram id) cannot be
+      // reached from the bot at all, which is correct — nothing here could prove it is them.
+      return await this.admins.resolveByTelegram(requireEffectiveTenantId(), BigInt(from.id));
     } catch (error: unknown) {
       // Failing CLOSED: a database or cache hiccup must not hand out the float, so an unreadable
       // identity is treated as "not an admin" rather than surfaced to the caller.

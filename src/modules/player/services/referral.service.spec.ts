@@ -1,9 +1,14 @@
 import type { AuditService } from '@core/audit/audit.service';
 import type { LockService } from '@core/cache/lock.service';
 import type { PrismaService } from '@core/prisma/prisma.service';
+import { TENANT_BOOTSTRAP_ID } from '@core/tenant';
 
 import { REFERRAL_BOUND_ACTION, ReferralService } from './referral.service';
 
+// Any single operator: these tests are about the referral rule, not about tenancy. What matters
+// is that every call names the SAME one, because a binding that crossed operators would not be
+// a referral at all.
+const TENANT_ID = TENANT_BOOTSTRAP_ID;
 const PLAYER_ID = 'aaaaaaaa-0000-4000-8000-000000000001';
 const REFERRER_ID = 'bbbbbbbb-0000-4000-8000-000000000002';
 const PLAYER_TG = 111111n;
@@ -95,6 +100,7 @@ describe('ReferralService.bindFromStartPayload', () => {
     const { service, auditWrite } = harness();
 
     const result = await service.bindFromStartPayload(
+      TENANT_ID,
       PLAYER_ID,
       PLAYER_TG,
       `ref_${REFERRER_TG}`,
@@ -121,6 +127,7 @@ describe('ReferralService.bindFromStartPayload', () => {
     const { service, playerFindUnique, auditWrite } = harness();
 
     const result = await service.bindFromStartPayload(
+      TENANT_ID,
       PLAYER_ID,
       PLAYER_TG,
       `ref_${PLAYER_TG}`,
@@ -136,6 +143,7 @@ describe('ReferralService.bindFromStartPayload', () => {
     const { service, auditWrite } = harness({ referrerId: null });
 
     const result = await service.bindFromStartPayload(
+      TENANT_ID,
       PLAYER_ID,
       PLAYER_TG,
       `ref_${REFERRER_TG}`,
@@ -150,6 +158,7 @@ describe('ReferralService.bindFromStartPayload', () => {
     const { service, auditWrite } = harness({ existingBinding: boundRow() });
 
     const result = await service.bindFromStartPayload(
+      TENANT_ID,
       PLAYER_ID,
       PLAYER_TG,
       'ref_999999',
@@ -168,6 +177,7 @@ describe('ReferralService.bindFromStartPayload', () => {
     auditFindFirst.mockResolvedValueOnce(null).mockResolvedValue(boundRow());
 
     const result = await service.bindFromStartPayload(
+      TENANT_ID,
       PLAYER_ID,
       PLAYER_TG,
       `ref_${REFERRER_TG}`,
@@ -183,6 +193,7 @@ describe('ReferralService.bindFromStartPayload', () => {
     acquire.mockResolvedValue(null);
 
     const result = await service.bindFromStartPayload(
+      TENANT_ID,
       PLAYER_ID,
       PLAYER_TG,
       `ref_${REFERRER_TG}`,
@@ -197,14 +208,14 @@ describe('ReferralService.bindFromStartPayload', () => {
     const { service, auditFindFirst, release } = harness();
     auditFindFirst.mockResolvedValueOnce(null).mockResolvedValue(boundRow());
 
-    await service.bindFromStartPayload(PLAYER_ID, PLAYER_TG, `ref_${REFERRER_TG}`, 'x');
+    await service.bindFromStartPayload(TENANT_ID, PLAYER_ID, PLAYER_TG, `ref_${REFERRER_TG}`, 'x');
     expect(release).toHaveBeenCalledTimes(1);
   });
 
   it('does nothing at all when there is no payload', async () => {
     const { service, auditFindFirst, acquire } = harness();
 
-    const result = await service.bindFromStartPayload(PLAYER_ID, PLAYER_TG, null, 'x');
+    const result = await service.bindFromStartPayload(TENANT_ID, PLAYER_ID, PLAYER_TG, null, 'x');
 
     expect(result.outcome).toBe('IGNORED_NO_PAYLOAD');
     expect(auditFindFirst).not.toHaveBeenCalled();

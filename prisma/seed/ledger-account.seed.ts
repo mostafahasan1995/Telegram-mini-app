@@ -11,6 +11,11 @@
  * convention, the display name and which scope column gets filled. Restating those here would
  * create a second source of truth that only disagrees with the ledger's when it matters.
  *
+ * WHOSE BOOK THIS IS: the bootstrap operator's. An account code is only unique within a tenant now
+ * (`@@unique([tenantId, code])`), and it has to be — two operators both have an agent float in NSP,
+ * and their balances are not each other's money. The rails these are scoped to are seeded into the
+ * same tenant, so the two agree by construction.
+ *
  * WHY `cachedBalanceMinor` is never in the update clause: it is an advisory cache maintained by
  * every posting and rewritten by the reconciliation job. A re-run of the seed that reset it to zero
  * would make the approval path believe the agent float is empty and refuse every credit until the
@@ -18,6 +23,7 @@
  */
 import type { PrismaClient } from '@prisma/client';
 
+import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
 import {
   houseCashCode,
   houseRoundingCode,
@@ -63,15 +69,17 @@ export async function seedLedgerAccounts(
 
   for (const code of ledgerAccountCodesFor(input)) {
     const parsed = parseAccountCode(code);
+    const identity = { tenantId: TENANT_BOOTSTRAP_ID, code };
 
     const existing = await prisma.ledgerAccount.findUnique({
-      where: { code },
+      where: { tenantId_code: identity },
       select: { id: true },
     });
 
     if (existing === null) {
       await prisma.ledgerAccount.create({
         data: {
+          tenantId: TENANT_BOOTSTRAP_ID,
           code: parsed.code,
           kind: parsed.kind,
           name: parsed.name,
@@ -89,7 +97,7 @@ export async function seedLedgerAccounts(
     }
 
     await prisma.ledgerAccount.update({
-      where: { code },
+      where: { tenantId_code: identity },
       // Name and active flag only — see the header on cachedBalanceMinor.
       data: { name: parsed.name, isActive: true },
     });

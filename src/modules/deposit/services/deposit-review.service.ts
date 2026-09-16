@@ -50,6 +50,7 @@ import { formatMinorToDecimal } from '@common/helpers/money.util';
 import type { AuthenticatedAdmin } from '@common/decorators/auth.types';
 import { adminActor } from '@common/types/actor.type';
 import { AuditService } from '@core/audit/audit.service';
+import { holdsAnyRole } from '@core/auth/admin-authority';
 import { AppConfigService } from '@core/config/config.service';
 import {
   AccountRegistryService,
@@ -60,6 +61,7 @@ import {
 import { OutboxService } from '@core/outbox/outbox.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import type { Tx } from '@core/prisma/tx.type';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 import {
   DEPOSIT_AGGREGATE,
@@ -96,7 +98,11 @@ export type ReviewOutcome =
   /** Somebody else already decided. NOT an error — see DepositStateMachine's header. */
   | { kind: 'alreadyHandled'; status: DepositStatus | null };
 
-/** Roles allowed to decide money. VIEWER and SUPPORT can look; they cannot approve. */
+/**
+ * Roles allowed to decide money. VIEWER and SUPPORT can look; they cannot approve. Platform staff
+ * (PLATFORM_ADMIN in tenant zero) also decides, as the contract's owner superset — through
+ * `holdsAnyRole`, not by being listed here.
+ */
 const DECIDING_ROLES: readonly AdminRole[] = Object.freeze([
   AdminRole.SUPER_ADMIN,
   AdminRole.FINANCE_ADMIN,
@@ -104,6 +110,10 @@ const DECIDING_ROLES: readonly AdminRole[] = Object.freeze([
 ]);
 
 const MINUTE_MS = 60_000;
+
+/** One body for "no such deposit" and "another operator's deposit", so ids cannot be probed. */
+const depositNotFound = (): NotFoundError =>
+  new NotFoundError(DepositErrorCodes.DEPOSIT_NOT_FOUND, 'Deposit not found.');
 
 @Injectable()
 export class DepositReviewService {
@@ -160,6 +170,10 @@ export class DepositReviewService {
       });
 
       if (outcome.kind === 'alreadyHandled') {
+        // The CAS and the read that explains a miss are both pinned to the effective operator, so
+        // NOT_FOUND covers an id that never existed AND another operator's deposit — one answer for
+        // both, the 404 the console expects, and nothing about the other operator's row.
+        if (outcome.reason === 'NOT_FOUND') throw depositNotFound();
         if (outcome.reason === 'GUARD_FAILED') {
           throw new BusinessRuleError(
             DepositErrorCodes.DEPOSIT_CLAIMED_BY_OTHER,
@@ -206,6 +220,8 @@ export class DepositReviewService {
       });
 
       if (outcome.kind === 'alreadyHandled') {
+        // Same rule as claim(): an unknown id and another operator's deposit are one 404.
+        if (outcome.reason === 'NOT_FOUND') throw depositNotFound();
         return { kind: 'alreadyHandled', status: outcome.current };
       }
       return { kind: 'released', deposit: outcome.deposit };
@@ -472,7 +488,8 @@ export class DepositReviewService {
 
     // ── 4. verified/credited amounts, kept separate from the claim ───────────────────────────
     const deposit = await tx.depositRequest.update({
-      where: { id: before.id },
+      // `before` was read pinned to the effective tenant, and the CAS above ran in it.
+      where: { id: before.id, tenantId: before.tenantId },
       data: {
         verifiedAmountMinor,
         creditedAmountMinor: creditAmountMinor,
@@ -563,7 +580,13 @@ export class DepositReviewService {
   ): Promise<ApprovalDecisionValue> {
     const decision = await this.approvalLimits.evaluate(
       tx,
-      { adminUserId: input.admin.adminUserId, role: input.admin.role },
+      // tenantId is the HOME tenant off the principal: the evaluator exempts PLATFORM_ADMIN from
+      // ceilings only when that home is tenant zero, never on the strength of an X-Tenant-Id header.
+      {
+        adminUserId: input.admin.adminUserId,
+        role: input.admin.role,
+        tenantId: input.admin.tenantId,
+      },
       amountMinor,
       currencyCode,
     );
@@ -603,16 +626,20 @@ export class DepositReviewService {
     }
   }
 
+  /**
+   * The deposit, IN THE EFFECTIVE OPERATOR, before anything else is looked at. Everything approve()
+   * says before its CAS — the claimed amount against a limit, the fee, the status of a second
+   * approval — describes this row, so another operator's id has to stop here as a plain
+   * DEPOSIT_NOT_FOUND, indistinguishable from an id that never existed.
+   */
   private async requireDeposit(tx: Tx, id: string): Promise<DepositRequest> {
-    const deposit = await this.deposits.findById(tx, id);
-    if (deposit === null) {
-      throw new NotFoundError(DepositErrorCodes.DEPOSIT_NOT_FOUND, 'Deposit not found.');
-    }
+    const deposit = await this.deposits.findByIdInTenant(tx, requireEffectiveTenantId(), id);
+    if (deposit === null) throw depositNotFound();
     return deposit;
   }
 
   private assertCanDecide(admin: AuthenticatedAdmin): void {
-    if (!DECIDING_ROLES.includes(admin.role)) {
+    if (!holdsAnyRole(admin, DECIDING_ROLES)) {
       throw new ForbiddenError(
         DepositErrorCodes.ADMIN_NO_APPROVAL_LIMIT,
         'Your role cannot decide deposits.',

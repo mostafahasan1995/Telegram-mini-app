@@ -15,6 +15,13 @@
  * WHY a failure downgrades rather than throws: an unreadable image is not a system fault — it is a
  * fact about the upload, and the right response is a PROOF_UNREADABLE risk flag on the admin card,
  * not a job that retries eight times and then sits in a dead-letter set nobody reads.
+ *
+ * WHOSE OPERATOR IS THIS: the media queue has no request, so nothing is ambient. The parent deposit
+ * is the only honest answer, and `ingest` reads it before doing anything else — so the work runs
+ * inside that tenant rather than stamping `tenantId` onto writes one at a time. That matters most
+ * for the READS: a duplicate proof is only a duplicate WITHIN one operator, and the sha256 lookup
+ * behind ProofDuplicateService is a `findMany` that, with no tenant in scope, would happily report
+ * another operator's proof as a match — evidence against a player that has nothing to do with them.
  */
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import type { DepositProof } from '@prisma/client';
@@ -35,6 +42,7 @@ import { OutboxService } from '@core/outbox/outbox.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { isUniqueConstraintError, mapPrismaError } from '@core/prisma/prisma-errors';
 import type { Tx } from '@core/prisma/tx.type';
+import { runWithTenant } from '@core/tenant';
 
 import { DEPOSIT_AGGREGATE, DEPOSIT_TOPICS } from '../deposit.constants';
 import { RiskFlags, RISK_FLAG_SEVERITY, type RiskFlag } from '../enums/risk-flag.enum';
@@ -45,6 +53,17 @@ export interface IngestOutcome {
   proofId: string;
   status: 'normalized' | 'already-normalized' | 'unreadable' | 'missing';
   riskFlags: RiskFlag[];
+}
+
+/**
+ * The slice of the parent deposit this job needs. `tenantId` rides along because every row written
+ * here hangs off THIS deposit and because it is what scopes the duplicate search — see the header.
+ */
+interface ParentDeposit {
+  id: string;
+  tenantId: string;
+  playerId: string;
+  shortId: string;
 }
 
 @Injectable()
@@ -61,17 +80,28 @@ export class ProofIngestService {
   ) {}
 
   async ingest(depositProofId: string): Promise<IngestOutcome> {
-    const proof = await this.deposits.findProof(this.prisma, depositProofId);
+    // The one lookup that cannot name a tenant: the job carries a proof id our own outbox wrote and
+    // nothing else, and this row is what says whose it is. See findProofForWorker.
+    const proof = await this.deposits.findProofForWorker(this.prisma, depositProofId);
     if (proof === null) {
       this.logger.warn(`proof ${depositProofId} vanished before ingestion`);
       return { proofId: depositProofId, status: 'missing', riskFlags: [] };
     }
 
     const deposit = await this.prisma.depositRequest.findUniqueOrThrow({
-      where: { id: proof.depositRequestId },
-      select: { id: true, playerId: true, shortId: true },
+      // The proof's own tenant, so a proof row can only ever lead to a deposit of its operator.
+      where: { id: proof.depositRequestId, tenantId: proof.tenantId },
+      select: { id: true, tenantId: true, playerId: true, shortId: true },
     });
 
+    return runWithTenant(deposit.tenantId, () => this.ingestForDeposit(proof, deposit));
+  }
+
+  /** Everything past the parent lookup, running as the deposit's operator. */
+  private async ingestForDeposit(
+    proof: DepositProof,
+    deposit: ParentDeposit,
+  ): Promise<IngestOutcome> {
     if (isNormalizedKey(proof.storageKey)) {
       // Already normalized. Re-index anyway: it is idempotent and repairs a lost cache entry.
       await this.reindex(proof, deposit.playerId);
@@ -100,6 +130,7 @@ export class ProofIngestService {
 
     const riskFlags = await this.prisma.runInTransaction(async (tx) => {
       const report = await this.duplicates.findDuplicates(tx, {
+        tenantId: deposit.tenantId,
         proofId: proof.id,
         depositRequestId: deposit.id,
         playerId: deposit.playerId,
@@ -130,11 +161,12 @@ export class ProofIngestService {
       // does not change the deposit's STATUS, so this row records the finding without a state move.
       await tx.depositTransition.create({
         data: {
+          tenantId: deposit.tenantId,
           depositRequestId: deposit.id,
           fromStatus: null,
           toStatus: (
             await tx.depositRequest.findUniqueOrThrow({
-              where: { id: deposit.id },
+              where: { id: deposit.id, tenantId: deposit.tenantId },
               select: { status: true },
             })
           ).status,
@@ -172,6 +204,7 @@ export class ProofIngestService {
     });
 
     await this.duplicates.index({
+      tenantId: deposit.tenantId,
       proofId: proof.id,
       depositRequestId: deposit.id,
       playerId: deposit.playerId,
@@ -211,14 +244,14 @@ export class ProofIngestService {
     },
   ): Promise<void> {
     try {
-      await this.deposits.updateProof(tx, proof.id, patch);
+      await this.deposits.updateProofInTenant(tx, proof.tenantId, proof.id, patch);
     } catch (cause) {
       const mapped = mapPrismaError(cause, { model: 'DepositProof', operation: 'update' });
       if (!isUniqueConstraintError(mapped)) throw mapped;
       this.logger.log(
         `proof ${proof.id} normalizes to a hash already on deposit ${proof.depositRequestId}; keeping one copy`,
       );
-      await tx.depositProof.delete({ where: { id: proof.id } });
+      await tx.depositProof.delete({ where: { id: proof.id, tenantId: proof.tenantId } });
     }
   }
 
@@ -226,6 +259,7 @@ export class ProofIngestService {
     const perceptualHash = await this.perceptualHashFromTransitions(proof);
     if (perceptualHash === null) return;
     await this.duplicates.index({
+      tenantId: proof.tenantId,
       proofId: proof.id,
       depositRequestId: proof.depositRequestId,
       playerId,
@@ -259,7 +293,7 @@ export class ProofIngestService {
 
   private async markUnreadable(
     proof: DepositProof,
-    deposit: { id: string; playerId: string; shortId: string },
+    deposit: ParentDeposit,
     cause: unknown,
   ): Promise<IngestOutcome> {
     const reason = isFileStorageError(cause)
@@ -272,11 +306,12 @@ export class ProofIngestService {
 
     await this.prisma.runInTransaction(async (tx) => {
       const current = await tx.depositRequest.findUniqueOrThrow({
-        where: { id: deposit.id },
+        where: { id: deposit.id, tenantId: deposit.tenantId },
         select: { status: true },
       });
       await tx.depositTransition.create({
         data: {
+          tenantId: deposit.tenantId,
           depositRequestId: deposit.id,
           fromStatus: null,
           toStatus: current.status,

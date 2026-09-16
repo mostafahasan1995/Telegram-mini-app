@@ -13,6 +13,7 @@ import type { Prisma } from '@prisma/client';
 import { PrismaService } from '@core/prisma/prisma.service';
 import type { Tx } from '@core/prisma/tx.type';
 import { AuditService } from '@core/audit/audit.service';
+import { requireEffectiveTenantId } from '@core/tenant/tenant.storage';
 import { BusinessRuleError, NotFoundError } from '@common/exceptions/app.exception';
 import { paginate, type PaginatedResult } from '@common/dtos/paginated.dto';
 
@@ -55,7 +56,7 @@ export class PlayerService {
   }
 
   async getOwnView(playerId: string): Promise<PlayerView> {
-    const player = await this.players.findById(playerId);
+    const player = await this.players.findByIdInTenant(requireEffectiveTenantId(), playerId);
     if (player === null) {
       throw new NotFoundError(PlayerErrorCodes.PLAYER_NOT_FOUND, 'Player not found.');
     }
@@ -83,14 +84,29 @@ export class PlayerService {
   /**
    * First sight or returning visit. Takes `tx` so the caller can commit the player row and the
    * login audit together — a session that exists without the row it belongs to is unexplainable.
+   *
+   * `tenantId` is explicit rather than read from the ambient context because the two callers are
+   * both sign-in paths: @Public() routes that arrive with no token, and therefore with no tenant
+   * context to read. Signing in is what ESTABLISHES the tenant, so it cannot also depend on it.
+   *
+   * It is returned alongside `playerId` for the same reason the session needs it: an existing
+   * player's row already names an operator, and the session must be stamped with THAT one rather
+   * than with whatever the caller assumed. PlayerView deliberately does not carry it — that type
+   * is a client-facing allow-list.
    */
   async upsertFromTelegram(
     tx: Tx,
+    tenantId: string,
     profile: TelegramProfile,
     currencyCode: string,
-  ): Promise<{ player: PlayerView; playerId: string; isNew: boolean }> {
-    const before = await this.players.findByTelegramUserId(profile.telegramUserId, tx);
-    const player = await this.players.upsertFromTelegram(profile, currencyCode, tx);
+  ): Promise<{
+    player: PlayerView;
+    playerId: string;
+    tenantId: string;
+    isNew: boolean;
+  }> {
+    const before = await this.players.findByTelegramUserId(tenantId, profile.telegramUserId, tx);
+    const player = await this.players.upsertFromTelegram(tenantId, profile, currencyCode, tx);
     const isNew = before === null;
 
     if (isNew) {
@@ -100,14 +116,22 @@ export class PlayerService {
         subjectType: 'Player',
         subjectId: player.id,
         after: {
-          telegramUserId: player.telegramUserId.toString(),
+          // The profile's id, which the upsert keyed the row on: a row upserted from Telegram has one.
+          telegramUserId: profile.telegramUserId.toString(),
           telegramUsername: player.telegramUsername,
           currencyCode: player.currencyCode,
         },
       });
     }
 
-    return { player: toPlayerView(player), playerId: player.id, isNew };
+    return {
+      player: toPlayerView(player),
+      playerId: player.id,
+      // The ROW's tenant, not the argument: a returning player keeps the operator they registered
+      // with even if the caller guessed a different one.
+      tenantId: player.tenantId,
+      isNew,
+    };
   }
 
   /**
@@ -119,7 +143,8 @@ export class PlayerService {
     const client: Tx = tx ?? this.prisma;
 
     const player = await client.player.findUnique({
-      where: { id: playerId },
+      // The operator being served (the player's session, or the bot the update came through).
+      where: { id: playerId, tenantId: requireEffectiveTenantId() },
       select: { status: true },
     });
     if (player === null) {

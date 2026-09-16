@@ -1,12 +1,13 @@
 /**
  * The smallest graph that can run an operational command. Deliberately NOT AppModule: a CLI that
  * boots the api graph would attach BullMQ producers, the outbox relay and every feature module just
- * to call setWebhook once — and `webhook:set` is run by a human during a deploy, often against
- * production, so the fewer things it wakes up the better.
+ * to call setWebhook for a few operators — and `webhook:set` is run by a human during a deploy, often
+ * against production, so the fewer things it wakes up the better.
  *
- * TelegramModule brings BotService and the SetWebhookCommand itself; PrismaModule and CacheModule
- * are here because TelegramModule's own providers need them (UpdateDedupeService writes rows, the
- * bot factory caches getMe in Redis).
+ * TelegramModule brings BotService, the per-operator bot registry, TenantModule (tenant rows and
+ * their sealed secrets) and the two Telegram commands; PrismaModule and CacheModule are here
+ * because those providers need them (UpdateDedupeService writes rows, the registry caches each
+ * bot's getMe in Redis).
  */
 import { Module } from '@nestjs/common';
 

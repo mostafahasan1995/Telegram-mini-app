@@ -21,9 +21,6 @@ export interface TestEnvOverrides {
   [key: string]: string | undefined;
 }
 
-/** Matches the schema's /^\d+:[A-Za-z0-9_-]{20,}$/ without being a real token. */
-const FAKE_BOT_TOKEN = '123456789:TEST_ONLY_NOT_A_REAL_BOT_TOKEN_00000';
-
 const DEFAULTS: Record<string, string> = {
   APP_ROLE: 'api',
   NODE_ENV: 'test',
@@ -36,10 +33,9 @@ const DEFAULTS: Record<string, string> = {
   JWT_ACCESS_TTL: '15m',
   REFRESH_TTL_DAYS: '30',
 
-  TELEGRAM_BOT_TOKEN: FAKE_BOT_TOKEN,
-  TELEGRAM_WEBHOOK_SECRET: 'test_webhook_secret_0123456789ab',
-  TELEGRAM_WEBHOOK_PATH_TOKEN: 'test_webhook_path_token',
-  TELEGRAM_ADMIN_CHAT_ID: '-1001234567890',
+  // No TELEGRAM_* identity: every operator's bot token, webhook and chats live on its tenant row.
+  // A suite that needs a working bot seals a fake token onto a fixture tenant (see
+  // telegram-fixtures.ts), exactly as production would from the dashboard.
 
   MINI_APP_ORIGIN: 'http://localhost:5173',
 

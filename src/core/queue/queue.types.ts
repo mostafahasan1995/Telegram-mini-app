@@ -47,6 +47,12 @@ export const TASKS = {
 
 export interface OutboxDispatchTask {
   outboxId: string;
+  /**
+   * Whose side effect this is. The relay claims across every operator, so the worker has no ambient
+   * tenant to inherit — it is carried in the payload, and the dispatch processor enters that tenant
+   * before any handler touches a row.
+   */
+  tenantId: string;
   topic: string;
   aggregateType: string;
   aggregateId: string;
@@ -94,6 +100,8 @@ export interface MediaProofProcessTask {
 }
 
 export interface ReconAgentFloatCheckTask {
+  /** The operator whose float is compared, with its own agent. Required: a job has no context. */
+  tenantId: string;
   currencyCode: string;
 }
 

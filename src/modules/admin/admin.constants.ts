@@ -19,7 +19,72 @@ export const AdminErrorCodes = {
 
   APPROVAL_LIMIT_NOT_FOUND: 'APPROVAL_LIMIT_NOT_FOUND',
   APPROVAL_LIMIT_INVALID: 'APPROVAL_LIMIT_INVALID',
+
+  // ── Console sign-in (API-CONTRACT.md §2a). The console's login page switches on these. ──────
+  //
+  // BOT_CODE_INVALID and BOT_CODE_EXPIRED were this surface's codes for the bot-code door removed
+  // on 2026-09-05. They are RETIRED here and must never be reused for anything else. (The player
+  // app's own BOT_CODE_INVALID, in player.constants.ts, is a different, still-live route.)
+
+  /** 401. No usable account holds this username and password. One sentence for every cause. */
+  ADMIN_CREDENTIALS_INVALID: 'ADMIN_CREDENTIALS_INVALID',
+  /** 409. Right password, several active operators. `details.operators`; retry with operatorSlug. */
+  ADMIN_OPERATOR_AMBIGUOUS: 'ADMIN_OPERATOR_AMBIGUOUS',
+  /** 403. Right password, but every operator it opens is SUSPENDED. `details.operators`. */
+  ADMIN_OPERATOR_NOT_ACTIVE: 'ADMIN_OPERATOR_NOT_ACTIVE',
+
+  // ── The operator's Ichancy agent account (API-CONTRACT.md §2b). Also answered by /credentials
+  //    once the agent account, not the console password, is what matched (§2a). ───────────────
+
+  /** 401, /ichancy only. No non-CLOSED operator holds that username and password. Says no more. */
+  AGENT_CREDENTIALS_INVALID: 'AGENT_CREDENTIALS_INVALID',
+  /** 409. Right agent credentials, several active operators. `details.operators`; retry with slug. */
+  AGENT_OPERATOR_AMBIGUOUS: 'AGENT_OPERATOR_AMBIGUOUS',
+  /** 403. Right agent credentials, but the operator is SUSPENDED. */
+  AGENT_OPERATOR_NOT_ACTIVE: 'AGENT_OPERATOR_NOT_ACTIVE',
+  /**
+   * 403. Right agent credentials, but the operator has staff and none of them is an active
+   * SUPER_ADMIN: its agent principal was deactivated or demoted. "No staff at all" is not this — that
+   * case creates the principal instead.
+   */
+  AGENT_OPERATOR_HAS_NO_OWNER: 'AGENT_OPERATOR_HAS_NO_OWNER',
+
+  /**
+   * 403. The actor may write staff but may not hand out this role (API-CONTRACT.md §3, `mayGrantRole`):
+   * PLATFORM_ADMIN is granted only by platform staff working in tenant zero with no X-Tenant-Id.
+   */
+  ADMIN_ROLE_NOT_GRANTABLE: 'ADMIN_ROLE_NOT_GRANTABLE',
+
+  // ── Linking a staff account to Telegram with a one-time code (owner decision 4, 2026-09-15). ──
+
+  /**
+   * 403. A code may be asked for only by the staff member for their own account, or by a platform
+   * admin; a link may be removed by the staff member, a SUPER_ADMIN of the operator, or a platform admin.
+   */
+  ADMIN_TELEGRAM_LINK_FORBIDDEN: 'ADMIN_TELEGRAM_LINK_FORBIDDEN',
+  /** 409. The account is already linked. Remove the link first; a code never replaces one silently. */
+  ADMIN_TELEGRAM_ALREADY_LINKED: 'ADMIN_TELEGRAM_ALREADY_LINKED',
+  /**
+   * 422. The account cannot be linked at all. `details.reason`: `PLATFORM` (tenant zero has no bot),
+   * `OPERATOR_CLOSED`, `AGENT_PRINCIPAL` (the reserved Telegram id 0 is how its sign-in finds it) or
+   * `INACTIVE`.
+   */
+  ADMIN_TELEGRAM_LINK_NOT_ALLOWED: 'ADMIN_TELEGRAM_LINK_NOT_ALLOWED',
 } as const;
+
+/**
+ * The Telegram id every operator's agent principal carries (API-CONTRACT.md §2b: "the reserved
+ * `telegram_user_id = 0`").
+ *
+ * WHY 0 AND NOT NULL, now that the column is nullable: the contract names 0, and the console's
+ * `AdminUserView` says a non-null id marks "admins made before [2026-09-05] plus each operator's agent
+ * principal". Two practical reasons agree with it. `@@unique([tenantId, telegramUserId])` then settles
+ * a race between two first sign-ins a second time, independently of the username index (NULLs are
+ * distinct and would not). And it can never resolve to a person: Telegram numbers users from 1, so no
+ * bot update carries `from.id = 0`. Code that DMs or scopes a menu to an admin's Telegram id must
+ * therefore skip ids that are not positive (TenantBotSetupService does).
+ */
+export const AGENT_PRINCIPAL_TELEGRAM_USER_ID = 0n;
 
 export type AdminErrorCode = (typeof AdminErrorCodes)[keyof typeof AdminErrorCodes];
 
@@ -29,7 +94,12 @@ export type AdminErrorCode = (typeof AdminErrorCodes)[keyof typeof AdminErrorCod
  * cannot be confused with one another.
  *
  * SUPER_ADMIN is listed EXPLICITLY rather than being implicitly granted everywhere: an implicit
- * god-role is exactly the thing that silently survives a permissions refactor.
+ * god-role among the TENANT roles is exactly the thing that silently survives a permissions
+ * refactor.
+ *
+ * PLATFORM_ADMIN is deliberately absent from this and every other role list: it is the owner
+ * superset by contract, and that single exemption is applied in one place
+ * (`@core/auth/admin-authority` `holdsAnyRole`) so these lists keep describing the tenant roles.
  */
 export const APPROVER_ROLES: readonly AdminRole[] = Object.freeze([
   'SUPER_ADMIN',
@@ -72,7 +142,9 @@ export const REPORT_SCHEDULE_LOCK_TTL_MS = 9 * 60_000;
  * TTL is the interval, so the fact survives a restart (which is what stops a redeploy re-posting)
  * and is shared by every replica (which is what stops two of them posting the same report).
  *
- * Not namespaced by period or by chat: there is exactly ONE scheduled report in this system, and a
- * key that quietly varies is a key that stops de-duplicating the moment a setting changes.
+ * Namespaced by OPERATOR and by nothing else: each operator gets one scheduled report of its own
+ * numbers, so one operator's post must never count as another's. Not by period or by chat: a key
+ * that quietly varies with a setting is a key that stops de-duplicating the moment it changes.
  */
-export const REPORT_LAST_POSTED_KEY = 'admin:report:last-posted';
+export const reportLastPostedKey = (tenantId: string): string =>
+  `admin:report:last-posted:${tenantId}`;

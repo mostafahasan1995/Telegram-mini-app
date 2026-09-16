@@ -11,13 +11,17 @@
 import request from 'supertest';
 import { Test } from '@nestjs/testing';
 
-import { createTestApp, createTestBot, type TestApp } from './setup/app-factory';
+import { createTestApp, type TestApp } from './setup/app-factory';
 import { startPostgres, stopPostgres } from './setup/postgres-container';
 import { startRedis, stopRedis } from './setup/redis-container';
 import { applyTestEnv } from './setup/test-env';
 import { THROTTLE_RULES, findUnmatchedRules } from '@core/throttler/throttle-routes';
-import { TELEGRAM_BOT } from '@core/telegram/telegram.constants';
 import { OUTBOX_HANDLERS, type OutboxTopicHandler } from '@core/outbox/outbox.types';
+// The constants FILE, not the '@core/tenant' barrel — which does export both of these. The barrel
+// also exports TenantModule, and importing a Nest module here would build a slice of the DI graph
+// at file load, before `applyTestEnv()` has run. That is the same reason every module import in
+// this file is dynamic.
+import { TENANT_BOOTSTRAP_ID, TENANT_ZERO_ID } from '@core/tenant/tenant.constants';
 
 jest.setTimeout(180_000);
 
@@ -218,8 +222,12 @@ describe('api composition', () => {
       const { PrismaService } = await import('@core/prisma/prisma.service');
       const prisma = ctx.app.get(PrismaService);
 
+      // Any surviving tenant would do — what is under test is that the append-only table can be
+      // cleared and re-armed — so the probe is written as the bootstrap operator, the one the
+      // migration guarantees exists.
       await prisma.auditLog.create({
         data: {
+          tenantId: TENANT_BOOTSTRAP_ID,
           actorType: 'SYSTEM',
           action: 'test.harness.probe',
           entityType: 'Test',
@@ -236,6 +244,7 @@ describe('api composition', () => {
       // ledger and the append-only guarantee would be tested by nothing.
       const rearmed = await prisma.auditLog.create({
         data: {
+          tenantId: TENANT_BOOTSTRAP_ID,
           actorType: 'SYSTEM',
           action: 'test.harness.probe2',
           entityType: 'Test',
@@ -257,6 +266,52 @@ describe('api composition', () => {
       expect(await prisma.paymentMethod.count()).toBe(2);
       // 2 singletons (agent float, rounding) + 3 per rail.
       expect(await prisma.ledgerAccount.count()).toBe(8);
+    });
+
+    it('leaves the tenancy baseline standing after a reset', async () => {
+      // The row every other seeded row hangs off. Two ways it can be missing, and both break the
+      // whole suite with a foreign-key error pointing at the child rather than at the cause:
+      // truncate.ts forgetting to preserve `tenants`, or the factory not seeding them at all —
+      // which matters because this database is built by `prisma db push`, so the INSERTs in the
+      // multi-tenant MIGRATION never run here.
+      const { PrismaService } = await import('@core/prisma/prisma.service');
+      const prisma = ctx.app.get(PrismaService);
+
+      await ctx.reset();
+
+      const [platform, bootstrap, defaults] = await Promise.all([
+        prisma.tenant.findUnique({ where: { id: TENANT_ZERO_ID }, select: { slug: true } }),
+        prisma.tenant.findUnique({ where: { id: TENANT_BOOTSTRAP_ID }, select: { slug: true } }),
+        prisma.platformDefaults.findUnique({ where: { id: 1 }, select: { id: true } }),
+      ]);
+
+      expect(platform).not.toBeNull();
+      expect(bootstrap).not.toBeNull();
+      expect(defaults).not.toBeNull();
+    });
+
+    it('enters an operator for the tests that bypass the middleware', async () => {
+      // `ctx.inTenant` is what a direct `app.get(Service)` call has instead of
+      // TenantContextMiddleware. Proving it works means proving the scope extension SEES it, so the
+      // assertion is a findMany with no `tenantId` in the where — the exact query that returns
+      // every operator's rows when nobody opened a context.
+      const { PrismaService } = await import('@core/prisma/prisma.service');
+      const { getEffectiveTenantId } = await import('@core/tenant/tenant.storage');
+      const prisma = ctx.app.get(PrismaService);
+
+      await ctx.inTenant(async () => {
+        expect(getEffectiveTenantId()).toBe(TENANT_BOOTSTRAP_ID);
+        const methods = await prisma.paymentMethod.findMany({ select: { tenantId: true } });
+        expect(methods).toHaveLength(2);
+        expect(methods.every((method) => method.tenantId === TENANT_BOOTSTRAP_ID)).toBe(true);
+      });
+
+      // The same query as the platform. Nobody pays into tenant zero, so it owns no rails — and an
+      // empty result here is the injection actually happening rather than the filter being a no-op
+      // that only looks right while one operator exists.
+      await ctx.inTenant(async () => {
+        expect(await prisma.paymentMethod.findMany()).toEqual([]);
+      }, TENANT_ZERO_ID);
     });
   });
 
@@ -296,12 +351,9 @@ describe('worker composition', () => {
     const { WorkerBootstrapService } = await import('../src/worker-bootstrap.service');
     const { OutboxDispatchProcessor } = await import('@core/outbox/outbox-dispatch.processor');
 
-    const moduleRef = await Test.createTestingModule({ imports: [WorkerModule] })
-      .overrideProvider(TELEGRAM_BOT)
-      // Without this the worker-role bot factory throws at boot: it hard-fails when getMe() cannot
-      // be resolved, because a worker that cannot match commands would mis-handle every one.
-      .useValue(createTestBot())
-      .compile();
+    // Nothing Telegram is stubbed: no bot is built at boot any more, so the worker graph must
+    // compile with no token and no network. A graph that needed a bot to boot would fail right here.
+    const moduleRef = await Test.createTestingModule({ imports: [WorkerModule] }).compile();
 
     try {
       // The consumer that did not exist before this composition: without it every Telegram update

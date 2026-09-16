@@ -1,15 +1,15 @@
 /**
  * THE PRODUCT REQUIREMENT, AS A TEST.
  *
- * "A player presses Start in the bot. That registers them as a player under OUR agent (the one in
- *  env). The agent then sees one new player in the Ichancy panel."
+ * "A player presses Start in the bot. That registers them as a player under OUR agent (the operator's
+ *  own, from its tenant row). The agent then sees one new player in the Ichancy panel."
  *
  * Every clause of that sentence is asserted below, because each is served by a different piece of
  * the system and any one of them can be broken without the others noticing:
  *
  *   "a player"                -> a Player row is upserted from the Telegram identity
  *   "registers them"          -> ensureLinked runs on /start, not lazily at the first credit
- *   "under OUR agent"         -> registerPlayer carries parentId = ICHANCY_AGENT_ID. Proven one
+ *   "under OUR agent"         -> registerPlayer carries parentId = the operator's agent id. Proven one
  *                                layer down, in http-ichancy.adapter.spec.ts ("registers, then
  *                                resolves the id"), because that is where the wire body is built.
  *   "the agent sees one"      -> the call happens EXACTLY once per player: a second /start finds the
@@ -20,16 +20,22 @@
  */
 import type { Context } from 'grammy';
 
+import { TENANT_BOOTSTRAP_ID, runWithTenant } from '@core/tenant';
+
 import { PlayerTelegramHandlers } from './player.handlers';
 
+/** Another operator, so a handler that named a fixed operator could not pass by coincidence. */
+const SECOND_OPERATOR_ID = '22222222-2222-4222-8222-222222222222';
 const TELEGRAM_USER_ID = 912911246;
 const PLAYER_ID = '9f3c1e58-0000-4000-8000-00000000aaaa';
 const AGENT_ID = '2372020';
+const ADMIN_CHAT_ID = -1004382350658n;
 
 interface Harness {
   handlers: PlayerTelegramHandlers;
   ensureLinked: jest.Mock;
   upsertFromTelegram: jest.Mock;
+  tenantLookup: jest.Mock;
   replies: string[];
   adminMessages: { chatId: string; text: string }[];
 }
@@ -39,16 +45,21 @@ interface Harness {
  * asserts what /start DOES, and a DI container would only add a way for the test to fail for
  * reasons that have nothing to do with the requirement.
  */
-function harness(options: { isNew?: boolean; alreadyLinked?: boolean } = {}): Harness {
+function harness(
+  options: { isNew?: boolean; alreadyLinked?: boolean; adminChatId?: bigint } = {},
+): Harness {
   const isNew = options.isNew ?? true;
   const created = !(options.alreadyLinked ?? false);
 
   const replies: string[] = [];
   const adminMessages: { chatId: string; text: string }[] = [];
 
+  // Shaped like the real return, tenant included: PlayerService reports the tenant of the ROW it
+  // found, which is the one a returning player keeps even when the caller asks for another.
   const upsertFromTelegram = jest.fn().mockResolvedValue({
     player: {},
     playerId: PLAYER_ID,
+    tenantId: TENANT_BOOTSTRAP_ID,
     isNew,
   });
 
@@ -62,6 +73,12 @@ function harness(options: { isNew?: boolean; alreadyLinked?: boolean } = {}): Ha
   const prisma = {
     runInTransaction: (callback: (tx: unknown) => unknown) => callback({}),
     player: { count: jest.fn().mockResolvedValue(91) },
+    // The operator's own admin group, read off its tenant row. 0 is "none set yet".
+    tenant: {
+      findUnique: jest.fn((args: { where: { id: string } }) =>
+        Promise.resolve({ id: args.where.id, adminChatId: options.adminChatId ?? ADMIN_CHAT_ID }),
+      ),
+    },
   };
 
   const credentialsFor = jest.fn().mockReturnValue({
@@ -73,14 +90,13 @@ function harness(options: { isNew?: boolean; alreadyLinked?: boolean } = {}): Ha
   const handlers = new PlayerTelegramHandlers(
     prisma as never,
     { upsertFromTelegram } as never,
-    { findById: jest.fn().mockResolvedValue({ id: PLAYER_ID }) } as never,
+    { findByIdInTenant: jest.fn().mockResolvedValue({ id: PLAYER_ID }) } as never,
     { ensureLinked, credentialsFor } as never,
     {
       bindFromStartPayload: jest.fn().mockResolvedValue({ outcome: 'IGNORED_NO_PAYLOAD' }),
     } as never,
     {
       ichancy: { currency: 'NSP', agentId: AGENT_ID, playerSiteUrl: 'https://ichancy.com' },
-      telegram: { adminChatId: -1004382350658n },
       app: { baseUrl: 'https://app.example.com' },
     } as never,
     {} as never,
@@ -111,27 +127,61 @@ function harness(options: { isNew?: boolean; alreadyLinked?: boolean } = {}): Ha
   // The ctx travels with the harness through the single call each test makes.
   (handlers as unknown as { __ctx: Context }).__ctx = ctx;
 
-  return { handlers, ensureLinked, upsertFromTelegram, replies, adminMessages };
+  return {
+    handlers,
+    ensureLinked,
+    upsertFromTelegram,
+    tenantLookup: prisma.tenant.findUnique,
+    replies,
+    adminMessages,
+  };
 }
 
 const ctxOf = (handlers: PlayerTelegramHandlers): Context =>
   (handlers as unknown as { __ctx: Context }).__ctx;
 
+/**
+ * Runs a handler the way TelegramUpdateProcessor does: inside the tenant context of the operator
+ * whose bot received the update. The handlers read their operator from there.
+ */
+const asBotTenant = <T>(
+  body: () => Promise<T>,
+  tenantId: string = TENANT_BOOTSTRAP_ID,
+): Promise<T> => runWithTenant(tenantId, body);
+
 describe('/start registers the player under our agent', () => {
   it('creates the player row from the Telegram identity', async () => {
     const h = harness();
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     expect(h.upsertFromTelegram).toHaveBeenCalledTimes(1);
-    const profile = h.upsertFromTelegram.mock.calls[0]?.[1] as { telegramUserId: bigint };
-    expect(profile.telegramUserId).toBe(BigInt(TELEGRAM_USER_ID));
+    // (tx, tenantId, profile, currencyCode): the tenant sits between the transaction and the
+    // profile, so everything after it is read one position later than it used to be.
+    const call = h.upsertFromTelegram.mock.calls[0] as [
+      unknown,
+      string,
+      { telegramUserId: bigint },
+      string,
+    ];
+    expect(call[2].telegramUserId).toBe(BigInt(TELEGRAM_USER_ID));
     // The currency the agent actually operates in, not a per-player choice.
-    expect(h.upsertFromTelegram.mock.calls[0]?.[2]).toBe('NSP');
+    expect(call[3]).toBe('NSP');
+  });
+
+  it('files the player under the operator whose bot received the update', async () => {
+    // A Telegram update carries no tenant of its own — no request, no header. The update processor
+    // enters the operator the webhook resolved from its path token, and the player must be filed
+    // under THAT operator. A second operator is used on purpose: a handler that still named the
+    // bootstrap operator would file this player there and fail here.
+    const h = harness();
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)), SECOND_OPERATOR_ID);
+
+    expect(h.upsertFromTelegram.mock.calls[0]?.[1]).toBe(SECOND_OPERATOR_ID);
   });
 
   it('registers the Ichancy account ON /start, not at the first credit', async () => {
     const h = harness();
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     expect(h.ensureLinked).toHaveBeenCalledTimes(1);
     expect(h.ensureLinked).toHaveBeenCalledWith(PLAYER_ID, 'telegram:/start');
@@ -139,18 +189,18 @@ describe('/start registers the player under our agent', () => {
 
   it('tells the player their gaming account is ready', async () => {
     const h = harness();
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     expect(h.replies.some((text) => text.includes('تم إنشاء حساب اللعب'))).toBe(true);
   });
 
   it('posts one arrivals card to the admin group, naming the agent-side identifiers', async () => {
     const h = harness();
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     expect(h.adminMessages).toHaveLength(1);
     const card = h.adminMessages[0];
-    expect(card?.chatId).toBe('-1004382350658');
+    expect(card?.chatId).toBe(ADMIN_CHAT_ID.toString());
     expect(card?.text).toContain('New player');
     expect(card?.text).toContain(String(TELEGRAM_USER_ID));
     // The two ids that let an operator find this person in the Ichancy panel.
@@ -158,11 +208,30 @@ describe('/start registers the player under our agent', () => {
     expect(card?.text).toContain('414402262');
   });
 
+  it('sends the arrivals card to the admin group of the operator whose bot received /start', async () => {
+    const h = harness({ adminChatId: -1009999999999n });
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)), SECOND_OPERATOR_ID);
+
+    expect(h.tenantLookup).toHaveBeenCalledWith({
+      where: { id: SECOND_OPERATOR_ID },
+      select: { adminChatId: true },
+    });
+    expect(h.adminMessages[0]?.chatId).toBe('-1009999999999');
+  });
+
+  it('posts no arrivals card, and still greets the player, when the operator has no admin group', async () => {
+    const h = harness({ adminChatId: 0n });
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
+
+    expect(h.adminMessages).toHaveLength(0);
+    expect(h.replies.some((text) => text.includes('تم إنشاء حساب اللعب'))).toBe(true);
+  });
+
   it('registers nothing new when the same player presses Start again', async () => {
     // A returning player: the row is not new and the account already exists. The agent must NOT see
     // a second player appear, and the group must not get a second arrivals card.
     const h = harness({ isNew: false, alreadyLinked: true });
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     // ensureLinked is still CALLED — it is the idempotent probe — but it reports created:false,
     // which is what keeps both the confirmation and the admin card from being sent again.
@@ -177,7 +246,7 @@ describe('/start registers the player under our agent', () => {
     const h = harness();
     h.ensureLinked.mockRejectedValueOnce(new Error('CLOUDFLARE_CHALLENGE'));
 
-    await expect(h.handlers.onStart(ctxOf(h.handlers))).resolves.toBeUndefined();
+    await expect(asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)))).resolves.toBeUndefined();
 
     expect(h.replies.some((text) => text.includes('أهلاً وسهلاً'))).toBe(true);
     expect(h.replies.some((text) => text.toLowerCase().includes('cloudflare'))).toBe(false);
@@ -191,7 +260,7 @@ describe('the player is told how to sign in', () => {
    */
   it('sends the login and password when the account is created', async () => {
     const h = harness();
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     const card = h.replies.find((text) => text.includes('اسم المستخدم'));
     expect(card).toBeDefined();
@@ -204,7 +273,7 @@ describe('the player is told how to sign in', () => {
     // They already have them; re-posting a password into a chat on every /start is a leak waiting
     // to be screenshotted. /account is how a player asks for them again.
     const h = harness({ isNew: false, alreadyLinked: true });
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     expect(h.replies.some((text) => text.includes('كلمة السر'))).toBe(false);
   });
@@ -216,7 +285,7 @@ describe('the player is told how to sign in', () => {
     const ctx = ctxOf(h.handlers) as unknown as { chat: { type: string } };
     ctx.chat.type = 'supergroup';
 
-    await h.handlers.onStart(ctxOf(h.handlers));
+    await asBotTenant(() => h.handlers.onStart(ctxOf(h.handlers)));
 
     // Assert on the SECRET ITSELF, not on the word "password": the group reply deliberately mentions
     // the word while telling the player where to get them, and an assertion on the label would fail
@@ -255,7 +324,7 @@ describe('👤 حسابي shows an existing account its sign-in details', () => 
       } as never,
       {
         findByTelegramUserId: jest.fn().mockResolvedValue(player),
-        findById: jest.fn().mockResolvedValue(player),
+        findByIdInTenant: jest.fn().mockResolvedValue(player),
       } as never,
       {
         credentialsFor: jest.fn().mockReturnValue({
@@ -267,7 +336,6 @@ describe('👤 حسابي shows an existing account its sign-in details', () => 
       {} as never,
       {
         ichancy: { currency: 'NSP', agentId: AGENT_ID, playerSiteUrl: 'https://ichancy.com' },
-        telegram: { adminChatId: -1004382350658n },
         app: { baseUrl: 'https://app.example.com' },
       } as never,
       {} as never,
@@ -293,7 +361,7 @@ describe('👤 حسابي shows an existing account its sign-in details', () => 
 
   it('prints the login and password in a private chat', async () => {
     const h = profileHarness('private');
-    await h.handlers.onProfile(h.ctx);
+    await asBotTenant(() => h.handlers.onProfile(h.ctx));
 
     const profile = h.replies[0] ?? '';
     expect(profile).toContain('p912911246_7fszgwgh');
@@ -303,7 +371,7 @@ describe('👤 حسابي shows an existing account its sign-in details', () => 
 
   it('withholds them in a group and points at a private chat instead', async () => {
     const h = profileHarness('supergroup');
-    await h.handlers.onProfile(h.ctx);
+    await asBotTenant(() => h.handlers.onProfile(h.ctx));
 
     const profile = h.replies[0] ?? '';
     expect(profile).not.toContain('Qk3mZ9xLp2vAa1!');

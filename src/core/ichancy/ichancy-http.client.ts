@@ -6,6 +6,10 @@
  * Nothing here decides business meaning — it hands the raw envelope plus a classification back and
  * lets the adapter map it to an IchancyResult. Nothing here retries either: a retry is a policy
  * decision about money and belongs one layer up, where "at most once more" is enforced.
+ *
+ * EVERY CALL NAMES ITS AGENT. The base URL comes from the operator's row (IchancyAgent), never from
+ * ICHANCY_BASE_URL, and signin sends that operator's own username and password. Only transport-wide
+ * settings (the timeout, and inside the transports the cookie and user agent) still come from env.
  */
 import { Injectable, Logger, Inject } from '@nestjs/common';
 import { IchancyOutcome, type IchancyOperation } from '@prisma/client';
@@ -18,6 +22,7 @@ import {
   isTimeoutError,
   type IchancyClassification,
 } from './error-map';
+import { type IchancyAgent } from './ichancy-agent';
 import {
   ICHANCY_CALL_LOG,
   type IchancyCallLogPort,
@@ -43,10 +48,23 @@ import {
 } from './ichancy.wire';
 import { ICHANCY_TRANSPORT, type IchancyTransport } from './transport/ichancy-transport';
 
+/** The code of a call refused before it left the process because no transport can reach the host. */
+export const TRANSPORT_ORIGIN_UNSUPPORTED_CODE = 'ICHANCY_TRANSPORT_ORIGIN_UNSUPPORTED';
+
+/** Where a call goes and whose transport state (cookies) it uses. Carries no secret. */
+export interface IchancyCallTarget {
+  readonly baseUrl: string;
+  readonly agentKey: string;
+  /** The operator whose agent this is: the outage breaker is kept per operator. */
+  readonly tenantId: string;
+}
+
 export interface IchancyCallParams {
   readonly operation: IchancyOperation;
   readonly endpoint: IchancyEndpointName;
   readonly body: Record<string, unknown>;
+  /** The agent this call is made as. */
+  readonly agent: IchancyCallTarget;
   /** Omitted for signin/refreshToken; required for everything else. */
   readonly accessToken?: string | null;
   /** 1-based. The adapter passes 2 for the post-refresh replay. */
@@ -65,9 +83,9 @@ export interface IchancyAttempt {
 export const ICHANCY_AUTH_CLIENT = 'ICHANCY_AUTH_CLIENT';
 
 export interface IchancyAuthClient {
-  /** Uses the agent credentials from config. Worker-only by policy — enforced by the session. */
-  signin(): Promise<IchancyResult<IchancyTokenPair>>;
-  refresh(refreshToken: string): Promise<IchancyResult<IchancyTokenPair>>;
+  /** Signs in with this agent's own username and password. Worker-only by policy, bar signInNow. */
+  signin(agent: IchancyAgent): Promise<IchancyResult<IchancyTokenPair>>;
+  refresh(agent: IchancyAgent, refreshToken: string): Promise<IchancyResult<IchancyTokenPair>>;
 }
 
 function outcomeFor(classification: IchancyClassification): IchancyOutcome {
@@ -108,7 +126,29 @@ export class IchancyHttpClient implements IchancyAuthClient {
    * about whether the far side moved money.
    */
   async call(params: IchancyCallParams): Promise<IchancyAttempt> {
-    const url = `${this.config.ichancy.baseUrl}${ICHANCY_API_PREFIX}/${params.endpoint}`;
+    const url = `${params.agent.baseUrl}${ICHANCY_API_PREFIX}/${params.endpoint}`;
+
+    // Refused BEFORE anything is sent, so it is a definite non-event (`rejected`), and it is neither
+    // logged as a call nor fed to the outage breaker: no request existed for either to describe. It
+    // happens when an operator's agent lives on a host the configured transport cannot reach — the
+    // browser transport holds one page on ICHANCY_BASE_URL's origin.
+    if (this.transport.canReach !== undefined && !this.transport.canReach(url)) {
+      const message =
+        `The ${this.transport.name} transport cannot reach ${params.agent.baseUrl}: it serves one ` +
+        'Ichancy host per process. Use ICHANCY_TRANSPORT=fetch for operators on another host.';
+      this.logger.warn(`${params.endpoint} refused before sending: ${message}`);
+      return {
+        classification: {
+          outcome: 'rejected',
+          code: TRANSPORT_ORIGIN_UNSUPPORTED_CODE,
+          message,
+          rule: null,
+        },
+        httpStatus: null,
+        envelope: null,
+        durationMs: 0,
+      };
+    }
 
     const startedAt = Date.now();
     let httpStatus: number | null = null;
@@ -122,6 +162,7 @@ export class IchancyHttpClient implements IchancyAuthClient {
         body: params.body,
         accessToken: params.accessToken ?? null,
         timeoutMs: this.config.ichancy.timeoutMs,
+        agentKey: params.agent.agentKey,
       });
       httpStatus = response.status;
 
@@ -149,9 +190,11 @@ export class IchancyHttpClient implements IchancyAuthClient {
       };
     }
 
-    // Fed before the call-log INSERT so the cluster-wide verdict is current even when the log
-    // write is slow. `record` swallows its own failures: instrumentation may never break a call.
-    await this.health.record(params.endpoint, classification);
+    // Fed before the call-log INSERT so the verdict is current even when the log write is slow.
+    // Recorded under the operator whose agent made the call: one operator's blocked agent is not
+    // another operator's outage. `record` swallows its own failures: instrumentation may never
+    // break a call.
+    await this.health.record(params.agent.tenantId, params.endpoint, classification);
 
     const durationMs = Date.now() - startedAt;
     await this.persist({
@@ -180,14 +223,13 @@ export class IchancyHttpClient implements IchancyAuthClient {
     return { classification, httpStatus, envelope, durationMs };
   }
 
-  async signin(): Promise<IchancyResult<IchancyTokenPair>> {
+  async signin(agent: IchancyAgent): Promise<IchancyResult<IchancyTokenPair>> {
     const attempt = await this.call({
       operation: 'SIGNIN',
       endpoint: IchancyEndpoint.SIGNIN,
-      body: {
-        username: this.config.ichancy.username,
-        password: this.config.ichancy.password,
-      },
+      // The call log redacts `password` by key name before the body reaches a row.
+      body: { username: agent.username, password: agent.password },
+      agent,
       attempt: 1,
     });
     // A token_expired classification on signin is meaningless (there is no token to refresh yet):
@@ -196,11 +238,12 @@ export class IchancyHttpClient implements IchancyAuthClient {
     return this.toTokenPair(attempt, IchancyRejectionCodes.INVALID_CREDENTIALS);
   }
 
-  async refresh(refreshToken: string): Promise<IchancyResult<IchancyTokenPair>> {
+  async refresh(agent: IchancyAgent, refreshToken: string): Promise<IchancyResult<IchancyTokenPair>> {
     const attempt = await this.call({
       operation: 'REFRESH_TOKEN',
       endpoint: IchancyEndpoint.REFRESH_TOKEN,
       body: { refreshToken },
+      agent,
       attempt: 1,
     });
     // "Invalid or expired refresh token" is a definite NO: the stored pair is dead and only a fresh

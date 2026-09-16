@@ -1,29 +1,38 @@
 /**
  * WHY a discovery scan: handlers belong next to their feature, but grammY needs every listener
- * attached to one Bot before the first update is dispatched. Without this, each new feature module
- * would have to remember to register itself in a shared file — and the failure mode of forgetting
- * is a handler that exists, compiles, is unit-tested, and is never called.
+ * attached before the first update is dispatched. Without this, each new feature module would have
+ * to remember to register itself in a shared file — and the failure mode of forgetting is a handler
+ * that exists, compiles, is unit-tested, and is never called.
+ *
+ * WHY ONE COMPOSER AND NOT ONE BOT: every operator has its own Bot, built on demand by
+ * TenantBotRegistry. The listeners are the same for all of them, so they are collected once into a
+ * grammY Composer and every tenant's Bot is given that same Composer. The handlers are stateless per
+ * update (everything they need arrives on `ctx`, and the operator is the ambient tenant the update
+ * processor entered), so sharing them between bots shares nothing that belongs to one operator.
  *
  * WHY only in the worker role: the api process persists and enqueues updates but never calls
  * `bot.handleUpdate()`. Attaching listeners there would build a dispatch table that can never fire
  * and would make the api boot depend on handler wiring it does not use.
+ *
+ * WHY IT IS BUILT LAZILY AS WELL AS AT INIT: `onModuleInit` builds it so the boot log shows the
+ * handler count, but queue consumers can be started by another module's init hook before this one
+ * has run. `middleware()` therefore builds it on first use too. Every provider instance already
+ * exists by then, which is all the scan needs.
  *
  * Handlers are wrapped so a thrown error is logged and swallowed. grammY would otherwise propagate
  * it out of `handleUpdate()` into the queue processor, which would retry the whole update — and
  * replaying an update whose money side-effect already happened is precisely what the dedupe layer
  * exists to prevent.
  */
-import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
-import { Bot, type Context } from 'grammy';
-import { type FilterQuery } from 'grammy';
+import { Composer, type Context, type FilterQuery } from 'grammy';
 import { AppConfigService } from '../../config/config.service';
 import {
   TELEGRAM_CALLBACK_METADATA,
   TELEGRAM_COMMAND_METADATA,
   TELEGRAM_MESSAGE_METADATA,
 } from '../decorators/handlers.decorator';
-import { TELEGRAM_BOT } from '../telegram.constants';
 
 type HandlerMethod = (ctx: Context) => unknown;
 
@@ -33,10 +42,9 @@ const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\
 @Injectable()
 export class TelegramHandlerRegistrar implements OnModuleInit {
   private readonly logger = new Logger(TelegramHandlerRegistrar.name);
-  private registered = 0;
+  private composer: Composer<Context> | null = null;
 
   constructor(
-    @Inject(TELEGRAM_BOT) private readonly bot: Bot,
     private readonly discovery: DiscoveryService,
     private readonly scanner: MetadataScanner,
     private readonly config: AppConfigService,
@@ -49,15 +57,19 @@ export class TelegramHandlerRegistrar implements OnModuleInit {
       );
       return;
     }
+    this.middleware();
+  }
 
-    // A handler that throws past our wrapper (or a grammY internal error) must not take the
-    // process down with an unhandled rejection.
-    this.bot.catch((error) => {
-      this.logger.error(
-        `Unhandled error while dispatching update ${error.ctx.update.update_id}: ${error.message}`,
-        error.error instanceof Error ? error.error.stack : undefined,
-      );
-    });
+  /**
+   * The handler composition every tenant's Bot is given. Null in the api role, which builds bots
+   * only to send.
+   */
+  middleware(): Composer<Context> | null {
+    if (!this.config.app.isWorker) return null;
+    if (this.composer !== null) return this.composer;
+
+    const composer = new Composer<Context>();
+    let registered = 0;
 
     for (const wrapper of this.discovery.getProviders()) {
       const instance = wrapper.instance as Record<string, unknown> | null | undefined;
@@ -67,45 +79,55 @@ export class TelegramHandlerRegistrar implements OnModuleInit {
       if (prototype === null) continue;
 
       for (const methodName of this.scanner.getAllMethodNames(prototype)) {
-        this.registerMethod(instance, methodName);
+        registered += this.registerMethod(composer, instance, methodName);
       }
     }
 
-    this.logger.log(`Registered ${this.registered} Telegram handler(s)`);
+    this.composer = composer;
+    this.logger.log(`Registered ${registered} Telegram handler(s)`);
+    return composer;
   }
 
-  private registerMethod(instance: Record<string, unknown>, methodName: string): void {
+  /** Attaches whatever listeners one method declares. Returns how many it attached. */
+  private registerMethod(
+    composer: Composer<Context>,
+    instance: Record<string, unknown>,
+    methodName: string,
+  ): number {
     const method = instance[methodName];
-    if (typeof method !== 'function') return;
+    if (typeof method !== 'function') return 0;
 
     const target = method as HandlerMethod;
     const label = `${instance.constructor?.name ?? 'Unknown'}.${methodName}`;
+    let registered = 0;
 
     const commands = Reflect.getMetadata(TELEGRAM_COMMAND_METADATA, target) as string[] | undefined;
     if (commands !== undefined && commands.length > 0) {
-      this.bot.command(commands, this.wrap(instance, target, label));
+      composer.command(commands, this.wrap(instance, target, label));
       this.logger.debug(`/${commands.join(', /')} -> ${label}`);
-      this.registered += 1;
+      registered += 1;
     }
 
     const namespace = Reflect.getMetadata(TELEGRAM_CALLBACK_METADATA, target) as string | undefined;
     if (typeof namespace === 'string' && namespace.length > 0) {
       // Prefix match: one handler owns a whole namespace and decodes the action itself.
-      this.bot.callbackQuery(
+      composer.callbackQuery(
         new RegExp(`^${escapeRegExp(namespace)}:`),
         this.wrap(instance, target, label),
       );
       this.logger.debug(`callback ${namespace}:* -> ${label}`);
-      this.registered += 1;
+      registered += 1;
     }
 
     const filters = Reflect.getMetadata(TELEGRAM_MESSAGE_METADATA, target) as
       FilterQuery[] | undefined;
     if (filters !== undefined && filters.length > 0) {
-      this.bot.on(filters, this.wrap(instance, target, label));
+      composer.on(filters, this.wrap(instance, target, label));
       this.logger.debug(`on(${filters.join(', ')}) -> ${label}`);
-      this.registered += 1;
+      registered += 1;
     }
+
+    return registered;
   }
 
   /** Binds `this` back to the provider and contains any error the handler throws. */

@@ -1,6 +1,11 @@
 /**
  * One command to point Telegram at the tunnel that is running right now:
- * read ngrok's public URL, write it to .env as API_BASE_URL, then run webhook:set.
+ * read ngrok's public URL, write it to .env as API_BASE_URL, then re-register operators' webhooks.
+ *
+ * WHICH OPERATORS: there is no deployment-wide bot. By default every ACTIVE operator's bot is
+ * re-registered under the new URL (`webhook:set -- --all-active`), because a tunnel URL change
+ * breaks all of them at once. Anything passed after `--` replaces that target, e.g.
+ * `npm run tunnel:sync -- --tenant default` for one operator (in any status).
  *
  * WHY this exists: doing it by hand is three steps, and step one is the dangerous one. ngrok's web
  * UI moves to 4041 when 4040 is taken, so a second ngrok (or a leftover from a previous session)
@@ -9,8 +14,9 @@
  * script scans every ngrok web port, keeps only tunnels that forward to OUR port, and refuses to
  * guess when there is more than one.
  *
- * Usage:  npm run tunnel:sync
- * (start `ngrok http 3000` in another terminal first)
+ * Usage:  npm run tunnel:sync                      every ACTIVE operator
+ *         npm run tunnel:sync -- --tenant <slug>   one operator
+ * (start `ngrok http 3000` in another terminal first; the api must be able to reach the database)
  */
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -88,10 +94,40 @@ async function main(): Promise<void> {
     console.log(`API_BASE_URL  ${current ?? '(unset)'}  ->  ${url}`);
   }
 
-  console.log('Registering the webhook with Telegram...\n');
+  const target = webhookTargetArgs(process.argv.slice(2));
+  console.log(`Registering webhooks with Telegram (${target.join(' ')})...\n`);
   // Spawned rather than imported so it reads the .env we just wrote, not a stale in-process copy.
-  const done = spawnSync('npm', ['run', 'webhook:set'], { stdio: 'inherit', shell: true });
+  const done = spawnSync('npm', ['run', 'webhook:set', '--', ...target], {
+    stdio: 'inherit',
+    shell: true,
+  });
   if (done.status !== 0) throw new Error(`webhook:set exited with ${String(done.status)}`);
+}
+
+/**
+ * The target handed to webhook:set: what the caller passed, or every ACTIVE operator.
+ *
+ * Only the flags webhook:set understands are forwarded, and a slug must look like one, because
+ * this runs through a shell (`shell: true`, needed for npm on Windows) and an argument is a command
+ * line there.
+ */
+function webhookTargetArgs(argv: readonly string[]): string[] {
+  if (argv.length === 0) return ['--all-active'];
+  const allowed = new Set(['--all-active', '--drop-pending', '--tenant']);
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index] ?? '';
+    const previous = index > 0 ? argv[index - 1] : undefined;
+    if (previous === '--tenant') {
+      if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(arg)) throw new Error(`Not a tenant slug: ${arg}`);
+      continue;
+    }
+    if (!allowed.has(arg)) {
+      throw new Error(
+        `Unsupported argument "${arg}". Use --tenant <slug>, --all-active, --drop-pending.`,
+      );
+    }
+  }
+  return [...argv];
 }
 
 main().catch((error: unknown) => {

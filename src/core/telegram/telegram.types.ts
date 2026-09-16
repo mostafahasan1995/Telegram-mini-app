@@ -6,6 +6,11 @@
 import { type Update } from 'grammy/types';
 
 export interface TelegramUpdateJobData {
+  /**
+   * The operator whose bot received the update, resolved from the webhook path token. The worker
+   * has no other way to know: the update itself names a chat and a user, never a bot.
+   */
+  tenantId: string;
   /** `telegram_updates.id` — the durable row this job is processing. */
   updateRowId: string;
   /** Telegram's `update_id`, as a decimal string. */

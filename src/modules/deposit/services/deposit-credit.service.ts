@@ -64,7 +64,9 @@ import {
 } from '@core/ledger';
 import { OutboxService } from '@core/outbox/outbox.service';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { acrossTenants } from '@core/prisma/tenant-scope.extension';
 import type { Tx } from '@core/prisma/tx.type';
+import { runWithTenant } from '@core/tenant';
 
 import {
   BALANCE_VERIFY_DELAY_MS,
@@ -107,6 +109,9 @@ export class CreditRetryLaterError extends Error {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Enough of a deposit to address its row in its own operator. */
+type DepositRef = Pick<DepositRequest, 'id' | 'tenantId'>;
+
 @Injectable()
 export class DepositCreditService {
   private readonly logger = new Logger(DepositCreditService.name);
@@ -123,9 +128,22 @@ export class DepositCreditService {
     @Inject(PLAYER_LINK_PORT) private readonly playerLink: PlayerLinkPort,
   ) {}
 
+  /**
+   * WHOSE OPERATOR IS THIS? The ichancy queue has no request behind it, so there is no ambient
+   * tenant — and everything below writes rows that must name one: T2, the audit trail, every outbox
+   * message. The deposit row is the only honest answer, so the lookup that opens this method is
+   * also what establishes the tenant.
+   *
+   * It costs nothing extra — the stale-epoch guard needed this row anyway — and it cannot be
+   * answered with the wrong operator's deposit: the id is our own outbox's, never a client's, and
+   * the row it finds is the one being credited. It is marked `acrossTenants` because it deliberately
+   * reads before any tenant is known; every read and write after it names `deposit.tenantId`.
+   * Carrying the tenant on the job payload instead would save no query and would add a second,
+   * forgeable copy of a fact the row already states.
+   */
   async credit(task: CreditTask): Promise<CreditOutcome> {
     const deposit = await this.prisma.depositRequest.findUnique({
-      where: { id: task.depositRequestId },
+      where: acrossTenants({ id: task.depositRequestId }),
     });
     if (deposit === null) return { kind: 'skipped', reason: 'DEPOSIT_NOT_FOUND' };
 
@@ -145,21 +163,28 @@ export class DepositCreditService {
       return { kind: 'skipped', reason: `NOT_CREDITABLE_${deposit.status}` };
     }
 
-    // The mutex spans the ENTIRE verify window — see the header.
-    const lockKey = playerCreditLockKey(deposit.playerId);
-    const handle = await this.locks.acquire(lockKey, CREDIT_LOCK_TTL_MS, {
-      retries: CREDIT_LOCK_RETRIES,
-      retryDelayMs: CREDIT_LOCK_RETRY_DELAY_MS,
-    });
-    if (handle === null) {
-      throw new CreditRetryLaterError(`another credit is in flight for player ${deposit.playerId}`);
-    }
+    // Past this line every write belongs to the deposit's operator, so the whole attempt — the
+    // mutex, the Ichancy calls, and every terminal state — runs inside that tenant. The lock key is
+    // built from a player uuid and is already globally unique, so it needs no tenant of its own.
+    return runWithTenant(deposit.tenantId, async () => {
+      // The mutex spans the ENTIRE verify window — see the header.
+      const lockKey = playerCreditLockKey(deposit.playerId);
+      const handle = await this.locks.acquire(lockKey, CREDIT_LOCK_TTL_MS, {
+        retries: CREDIT_LOCK_RETRIES,
+        retryDelayMs: CREDIT_LOCK_RETRY_DELAY_MS,
+      });
+      if (handle === null) {
+        throw new CreditRetryLaterError(
+          `another credit is in flight for player ${deposit.playerId}`,
+        );
+      }
 
-    try {
-      return await this.creditUnderLock(deposit, task, handle);
-    } finally {
-      await this.locks.release(handle).catch(() => false);
-    }
+      try {
+        return await this.creditUnderLock(deposit, task, handle);
+      } finally {
+        await this.locks.release(handle).catch(() => false);
+      }
+    });
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -207,7 +232,7 @@ export class DepositCreditService {
     // Counted separately from the transition: a redelivery that finds the row already CREDITING
     // still made a real attempt, and creditAttempts is what tells an operator how many times we
     // have talked to Ichancy about this deposit.
-    await this.bumpAttempts(deposit.id);
+    await this.bumpAttempts(deposit);
 
     const context = {
       depositRequestId: approved.id,
@@ -226,7 +251,7 @@ export class DepositCreditService {
       );
     }
     const b0 = before.data.balanceMinor;
-    await this.recordBaseline(deposit.id, b0);
+    await this.recordBaseline(deposit, b0);
 
     // ── 2. the call ────────────────────────────────────────────────────────────────────────────
     const first = await this.ichancy.creditPlayer({
@@ -269,7 +294,7 @@ export class DepositCreditService {
     // The delta says it did NOT land. Retry once — and only once. Every path out of here is
     // terminal, so no amount of redelivery can turn this into a third POST.
     this.logger.warn(`retrying credit for ${deposit.shortId} once (delta showed no movement)`);
-    await this.bumpAttempts(deposit.id);
+    await this.bumpAttempts(deposit);
 
     const second = await this.ichancy.creditPlayer({
       ichancyPlayerId: link.ichancyPlayerId,
@@ -347,7 +372,7 @@ export class DepositCreditService {
     }
 
     const b1 = after.data.balanceMinor;
-    await this.recordAfterBalance(deposit.id, b1);
+    await this.recordAfterBalance(deposit, b1);
 
     // `>=` and not `===`: another movement (a bet settling, a bonus) may have landed in the same
     // window. A delta that covers our amount is evidence ours landed; a smaller one is not.
@@ -415,7 +440,7 @@ export class DepositCreditService {
         );
 
         await tx.depositRequest.update({
-          where: { id: deposit.id },
+          where: { id: deposit.id, tenantId: deposit.tenantId },
           data: { ledgerCreditTxId: posted.transactionId },
         });
 
@@ -666,23 +691,25 @@ export class DepositCreditService {
     return balance >= amountMinor ? null : amountMinor - balance;
   }
 
-  private async recordBaseline(depositRequestId: string, b0: bigint): Promise<void> {
+  // The small writes name the deposit's own tenant, which is also the one this attempt runs in.
+
+  private async recordBaseline(deposit: DepositRef, b0: bigint): Promise<void> {
     await this.prisma.depositRequest.update({
-      where: { id: depositRequestId },
+      where: { id: deposit.id, tenantId: deposit.tenantId },
       data: { balanceBeforeMinor: b0 },
     });
   }
 
-  private async recordAfterBalance(depositRequestId: string, b1: bigint): Promise<void> {
+  private async recordAfterBalance(deposit: DepositRef, b1: bigint): Promise<void> {
     await this.prisma.depositRequest.update({
-      where: { id: depositRequestId },
+      where: { id: deposit.id, tenantId: deposit.tenantId },
       data: { balanceAfterMinor: b1 },
     });
   }
 
-  private async bumpAttempts(depositRequestId: string): Promise<void> {
+  private async bumpAttempts(deposit: DepositRef): Promise<void> {
     await this.prisma.depositRequest.update({
-      where: { id: depositRequestId },
+      where: { id: deposit.id, tenantId: deposit.tenantId },
       data: { creditAttempts: { increment: 1 } },
     });
   }

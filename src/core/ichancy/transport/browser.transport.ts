@@ -267,6 +267,20 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
 
   constructor(private readonly config: AppConfigService) {}
 
+  /**
+   * One Chromium page, parked on ICHANCY_BASE_URL's origin, and the call is a same-origin fetch from
+   * inside it. A request for an operator whose agent lives on another host could only be a
+   * cross-origin fetch the page's CORS would refuse, after the request may already have left — so it
+   * is refused here instead, before anything is sent. Such operators need ICHANCY_TRANSPORT=fetch.
+   */
+  canReach(url: string): boolean {
+    try {
+      return new URL(url).origin === new URL(this.config.ichancy.baseUrl).origin;
+    } catch {
+      return false;
+    }
+  }
+
   async post(request: IchancyTransportRequest): Promise<IchancyTransportResponse> {
     // Its OWN budget, not the caller's — see LAUNCH_BUDGET_MS. Without a ceiling here a wedged
     // launch blocks the caller forever and, under a 5-minute cron, the ticks pile up behind it.

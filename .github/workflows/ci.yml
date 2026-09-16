@@ -1,0 +1,295 @@
+# Backend CI/CD.
+#
+#   pull_request            -> verify (+ integration, informational)
+#   push to master          -> verify -> image (both targets, sha-<7>) -> deploy (environment: production)
+#   workflow_dispatch       -> verify (+ integration); on master also BUILDS both images but never
+#                              pushes them, and never deploys: a deploy is the consequence of a merge,
+#                              not of a button someone pressed.
+#
+# The same shape is used in every repo of this product (backend, dashboard, mini-app), so they
+# behave identically. See deploy/docs/CONTRACT.md, section 7.
+#
+# SECURITY NOTES
+#  - Never `pull_request_target`: that event runs with repository secrets against code from a fork.
+#  - Every third-party action is pinned to a full commit SHA (a tag can be moved; a SHA cannot).
+#    The comment after each SHA says which release it is. Resolve new ones with
+#    `git ls-remote https://github.com/<owner>/<action>.git refs/tags/<tag>`.
+#  - Permissions are least-privilege per job. Only `image` can write packages.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck, lint, unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # Same Node release as the Dockerfile's NODE_IMAGE, so a test that passes here ran on the
+          # runtime production uses. Bump both together.
+          node-version: 22.23.2
+          cache: npm
+
+      - run: npm ci
+
+      # `npm run typecheck` is plain `tsc --noEmit`, which needs the generated client types to exist.
+      # prisma.config.ts deliberately works with no database URL, so this needs no secrets.
+      - name: Generate Prisma client
+        run: npm run prisma:generate
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      # src/core/file/image.util.spec.ts exercises sharp on real images, and its 5-megapixel fixture
+      # carries a 30 s timeout of its own: Jest's 5 s default is a bound on the machine, and this job
+      # gates image and deploy. Nothing is skipped here — sharp ships prebuilt linux-x64 binaries, so
+      # a failure on this runner is a finding, not noise.
+      - name: Unit tests
+        run: npm test
+
+  integration:
+    name: Integration tests (informational)
+    # NOT A GATE — yet. `image` and `deploy` do not list this job in `needs`, so a red run here does
+    # not stop a deploy. It runs the testcontainers suite (Postgres 17 + Redis in Docker, which
+    # GitHub-hosted Ubuntu runners provide) and has not yet been proven green in CI. Once it has been
+    # green for a while, add `integration` to the image job's `needs` and delete this comment.
+    runs-on: ubuntu-24.04
+    # 45, not 30: Jest gives every test FILE a fresh module registry, so the module-level singleton in
+    # test/setup/postgres-container.ts is one container per suite, not one per worker — 18 suites now
+    # each start Postgres (plus `prisma db push`) and Redis. 12 suites fitted in 30 minutes; the six
+    # that this job could not run before add five more databases to that, which is too close to the
+    # edge for a job whose failure mode is a cancelled run that says nothing about the code.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+          cache: npm
+
+      - run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run prisma:generate
+
+      - name: Integration tests
+        run: npm run test:int
+
+  image:
+    name: Build and push images
+    needs: [verify]
+    # master only: pull requests never push images (they would need packages: write on untrusted code).
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `sha-<7 chars>` is only immutable because CI never writes it twice: GHCR tags are mutable, and
+      # a rebuild of the same commit weeks later (cold cache, newer apt packages) would put different
+      # bytes behind a tag deploy.sh promises to roll back to exactly. So an image is pushed only on
+      # a `push` event (workflow_dispatch builds to prove the Dockerfile still works, then discards),
+      # and never when its sha tag is already in the registry — which also covers "Re-run all jobs"
+      # on an old push run, since a re-run keeps the original event. If the lookup itself fails
+      # (network, registry outage) the tag counts as absent and the push goes ahead, as before.
+      - name: Check whether this commit's images already exist
+        id: existing
+        run: |
+          short_sha="${GITHUB_SHA:0:7}"
+          for pair in runner:cashier-backend tools:cashier-backend-tools; do
+            key="${pair%%:*}"
+            image="ghcr.io/mostafahasan1995/${pair#*:}:sha-${short_sha}"
+            if docker buildx imagetools inspect "${image}" > /dev/null 2>&1; then
+              echo "::notice title=Image not re-pushed::${image} already exists; it is never overwritten."
+              echo "${key}=true" >> "${GITHUB_OUTPUT}"
+            else
+              echo "${key}=false" >> "${GITHUB_OUTPUT}"
+            fi
+          done
+
+      # Tags: `sha-<7 chars>` is immutable and is the ONLY thing deploy.sh deploys or rolls back to.
+      # The branch tag (`master`) floats and exists for humans. Nothing is ever tagged `latest`.
+      - name: Tags for cashier-backend
+        id: meta-runner
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/mostafahasan1995/cashier-backend
+          flavor: latest=false
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+
+      - name: Tags for cashier-backend-tools
+        id: meta-tools
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/mostafahasan1995/cashier-backend-tools
+          flavor: latest=false
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+
+      # linux/amd64 only: the Contabo VPS is x86, and an arm64 build under QEMU would take far longer
+      # for an image nobody runs. Each image has its own cache scope, otherwise the second build's
+      # cache export would overwrite the first's and every run would start cold.
+      - name: Build and push cashier-backend (runner)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          target: runner
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'push' && steps.existing.outputs.runner != 'true' }}
+          tags: ${{ steps.meta-runner.outputs.tags }}
+          labels: ${{ steps.meta-runner.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=cashier-backend
+          cache-to: type=gha,mode=max,scope=cashier-backend
+
+      # Built second on the same builder, so the shared `builder` stage is already in its local cache.
+      - name: Build and push cashier-backend-tools (tools)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          target: tools
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'push' && steps.existing.outputs.tools != 'true' }}
+          tags: ${{ steps.meta-tools.outputs.tags }}
+          labels: ${{ steps.meta-tools.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=cashier-backend-tools
+          cache-to: type=gha,mode=max,scope=cashier-backend-tools
+
+  deploy:
+    name: Deploy to VPS
+    needs: [image]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    # 45, not less: deploy.sh first waits up to DEPLOY_LOCK_TIMEOUT (900 s) on flock for another
+    # repo's deploy, then a worst-case backend rollout is pull + migrate + the 180 s api gate + the
+    # 30 s worker window, and on failure a rollback that runs the gate again — plus runner and SSH
+    # setup. A job timeout that fires inside that window cuts the session mid-rollout.
+    timeout-minutes: 45
+    environment: production
+    permissions:
+      contents: read
+    # Queue, never cancel: killing a deploy between `migrate` and the api/worker restart is exactly
+    # the half-finished state deploy.sh is written to avoid. A second merge waits for the first.
+    # (GitHub keeps at most one run PENDING per group; a third merge replaces the second's pending
+    # run, which is fine — it deploys a newer commit that already contains the second.)
+    concurrency:
+      group: deploy-production-backend
+      cancel-in-progress: false
+    steps:
+      # Skip cleanly until a VPS exists, so CI is green on a fresh repo. The secret is read through an
+      # env var: secrets are not available in `if:` expressions, and comparing one there is fragile.
+      - name: Check deploy target is configured
+        id: target
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          if [ -z "${VPS_HOST}" ]; then
+            echo "::notice title=Deploy skipped::VPS_HOST secret is not set. Images were pushed; nothing was deployed."
+            echo "configured=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "configured=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      # Only the newest commit on master may deploy from here. A re-run of an older run keeps its
+      # original GITHUB_SHA and push event, and an older run whose image build finished late is not
+      # ordered behind a newer one by the concurrency group — either would silently move production
+      # back to an older release (and, for the backend, run older code on a schema already migrated
+      # further). Asked of GitHub at the moment the job runs, not of the event payload. An
+      # intentional rollback is not blocked by this: it goes through the deploy repo's "Deploy stack"
+      # workflow_dispatch, which deploys a chosen sha tag on purpose.
+      - name: Refuse to deploy a commit that is no longer the head of master
+        if: steps.target.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head_sha="$(git ls-remote "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" refs/heads/master | cut -f1)"
+          case "${head_sha}" in
+            '' | *[!0-9a-f]*) echo "::error::Could not read the head of master (got '${head_sha}'). Nothing was deployed."; exit 1 ;;
+          esac
+          if [ "${head_sha}" != "${GITHUB_SHA}" ]; then
+            echo "::error title=Stale deploy refused::${GITHUB_SHA} is no longer the head of master (${head_sha} is). Its own run deploys the newer commit; to roll back on purpose, use the deploy repo's Deploy stack workflow."
+            exit 1
+          fi
+
+      - name: Install SSH key and pinned host key
+        if: steps.target.outputs.configured == 'true'
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          umask 077
+          printf '%s\n' "${VPS_SSH_PRIVATE_KEY}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # The host key is PINNED from a secret. StrictHostKeyChecking=yes below makes ssh refuse
+          # any server whose key is not in this file, so a hijacked IP cannot receive the deploy.
+          printf '%s\n' "${VPS_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Run deploy.sh on the VPS
+        if: steps.target.outputs.configured == 'true'
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          # The tag must equal what metadata-action pushed: `sha-` + the first 7 hex chars of the commit.
+          short_sha="${GITHUB_SHA:0:7}"
+          case "${short_sha}" in
+            *[!0-9a-f]* | '') echo "::error::unexpected GITHUB_SHA '${GITHUB_SHA}'"; exit 1 ;;
+          esac
+          # The remote command is a fixed string plus that validated hex. Nothing from a PR title,
+          # branch name or commit message is ever interpolated into it.
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 \
+            -o ServerAliveInterval=30 \
+            -p "${VPS_PORT:-22}" \
+            "${VPS_USER}@${VPS_HOST}" \
+            "/opt/cashier/scripts/deploy.sh backend sha-${short_sha}"
+
+      - name: Remove SSH key
+        if: always() && steps.target.outputs.configured == 'true'
+        run: rm -f ~/.ssh/deploy_key

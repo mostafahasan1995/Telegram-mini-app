@@ -3,7 +3,114 @@
  * really move the balance, every BALANCE_DELTA test built on it would be green for the wrong reason.
  */
 import { FakeIchancyAdapter } from './fake-ichancy.adapter';
+import {
+  IchancyAgentErrorCodes,
+  IchancyAgentUnavailableError,
+  ichancyAgentKey,
+  type IchancyAgent,
+  type IchancyAgentCandidate,
+  type IchancyAgentResolver,
+} from './ichancy-agent';
 import { IchancyRejectionCodes, isIchancyOk } from './ichancy.types';
+
+function agentOf(tenantId: string, username: string, agentId: string): IchancyAgent {
+  const baseUrl = 'https://agents.example.com';
+  return {
+    tenantId,
+    baseUrl,
+    username,
+    password: `password-${username}`,
+    agentId,
+    currency: 'NSP',
+    agentKey: ichancyAgentKey(baseUrl, username),
+    credentialDigest: `digest-${username}`,
+  };
+}
+
+/** The operator "in context", switched by the test the way runWithTenant would switch it. */
+class SwitchableResolver implements IchancyAgentResolver {
+  current: IchancyAgent | IchancyAgentUnavailableError = agentOf('tenant-a', 'agent_a', '1001');
+
+  forCurrentTenant(): Promise<IchancyAgent> {
+    return this.current instanceof IchancyAgentUnavailableError
+      ? Promise.reject(this.current)
+      : Promise.resolve(this.current);
+  }
+
+  forTenant(): Promise<IchancyAgent> {
+    return this.forCurrentTenant();
+  }
+
+  fromCandidate(candidate: IchancyAgentCandidate): IchancyAgent {
+    return { ...agentOf(candidate.tenantId, candidate.username, candidate.agentId), password: candidate.password };
+  }
+}
+
+describe('FakeIchancyAdapter keyed per agent', () => {
+  let resolver: SwitchableResolver;
+  let fake: FakeIchancyAdapter;
+  const A = agentOf('tenant-a', 'agent_a', '1001');
+  const B = agentOf('tenant-b', 'agent_b', '2002');
+
+  beforeEach(() => {
+    resolver = new SwitchableResolver();
+    fake = new FakeIchancyAdapter(resolver);
+  });
+
+  it("keeps each agent's players and float apart, and records which agent made every call", async () => {
+    fake.setAgentWallet({ balanceMinor: 10_000n, agentKey: A.agentKey });
+    fake.setAgentWallet({ balanceMinor: 50_000n, agentKey: B.agentKey });
+
+    resolver.current = A;
+    const created = await fake.ensurePlayer({ login: 'shared_login', email: 'a@x.io', password: 'pw' });
+    const playerOfA = isIchancyOk(created) ? created.data.ichancyPlayerId : '';
+    await fake.creditPlayer({ ichancyPlayerId: playerOfA, amountMinor: 2_500n, comment: 'DEP-A' });
+
+    // B cannot see A's player, nor pay it from its float.
+    resolver.current = B;
+    expect((await fake.getPlayerBalance(playerOfA)).kind).toBe('ambiguous');
+    expect(await fake.findPlayerByLogin('shared_login')).toEqual({ kind: 'ok', data: null });
+    expect(fake.peekAgentWallet(B.agentKey)).toEqual({ balanceMinor: 50_000n, availableMinor: 50_000n });
+    expect(fake.peekAgentWallet(A.agentKey)).toEqual({ balanceMinor: 7_500n, availableMinor: 7_500n });
+
+    expect(fake.callsForAgent(A.agentKey).map((call) => [call.operation, call.tenantId, call.agentId])).toEqual([
+      ['ensurePlayer', 'tenant-a', '1001'],
+      ['creditPlayer', 'tenant-a', '1001'],
+    ]);
+    expect(fake.callsForAgent(B.agentKey)).toHaveLength(2);
+  });
+
+  it('throws with no operator in context, and refuses an operator whose agent cannot be used', async () => {
+    resolver.current = new IchancyAgentUnavailableError(IchancyAgentErrorCodes.NO_TENANT_CONTEXT, 'none');
+    await expect(fake.getAgentWallet()).rejects.toMatchObject({ code: 'ICHANCY_NO_TENANT_CONTEXT' });
+
+    resolver.current = new IchancyAgentUnavailableError(IchancyAgentErrorCodes.AGENT_UNCONFIGURED, 'unset');
+    expect(await fake.getAgentWallet()).toMatchObject({ kind: 'rejected', code: 'ICHANCY_AGENT_UNCONFIGURED' });
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it('refuses a helper that names no agent, instead of seeding a bucket no call reads', () => {
+    expect(() => fake.seedPlayer({ login: 'nobody' })).toThrow(/keyed per agent/);
+  });
+
+  it('accepts a sign-in unless that login is refused, and pages only the agent\'s own players', async () => {
+    fake.rejectSignIn('agent_b');
+    resolver.current = A;
+    expect(await fake.signIn()).toEqual({ kind: 'ok', data: { agentKey: A.agentKey, generation: 1 } });
+    resolver.current = B;
+    expect(await fake.signIn()).toMatchObject({ kind: 'rejected', code: 'INVALID_CREDENTIALS' });
+    expect(fake.signInCount(A.agentKey)).toBe(1);
+    expect(fake.signInCount(B.agentKey)).toBe(0);
+    // The recorded input names the agent, never the password.
+    expect(JSON.stringify(fake.callsFor('signIn'))).not.toContain('password-');
+
+    fake.seedPlayer({ login: 'b1', agentKey: B.agentKey });
+    fake.seedPlayer({ login: 'b2', agentKey: B.agentKey });
+    fake.seedPlayer({ login: 'a1', agentKey: A.agentKey });
+    const page = await fake.listAgentPlayers({ start: 0, limit: 10 });
+    expect(isIchancyOk(page) && page.data.records.map((record) => record.login)).toEqual(['b1', 'b2']);
+  });
+});
 
 describe('FakeIchancyAdapter', () => {
   let fake: FakeIchancyAdapter;

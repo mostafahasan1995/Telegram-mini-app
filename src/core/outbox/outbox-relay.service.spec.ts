@@ -6,6 +6,7 @@
  */
 import type { AppConfigService } from '@core/config/config.service';
 import type { PrismaService } from '@core/prisma/prisma.service';
+import { ALL_TENANTS } from '@core/prisma/tenant-scope.extension';
 import { TASKS } from '@core/queue/queue.types';
 import type { TypedQueueService } from '@core/queue/typed-queue.service';
 
@@ -18,9 +19,17 @@ interface UpdateManyCall {
   data: Record<string, unknown>;
 }
 
-function row(id: string, attempts = 1): ClaimedOutboxRow {
+/**
+ * The marker cannot be declared on UpdateManyCall — it is a plain symbol, not a `unique symbol`, so
+ * it has no place in an interface. Its presence on the `where` is what the extension reads.
+ */
+const spansEveryTenant = (call: UpdateManyCall | undefined): boolean =>
+  call !== undefined && Object.getOwnPropertySymbols(call.where).includes(ALL_TENANTS);
+
+function row(id: string, attempts = 1, tenantId = 'tenant-a'): ClaimedOutboxRow {
   return {
     id,
+    tenantId,
     aggregateType: 'DepositRequest',
     aggregateId: `agg-${id}`,
     topic: 'deposit.credit.requested',
@@ -96,6 +105,7 @@ describe('OutboxRelayService — the happy path', () => {
     const entries = addBulk.mock.calls[0]?.[1] as { payload: Record<string, unknown> }[];
     expect(entries[0]?.payload).toEqual({
       outboxId: 'a',
+      tenantId: 'tenant-a',
       topic: 'deposit.credit.requested',
       aggregateType: 'DepositRequest',
       aggregateId: 'agg-a',
@@ -114,6 +124,45 @@ describe('OutboxRelayService — the happy path', () => {
     });
     expect(addBulk).not.toHaveBeenCalled();
     expect(updates).toHaveLength(0);
+  });
+});
+
+describe('OutboxRelayService — one relay, every operator', () => {
+  it('publishes a mixed batch, each job stamped with its own row tenant', async () => {
+    // The claim is deliberately cross-operator, so a single tick routinely holds two operators'
+    // messages. Losing the per-row tenant here is how a deposit notification would reach the wrong
+    // operator's players, and it would look perfectly healthy in the logs.
+    const { service, addBulk } = createHarness({
+      claim: [row('a', 1, 'tenant-a'), row('b', 1, 'tenant-b')],
+    });
+    await service.tick();
+
+    const entries = addBulk.mock.calls[0]?.[1] as { payload: { tenantId: string } }[];
+    expect(entries.map((entry) => entry.payload.tenantId)).toEqual(['tenant-a', 'tenant-b']);
+  });
+
+  it('marks a mixed batch SENT across operators rather than only the ambient one', async () => {
+    // runOnce() is public so an operator endpoint can drain on demand — i.e. from inside a request
+    // that HAS a tenant context. Without the escape hatch the extension would narrow this UPDATE to
+    // that one tenant and leave every other operator's row IN_FLIGHT until the reaper woke up.
+    const { service, updates } = createHarness({
+      claim: [row('a', 1, 'tenant-a'), row('b', 1, 'tenant-b')],
+    });
+    await service.tick();
+
+    expect(updates[0]?.where.id.in).toEqual(['a', 'b']);
+    expect(spansEveryTenant(updates[0])).toBe(true);
+  });
+
+  it('returns and buries rows across operators the same way when the publish fails', async () => {
+    const { service, addBulk, updates } = createHarness({
+      claim: [row('a', OUTBOX_MAX_PUBLISH_ATTEMPTS, 'tenant-a'), row('b', 2, 'tenant-b')],
+    });
+    addBulk.mockRejectedValue(new Error('ECONNREFUSED'));
+    await service.tick();
+
+    expect(updates).toHaveLength(2);
+    expect(updates.every(spansEveryTenant)).toBe(true);
   });
 });
 

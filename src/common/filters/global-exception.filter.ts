@@ -24,6 +24,7 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, Logger } from '@nestjs/common';
 import { type Request, type Response } from 'express';
 import { type ApiEnvelope, type ApiErrorBody } from '../dtos/api-response.dto';
+import { redactRequestUrl, redactWebhookPathToken } from '../helpers/request-url-redaction.util';
 import { AppException } from '../exceptions/app.exception';
 import { CommonErrorCodes } from '../exceptions/error-codes';
 import { resolveCorrelationId } from '../interceptors/correlation-id.interceptor';
@@ -391,13 +392,19 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     request: Request,
     correlationId: string,
   ): void {
-    const where = `${request.method} ${request.url}`;
+    // Redacted because the Telegram webhook carries its path token in the URL, and a failed enqueue
+    // there is exactly the 500 that lands here. The message and stack get the same masking: nothing
+    // stops an error from quoting the URL it was handling.
+    const where = `${request.method} ${redactRequestUrl(request.url)}`;
     const context = `${normalized.body.code} ${where} correlationId=${correlationId}`;
 
     if (normalized.unexpected) {
       const stack = exception instanceof Error ? exception.stack : undefined;
       const detail = exception instanceof Error ? exception.message : String(exception);
-      this.logger.error(`${context} :: ${detail}`, stack);
+      this.logger.error(
+        `${context} :: ${redactWebhookPathToken(detail)}`,
+        stack === undefined ? undefined : redactWebhookPathToken(stack),
+      );
       return;
     }
 

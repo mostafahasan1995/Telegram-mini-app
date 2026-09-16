@@ -1,18 +1,24 @@
 /**
- * A real PostgreSQL 17 for the integration suite — schema pushed AND `prisma/sql/001..005` applied.
+ * A real PostgreSQL 17 for the integration suite — schema pushed AND `prisma/sql/001..006` applied.
  *
- * WHY the hand-written SQL is applied here and not left to a developer's memory: those five files
+ * WHY the hand-written SQL is applied here and not left to a developer's memory: those six files
  * are where the cashier's actual guarantees live (the ledger balances at COMMIT, the ledger is
- * append-only, one credit per deposit, four eyes really means two people). Prisma will never run
+ * append-only, one credit per deposit, four eyes really means two people, and one operator cannot
+ * reach into another's rows). Prisma will never run
  * them and `prisma db push` does not know they exist, so a test database without them looks
  * identical and silently asserts nothing. That is not hypothetical: the shared dev container this
  * project was built against has all 21 tables and zero of these triggers.
  *
- * WHY one container per JEST WORKER rather than per file or per suite: starting Postgres costs
- * seconds and truncating costs milliseconds. Jest runs each worker in its own process, so a
- * module-level singleton is exactly "one per worker" — files in the same worker share it, and
- * workers never share state with each other. `truncateAll()` between tests is what keeps them
- * isolated.
+ * WHY a module-level singleton rather than a container per test: starting Postgres costs
+ * seconds and truncating costs milliseconds, so `truncateAll()` between tests is what keeps
+ * tests isolated.
+ *
+ * WHAT IT SPANS — ONE CONTAINER PER SUITE, NOT PER WORKER: Jest gives every test FILE a fresh
+ * module registry, so each file that calls `startPostgres()` gets its own `handle`, and its own
+ * container, even at `maxWorkers: 1`. Workers never share state either way. So a suite that
+ * never calls `stopPostgres()` leaves its container running until the process exits, and the
+ * integration job pays for one container per suite — which is why that job's timeout is set the
+ * way it is (.github/workflows/ci.yml).
  *
  * The `ichancy_app` role is created before 003 runs so the least-privilege grants are actually
  * exercised. Tests connect as the OWNER by default (they need to truncate); `appUrl` is there for
@@ -38,18 +44,26 @@ export interface PostgresHandle {
 const APP_ROLE = 'ichancy_app';
 const APP_PASSWORD = 'ichancy_app';
 
-/** Applied in this order — 003 needs the tables, 004/005 need them too. */
+/**
+ * Applied in this order — 003 needs the tables, 004/005 need them too, and 006 needs `tenant_id`
+ * to exist before it can build foreign keys against it.
+ *
+ * 006 matters here for the same reason the other five do: without it a test database looks
+ * identical and silently asserts nothing. A cross-tenant deposit would insert happily, and an
+ * integration test written to prove isolation would pass while proving the opposite.
+ */
 const SQL_FILES = [
   '001_ledger_balanced_trigger.sql',
   '002_immutability.sql',
   '003_app_role_grants.sql',
   '004_partial_indexes.sql',
   '005_four_eyes_check.sql',
+  '006_tenant_isolation.sql',
 ] as const;
 
 const PROJECT_ROOT = join(__dirname, '..', '..');
 
-/** Module-level, therefore one per Jest worker process. */
+/** Module-level, therefore one per test FILE — see WHAT IT SPANS above, not one per worker. */
 let handle: PostgresHandle | null = null;
 let starting: Promise<PostgresHandle> | null = null;
 
@@ -96,9 +110,57 @@ async function applyGuards(url: string): Promise<void> {
       // cut in half.
       await client.query(sql);
     }
+
+    await seedBaselineTenancy(client);
   } finally {
     await client.end();
   }
+}
+
+/**
+ * The two tenants every tenant-scoped row hangs off, plus the currency they reference.
+ *
+ * WHY THIS IS HERE AND NOT LEFT TO THE MIGRATION: this harness builds its schema with
+ * `prisma db push`, which creates tables from schema.prisma and runs NO migrations. The rows that
+ * `20260911090000_multi_tenant_core` inserts therefore do not exist, so `tenants` comes up EMPTY and
+ * the first tenant-scoped insert in the suite dies on a foreign key — with an error naming the row
+ * being inserted rather than the baseline that was never created.
+ *
+ * It runs on the POSTGRES_TEST_URL path too, where the rows usually DO already exist because a human
+ * ran `migrate deploy`. Everything here is `ON CONFLICT DO NOTHING`, so that case is a no-op, and
+ * truncateAll() preserves both tables between tests.
+ *
+ * The ids are literals rather than imports from '@core/tenant': this file is harness plumbing that
+ * runs before any application module is loaded, and the values are equally hard-coded in the
+ * migration and in prisma/sql/006's CHECK constraint. If they ever change, all three change together.
+ */
+async function seedBaselineTenancy(client: Client): Promise<void> {
+  await client.query(`
+    INSERT INTO currencies (code, name, scale, symbol, is_active, created_at, updated_at)
+    VALUES ('NSP', 'New Syrian Pound', 2, 'NSP', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    ON CONFLICT (code) DO NOTHING;
+
+    INSERT INTO tenants (
+      id, slug, display_name, status, bot_token_enc, admin_chat_id,
+      ichancy_base_url, ichancy_username, ichancy_password_enc, ichancy_agent_id,
+      currency_code, dual_approval_threshold_minor, agent_float_low_watermark_minor,
+      deposit_expiry_minutes, updated_at
+    ) VALUES
+      ('00000000-0000-0000-0000-000000000000', 'platform', 'Platform', 'ACTIVE',
+       'TEST-PLATFORM-NO-BOT', 0, 'https://example.invalid', 'unused', 'TEST-PLATFORM-NO-AGENT',
+       'unused', 'NSP', 0, 0, 30, CURRENT_TIMESTAMP),
+      ('00000000-0000-0000-0000-000000000001', 'default', 'Default Operator', 'ACTIVE',
+       'TEST-BOOTSTRAP-BOT', 0, 'https://example.invalid', 'test-agent', 'TEST-BOOTSTRAP-PASSWORD',
+       '1', 'NSP', 0, 0, 30, CURRENT_TIMESTAMP)
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO platform_defaults (
+      id, ichancy_base_url, ichancy_agent_id, currency_code,
+      dual_approval_threshold_minor, agent_float_low_watermark_minor,
+      deposit_expiry_minutes, updated_at
+    ) VALUES (1, 'https://example.invalid', '1', 'NSP', 0, 0, 30, CURRENT_TIMESTAMP)
+    ON CONFLICT (id) DO NOTHING;
+  `);
 }
 
 export async function startPostgres(): Promise<PostgresHandle> {

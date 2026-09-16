@@ -36,6 +36,7 @@ import { NotFoundError } from '@common/exceptions/app.exception';
 import { parseDecimalToMinor } from '@common/helpers/money.util';
 import { FILE_STORAGE, type FileStorage } from '@core/file';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { requireEffectiveTenantId } from '@core/tenant';
 import { Inject } from '@nestjs/common';
 
 import { PROOF_URL_TTL_SECONDS } from '../deposit.constants';
@@ -144,7 +145,12 @@ export class DepositAdminController {
   @Get(':id')
   @AdminAuth(...QUEUE_ROLES)
   async detail(@Param('id', ParseUUIDPipe) id: string): Promise<AdminDepositView> {
-    const deposit = await this.repository.findByIdWithContext(this.prisma, id);
+    // EFFECTIVE tenant: another operator's deposit is the same 404 as an id that never existed.
+    const deposit = await this.repository.findByIdWithContextInTenant(
+      this.prisma,
+      requireEffectiveTenantId(),
+      id,
+    );
     if (deposit === null) {
       throw new NotFoundError(DepositErrorCodes.DEPOSIT_NOT_FOUND, 'Deposit not found.');
     }
@@ -287,10 +293,20 @@ export class DepositAdminController {
     return this.sweeper.runOnce();
   }
 
-  /** Scoped by deposit id so a proof id alone cannot be used to enumerate other people's receipts. */
+  /**
+   * Scoped by deposit id AND operator, both in the query. The deposit id alone was no protection:
+   * it comes from the same URL as the proof id, and another operator's pair matched itself and
+   * streamed that operator's player's receipt. Resolved BEFORE the storage driver is touched, so a
+   * refused request presigns and reads nothing.
+   */
   private async requireProof(depositRequestId: string, proofId: string) {
-    const proof = await this.repository.findProof(this.prisma, proofId);
-    if (proof === null || proof.depositRequestId !== depositRequestId) {
+    const proof = await this.repository.findProofInTenant(
+      this.prisma,
+      requireEffectiveTenantId(),
+      depositRequestId,
+      proofId,
+    );
+    if (proof === null) {
       throw new NotFoundError(DepositErrorCodes.PROOF_NOT_FOUND, 'Proof not found.');
     }
     return proof;

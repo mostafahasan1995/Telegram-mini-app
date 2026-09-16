@@ -1,0 +1,19 @@
+-- A one-time bind link belongs to the first chat that presents it (security fix, 2026-09-16).
+--
+-- The "Add bot to group" link makes Telegram post `/start@<bot> <nonce>` as a visible message in the
+-- group, so every member of that group can read the nonce. The link is not used up when the bind is
+-- refused on chat grounds (the bot not yet an administrator) or when it is opened in the group that is
+-- already bound, and it stays live for its 15 minutes. Inside that window a member could type the same
+-- command in a group they control where the bot is an administrator, and the staff group (and the
+-- review cards) would move there. The first chat that presents the nonce is now recorded, and the same
+-- nonce from any other chat is refused with LINK_OTHER_CHAT.
+--
+-- One nullable column with no default. Safe on a populated database:
+--  - on PostgreSQL 11+ adding it only updates the catalog: no row is rewritten, and the ACCESS
+--    EXCLUSIVE lock is held only for that catalog change;
+--  - existing rows read NULL, "not presented yet". A used link is refused as LINK_USED before its pin
+--    is read, and a live one is pinned by the next chat that presents it, so nothing is backfilled. A
+--    link that was presented, refused and not used up in the minutes before this deploy is therefore
+--    pinned by its next presentation; at most 15 minutes of links are affected;
+--  - IF NOT EXISTS makes a re-run a no-op.
+ALTER TABLE "telegram_chat_bind_links" ADD COLUMN IF NOT EXISTS "pinned_chat_id" BIGINT;

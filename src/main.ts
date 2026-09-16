@@ -20,6 +20,7 @@ import {
 import { TransformInterceptor } from '@common/interceptors/transform.interceptor';
 import { AppConfigService } from '@core/config/config.service';
 import { IDEMPOTENCY_HEADER } from '@core/idempotency/idempotency.constants';
+import { TENANT_HEADER, TenantContextMiddleware } from '@core/tenant';
 import { findUnmatchedRules } from '@core/throttler/throttle-routes';
 
 import { AppModule } from './app.module';
@@ -136,6 +137,17 @@ export function configureApiApp(app: NestExpressApplication, config: AppConfigSe
   // turns AuthGuard's principal into the Actor the audit stamping reads. See the file header.
   app.use(requestContextMiddleware);
 
+  // SECOND, and still before any guard: reads the signed `tid` claim off the access token and runs
+  // the rest of the request inside that tenant's AsyncLocalStorage context. AuthGuard resolves the
+  // admin identity by (tenantId, telegramUserId), so the tenant has to be established before it —
+  // which is why this is pre-router middleware and not an interceptor.
+  //
+  // Resolved from the container rather than imported as a function because it needs JwtService:
+  // nothing has authenticated yet here, so it verifies the token itself. A token it cannot verify
+  // simply yields no tenant context; AuthGuard then produces the canonical 401 envelope.
+  const tenantContext = app.get(TenantContextMiddleware);
+  app.use(tenantContext.use.bind(tenantContext));
+
   // This api owns its body parsing (see API_APP_OPTIONS.bodyParser === false): one route needs
   // megabytes, nothing else may have them, and a malformed body must not be reported as a 500.
   // The error handler goes immediately after the parsers — Express walks the stack FORWARD from
@@ -178,7 +190,16 @@ export function configureApiApp(app: NestExpressApplication, config: AppConfigSe
     },
     credentials: true,
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['authorization', 'content-type', IDEMPOTENCY_HEADER, CORRELATION_ID_HEADER],
+    // TENANT_HEADER is listed because without it the browser strips X-Tenant-Id at preflight and
+    // the console's operator switcher silently reads the platform admin's own tenant instead —
+    // a wrong answer that looks exactly like a right one.
+    allowedHeaders: [
+      'authorization',
+      'content-type',
+      IDEMPOTENCY_HEADER,
+      CORRELATION_ID_HEADER,
+      TENANT_HEADER,
+    ],
     // Without these the mini-app cannot read them: the correlation id it should show in an error
     // toast, and the rate-limit headers it should back off on.
     exposedHeaders: [
@@ -261,13 +282,15 @@ export async function bootstrapApi(): Promise<void> {
   // NOTE ON THE ABSENT GLOBAL PREFIX: the spec asks for '/v1', and every feature controller already
   // declares it in its own @Controller('v1/...') path. Calling setGlobalPrefix('v1') here would
   // produce /v1/v1/deposits and break every documented endpoint and every module's tests. The two
-  // routes that are deliberately NOT versioned — /health/* and the Telegram webhook, whose URL is
-  // built by AppConfigService — confirm the intent: versioning is per-controller in this codebase.
+  // routes that are deliberately NOT versioned — /health/* and the Telegram webhook, whose URL each
+  // operator's bot is registered under (telegramWebhookUrl) — confirm the intent: versioning is
+  // per-controller in this codebase.
 
   await app.listen(config.app.port, '0.0.0.0');
 
   logger.log(`API listening on port ${config.app.port} (${config.app.nodeEnv})`);
-  logger.log(`Telegram webhook path: ${config.telegram.webhookPath}`);
+  // No webhook banner: there is no deployment-wide webhook path any more. Each operator's bot is
+  // registered at /telegram/webhook/<its own path token>, which belongs in no startup log.
   if (!config.app.isProduction) logger.log(`OpenAPI UI: ${config.app.baseUrl}/docs`);
 }
 

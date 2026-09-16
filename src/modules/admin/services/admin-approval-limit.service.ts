@@ -11,6 +11,17 @@
  * nobody has decided how much to trust. Treating that as "unlimited" would mean the safest possible
  * configuration (an empty limits table on a fresh install) grants everyone infinite authority.
  *
+ * WHY PLATFORM_ADMIN SKIPS THE CEILINGS BUT NOT THE SECOND APPROVER: the dashboard contract makes
+ * it the owner superset — "Its money decisions are unbounded by an approval limit (the backend
+ * `RolesGuard` and the approval-limit evaluator both exempt it) and still land in the ledger and the
+ * audit trail like anybody else's." (manager-account-dashboard/docs/API-CONTRACT.md §3 Roles). So
+ * platform staff never needs a limit row and is never stopped by a single or daily ceiling, which
+ * is why the fail-closed rule above does not apply to it. What the contract does NOT lift is four
+ * eyes: the dual-approval threshold is an operator-wide control, not a personal ceiling, so an
+ * amount above it still goes to PENDING_SECOND_APPROVAL and still needs a DIFFERENT admin (the CAS
+ * predicate and the prisma/sql/005 CHECK in the deposit flow are untouched). The ledger and audit
+ * writes live in the callers and run exactly as they do for anybody else.
+ *
  * WHY the daily total is summed in JS and not with Prisma's `_sum`: the amount that counts against
  * the budget is `verifiedAmountMinor ?? claimedAmountMinor`, and an aggregate cannot coalesce two
  * columns. The row count per admin per day is bounded by how fast a human can click, so reading the
@@ -22,8 +33,10 @@ import type { AdminApprovalLimit, AdminRole, DepositStatus } from '@prisma/clien
 import { AppConfigService } from '@core/config/config.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { AuditService } from '@core/audit/audit.service';
+import { holdsAnyRole, isPlatformStaff } from '@core/auth/admin-authority';
 import { isUniqueConstraintError } from '@core/prisma/prisma-errors';
 import type { Tx } from '@core/prisma/tx.type';
+import { requireEffectiveTenantId } from '@core/tenant';
 import { formatMinorToDecimal, sumMinor } from '@common/helpers/money.util';
 import { adminActor } from '@common/types/actor.type';
 import { ConflictError, NotFoundError, ValidationError } from '@common/exceptions/app.exception';
@@ -64,6 +77,11 @@ export interface ApprovalEvaluation {
 export interface ApprovingAdmin {
   readonly adminUserId: string;
   readonly role: AdminRole;
+  /**
+   * The admin's HOME tenant (the row's own), never the X-Tenant-Id override. Required because
+   * platform staff is PLATFORM_ADMIN *in tenant zero*; the role alone does not earn the exemption.
+   */
+  readonly tenantId: string;
 }
 
 /**
@@ -140,8 +158,12 @@ export class AdminApprovalLimitService {
     // A zero or negative approval is not a small approval, it is a malformed one.
     if (amountMinor <= 0n) return base;
 
-    if (!APPROVER_ROLES.includes(admin.role)) {
+    if (!holdsAnyRole(admin, APPROVER_ROLES)) {
       return { ...base, reason: 'ROLE_MAY_NOT_APPROVE' };
+    }
+
+    if (isPlatformStaff(admin)) {
+      return this.evaluatePlatformStaff(tx, admin, amountMinor, currencyCode, at, base);
     }
 
     const limit = await this.limits.findEffective(admin.adminUserId, currencyCode, at, tx);
@@ -178,6 +200,34 @@ export class AdminApprovalLimitService {
     }
 
     return { ...withLimits, dailyUsedMinor, decision: 'ALLOWED', reason: 'WITHIN_LIMITS' };
+  }
+
+  /**
+   * The owner superset's path: no ceilings, the global four-eyes threshold. See the file header.
+   *
+   * WHY no limit row is read at all, not even for its `secondApprovalAbove` override: a platform
+   * admin's row lives in tenant zero, while the deposits it decides live in an operator (tenant zero
+   * may hold none — prisma/sql/006), so a row would be found or not depending on which tenant the
+   * request happened to run in. An answer that changes with the X-Tenant-Id header is not a control.
+   * The global threshold is the same everywhere, and it can only be raised by changing the deployment.
+   *
+   * `maxSingleApprovalMinor`/`maxDailyApprovalMinor` stay null ("no limit row applies"), which is the
+   * truth. `dailyUsedMinor` is still reported so an admin card or audit row can show it.
+   */
+  private async evaluatePlatformStaff(
+    tx: Tx,
+    admin: ApprovingAdmin,
+    amountMinor: bigint,
+    currencyCode: string,
+    at: Date,
+    base: ApprovalEvaluation,
+  ): Promise<ApprovalEvaluation> {
+    const dailyUsedMinor = await this.dailyApprovedMinor(tx, admin.adminUserId, currencyCode, at);
+
+    if (amountMinor > base.secondApprovalAboveMinor) {
+      return { ...base, dailyUsedMinor, decision: 'NEEDS_SECOND', reason: 'ABOVE_DUAL_THRESHOLD' };
+    }
+    return { ...base, dailyUsedMinor, decision: 'ALLOWED', reason: 'WITHIN_LIMITS' };
   }
 
   /**
@@ -240,7 +290,9 @@ export class AdminApprovalLimitService {
 
     this.assertCoherent(maxSingleApprovalMinor, maxDailyApprovalMinor, secondApprovalAboveMinor);
 
-    const admin = await this.admins.findById(adminUserId);
+    // Bound to the effective operator: a manager may set ceilings only for their own staff. Raising
+    // another operator's approver's ceiling would quietly weaken that operator's four-eyes rule.
+    const admin = await this.admins.findByIdInTenant(requireEffectiveTenantId(), adminUserId);
     if (admin === null) {
       throw new NotFoundError(AdminErrorCodes.ADMIN_NOT_FOUND, 'Administrator not found.');
     }
@@ -254,6 +306,10 @@ export class AdminApprovalLimitService {
 
         const created = await this.limits.create(
           {
+            // The limit belongs wherever the admin it constrains lives — read off the row loaded
+            // above rather than from the ambient context, so a ceiling can never end up filed under
+            // an operator that cannot see the admin it applies to.
+            tenantId: admin.tenantId,
             adminUserId,
             currencyCode: dto.currencyCode,
             maxSingleApprovalMinor,
@@ -307,9 +363,11 @@ export class AdminApprovalLimitService {
    */
   async endLimit(actorAdminId: string, limitId: string): Promise<ApprovalLimitView> {
     const at = new Date();
+    // Another operator's limit is "not found": ending it would deny that operator's approvals.
+    const tenantId = requireEffectiveTenantId();
 
     return this.prisma.runInTransaction(async (tx) => {
-      const existing = await this.limits.findById(limitId, tx);
+      const existing = await this.limits.findByIdInTenant(tenantId, limitId, tx);
       if (existing === null) {
         throw new NotFoundError(
           AdminErrorCodes.APPROVAL_LIMIT_NOT_FOUND,
@@ -323,7 +381,7 @@ export class AdminApprovalLimitService {
         );
       }
 
-      const closed = await this.limits.close(limitId, at, tx);
+      const closed = await this.limits.close(tenantId, limitId, at, tx);
 
       await this.audit.write(tx, {
         action: 'admin.limit.ended',

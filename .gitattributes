@@ -1,0 +1,14 @@
+# WHY this file exists: the Windows machines this repo is developed on run with core.autocrlf=true,
+# which rewrites line endings to CRLF on checkout. Anything a Linux container or a Linux CI runner
+# executes byte-for-byte must stay LF — a CRLF shebang fails as "/bin/sh^M: not found", and a CRLF
+# after a Dockerfile `\` continuation is a trap waiting for the first script someone adds.
+#
+# Deliberately NARROW. A blanket `* text=auto eol=lf` would renormalise every tracked file and bury
+# the next real change under a whole-repo line-ending diff. TypeScript and SQL are read by node and
+# postgres, both of which accept either ending, so they are left alone.
+Dockerfile          text eol=lf
+.dockerignore       text eol=lf
+.gitattributes      text eol=lf
+*.sh                text eol=lf
+.github/**/*.yml    text eol=lf
+.github/**/*.yaml   text eol=lf

@@ -13,6 +13,10 @@
  *
  * `adminChatId`/`adminMessageId` are recorded on the deposit the first time a card is posted, so
  * every later edit addresses that exact message across process restarts.
+ *
+ * WHICH BOT: always the bot of the operator that OWNS the deposit or player, read off that row. The
+ * telegram queue's jobs carry only an id and run with no tenant context, so the row is the one
+ * trustworthy answer, and a card sent through another operator's bot would leak this one's data.
  */
 import { Injectable, Logger } from '@nestjs/common';
 import { DepositStatus, type Prisma } from '@prisma/client';
@@ -21,7 +25,9 @@ import { AppConfigService } from '@core/config/config.service';
 import { IdempotencyService } from '@core/idempotency/idempotency.service';
 import { BALANCE_SNAPSHOT_METADATA_KEY, ichancyAgentFloatCode } from '@core/ledger';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { acrossTenants } from '@core/prisma/tenant-scope.extension';
 import { BotService } from '@core/telegram/services/bot.service';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 import { OPS_CARD_FEED_IDEMPOTENCY_SCOPE, OPS_CARD_IDEMPOTENCY_SCOPE } from '../deposit.constants';
 import { DepositRepository } from '../repositories/deposit.repository';
@@ -33,6 +39,7 @@ import {
   renderOpsCardPublic,
   renderPlayerMessage,
   esc,
+  playerLabelOf,
   type OpsCardInput,
 } from '../telegram/deposit-card.util';
 
@@ -54,7 +61,9 @@ export class DepositNotifyService {
    * outbox delivers at least once and a redelivery must not produce a second card.
    */
   async postOrUpdateAdminCard(depositRequestId: string, reason: string): Promise<void> {
-    const deposit = await this.deposits.findByIdWithContext(this.prisma, depositRequestId);
+    // The telegram queue has no tenant context and its job carries only an id our own outbox wrote;
+    // the row is what names the operator. Everything after this line is pinned to deposit.tenantId.
+    const deposit = await this.deposits.findByIdWithContextForWorker(this.prisma, depositRequestId);
     if (deposit === null) {
       this.logger.warn(`admin card requested for unknown deposit ${depositRequestId}`);
       return;
@@ -65,7 +74,7 @@ export class DepositNotifyService {
       deposit.decidedByAdminId === null
         ? null
         : await this.prisma.adminUser.findUnique({
-            where: { id: deposit.decidedByAdminId },
+            where: { id: deposit.decidedByAdminId, tenantId: deposit.tenantId },
             select: { displayName: true },
           });
 
@@ -84,6 +93,7 @@ export class DepositNotifyService {
 
     if (deposit.adminChatId !== null && deposit.adminMessageId !== null) {
       const edited = await this.bot.editMessageText(
+        deposit.tenantId,
         deposit.adminChatId,
         Number(deposit.adminMessageId),
         text,
@@ -95,20 +105,20 @@ export class DepositNotifyService {
       this.logger.warn(`card for ${deposit.shortId} was gone; posting a new one (${reason})`);
     }
 
-    const message = await this.bot.notifyAdmins(text, {
+    const message = await this.bot.notifyAdmins(deposit.tenantId, text, {
       parseMode: 'HTML',
       replyMarkup: keyboard,
       linkPreview: false,
     });
     if (message === null) {
       this.logger.error(
-        `admin chat ${this.config.telegram.adminChatId.toString()} is unreachable; ` +
+        `the admin chat of tenant ${deposit.tenantId} is unset or unreachable; ` +
           `deposit ${deposit.shortId} has no review card`,
       );
       return;
     }
 
-    await this.deposits.recordAdminCard(this.prisma, deposit.id, {
+    await this.deposits.recordAdminCard(this.prisma, deposit.tenantId, deposit.id, {
       chatId: BigInt(message.chat.id),
       messageId: BigInt(message.message_id),
       threadId: message.message_thread_id === undefined ? null : BigInt(message.message_thread_id),
@@ -137,9 +147,13 @@ export class DepositNotifyService {
    */
   async postCreditedOpsCard(depositRequestId: string): Promise<void> {
     const deposit = await this.prisma.depositRequest.findUnique({
-      where: { id: depositRequestId },
+      // Runs inside the outbox dispatcher, which entered the outbox row's own tenant — the operator
+      // whose credit committed that row. Pinned to it, so the card can only ever describe a deposit
+      // of the operator whose bot and admin chat it is posted through.
+      where: { id: depositRequestId, tenantId: requireEffectiveTenantId() },
       select: {
         id: true,
+        tenantId: true,
         shortId: true,
         currencyCode: true,
         claimedAmountMinor: true,
@@ -162,7 +176,7 @@ export class DepositNotifyService {
     }
 
     const t2 = await this.prisma.ledgerTransaction.findUnique({
-      where: { id: deposit.ledgerCreditTxId },
+      where: { id: deposit.ledgerCreditTxId, tenantId: deposit.tenantId },
       select: { metadata: true, postedAt: true },
     });
     const snapshot = agentFloatSnapshot(
@@ -204,7 +218,7 @@ export class DepositNotifyService {
    * failed send after giving the key back. This is the card that matters operationally.
    */
   private async postAdminOpsCard(
-    deposit: { id: string; shortId: string },
+    deposit: { id: string; tenantId: string; shortId: string },
     text: string,
   ): Promise<void> {
     const begun = await this.idempotency.begin({
@@ -231,12 +245,15 @@ export class DepositNotifyService {
     }
 
     try {
-      const message = await this.bot.notifyAdmins(text, { parseMode: 'HTML', linkPreview: false });
+      const message = await this.bot.notifyAdmins(deposit.tenantId, text, {
+        parseMode: 'HTML',
+        linkPreview: false,
+      });
       if (message === null) {
         // Permanently unreachable admin chat — same terminal outcome as the review card path.
         await this.idempotency.release(begun.lease, 'admin chat unreachable');
         this.logger.error(
-          `admin chat ${this.config.telegram.adminChatId.toString()} is unreachable; ` +
+          `the admin chat of tenant ${deposit.tenantId} is unset or unreachable; ` +
             `deposit ${deposit.shortId} has no ops card`,
         );
         return;
@@ -253,11 +270,11 @@ export class DepositNotifyService {
   }
 
   /**
-   * The same credit, mirrored into the OPTIONAL feed group.
+   * The same credit, mirrored into the operator's OPTIONAL feed group (`tenants.feed_chat_id`).
    *
    * MASKED BY DEFAULT: the feed group may contain CUSTOMERS. renderOpsCardPublic drops the cashier
    * float entirely and reduces the player's identifiers to their last characters. The full card is
-   * only reused when TELEGRAM_FEED_FULL_DETAIL says the group is staff-only — an explicit act.
+   * only reused when TELEGRAM_FEED_FULL_DETAIL says feed groups are staff-only — an explicit act.
    *
    * NEVER THROWS. A credited deposit is already money that moved; failing the outbox job because a
    * secondary group did not get its copy would re-run a notification path for no gain and leave the
@@ -265,27 +282,30 @@ export class DepositNotifyService {
    * (or to a concurrent worker holding the key) stays lost — which is the right trade for a mirror.
    */
   private async postFeedOpsCard(
-    deposit: { id: string; shortId: string },
+    deposit: { id: string; tenantId: string; shortId: string },
     card: OpsCardInput,
     adminText: string,
   ): Promise<void> {
-    // No feed configured: nothing to do, and nothing to say about it once per deposit either.
-    const feedChatId = this.config.telegram.feedChatId;
-    if (feedChatId === null) return;
-
-    // Feed pointed at the SAME chat as the admin group: postAdminOpsCard already delivered this
-    // exact deposit there, so a second send is a duplicate card, not a feed. This is not a
-    // hypothetical misconfiguration — an operator running a single group naturally sets both ids to
-    // it, and the two would then differ only in that the feed copy is the masked one, which reads
-    // as a bug. One group is a perfectly good setup; it just does not need the feed half.
-    if (feedChatId === this.config.telegram.adminChatId) {
-      this.logger.debug(
-        `feed card for ${deposit.shortId} skipped: feed chat is the admin chat (already posted)`,
-      );
-      return;
-    }
-
     try {
+      // Read from the operator's row inside the try: this method never throws, and a database blip
+      // costs the mirror, not the credit job.
+      const { adminChatId, feedChatId } = await this.bot.chatsOf(deposit.tenantId);
+
+      // No feed configured: nothing to do, and nothing to say about it once per deposit either.
+      if (feedChatId === null) return;
+
+      // Feed pointed at the SAME chat as the admin group: postAdminOpsCard already delivered this
+      // exact deposit there, so a second send is a duplicate card, not a feed. This is not a
+      // hypothetical misconfiguration — an operator running a single group naturally sets both ids
+      // to it, and the two would then differ only in that the feed copy is the masked one, which
+      // reads as a bug. One group is a perfectly good setup; it just does not need the feed half.
+      if (feedChatId === adminChatId) {
+        this.logger.debug(
+          `feed card for ${deposit.shortId} skipped: feed chat is the admin chat (already posted)`,
+        );
+        return;
+      }
+
       const begun = await this.idempotency.begin({
         scope: OPS_CARD_FEED_IDEMPOTENCY_SCOPE,
         key: deposit.id,
@@ -303,7 +323,12 @@ export class DepositNotifyService {
       const text = this.config.telegram.feedFullDetail ? adminText : renderOpsCardPublic(card);
 
       try {
-        const message = await this.bot.notifyFeed(text, { parseMode: 'HTML', linkPreview: false });
+        // The chat just read, not notifyFeed(): a second read could see a chat changed in between
+        // and send the card somewhere the admin-chat comparison above never looked at.
+        const message = await this.bot.sendMessage(deposit.tenantId, feedChatId, text, {
+          parseMode: 'HTML',
+          linkPreview: false,
+        });
         if (message === null) {
           await this.idempotency.release(begun.lease, 'feed chat unreachable');
           this.logger.warn(
@@ -336,20 +361,38 @@ export class DepositNotifyService {
     params: Readonly<Record<string, string>>,
   ): Promise<void> {
     const player = await this.prisma.player.findUnique({
-      where: { id: playerId },
-      select: { telegramUserId: true },
+      // The telegram queue again: no tenant context, and a player id our own outbox wrote. The row's
+      // tenant is what picks the bot below, so the message can only go out through the operator the
+      // player belongs to.
+      where: acrossTenants({ id: playerId }),
+      select: { tenantId: true, telegramUserId: true },
     });
     if (player === null) {
       this.logger.warn(`cannot notify unknown player ${playerId}`);
       return;
     }
-    await this.bot.sendMessage(player.telegramUserId, renderPlayerMessage(template, params), {
-      parseMode: 'HTML',
-      linkPreview: false,
-    });
+    // An imported player has no Telegram account, so there is no private chat to write to. Not an
+    // error: the message has nowhere to go until a Telegram id is attached to the row.
+    if (player.telegramUserId === null) {
+      this.logger.warn(`player ${playerId} has no Telegram account; message not sent`);
+      return;
+    }
+    // A player's Telegram id is only a chat the bot they started can write to, which is their
+    // operator's bot.
+    await this.bot.sendMessage(
+      player.tenantId,
+      player.telegramUserId,
+      renderPlayerMessage(template, params),
+      { parseMode: 'HTML', linkPreview: false },
+    );
   }
 
-  /** Operator alert. Deliberately loud and deliberately separate from the review cards. */
+  /**
+   * Operator alert. Deliberately loud and deliberately separate from the review cards.
+   *
+   * Runs only inside the outbox dispatcher, which enters `runWithTenant()` with the outbox row's own
+   * tenant, so the ambient tenant IS the operator the alert is about.
+   */
   async alertAdmins(payload: {
     shortId?: string;
     severity: string;
@@ -364,13 +407,17 @@ export class DepositNotifyService {
       payload.hint === undefined ? null : `<i>${esc(payload.hint)}</i>`,
     ].filter((line): line is string => line !== null);
 
-    await this.bot.notifyAdmins(lines.join('\n'), { parseMode: 'HTML', linkPreview: false });
+    await this.bot.notifyAdmins(requireEffectiveTenantId(), lines.join('\n'), {
+      parseMode: 'HTML',
+      linkPreview: false,
+    });
   }
 
-  private playerLabel(player: { telegramUserId: bigint; telegramUsername: string | null }): string {
-    return player.telegramUsername === null
-      ? `id ${player.telegramUserId.toString()}`
-      : `@${player.telegramUsername} (${player.telegramUserId.toString()})`;
+  private playerLabel(player: {
+    telegramUserId: bigint | null;
+    telegramUsername: string | null;
+  }): string {
+    return playerLabelOf(player);
   }
 }
 

@@ -140,7 +140,7 @@ export interface ApprovalLimitPort {
    */
   evaluate(
     tx: Tx,
-    admin: { readonly adminUserId: string; readonly role: AdminRole },
+    admin: { readonly adminUserId: string; readonly role: AdminRole; readonly tenantId: string },
     amountMinor: bigint,
     currencyCode: string,
   ): Promise<ApprovalDecisionValue>;

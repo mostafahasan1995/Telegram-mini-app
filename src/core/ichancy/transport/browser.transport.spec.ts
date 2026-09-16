@@ -146,6 +146,7 @@ const post = (transport: TestableTransport, timeoutMs = 8_000): Promise<IchancyT
     url: 'https://agents.ichancy.com/global-api/Player/registerPlayer',
     body: { player: { login: 'p1' } },
     accessToken: 'token',
+    agentKey: 'agent-1',
     timeoutMs,
   });
 

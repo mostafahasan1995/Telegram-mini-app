@@ -8,8 +8,14 @@
  * @core/cache and the HTTP client only dials on the first call. So an e2e run on the fake never
  * touches Ichancy or a socket of its own.
  *
+ * WHY TenantModule IS IMPORTED: both adapters resolve the operator's own agent from its tenant row
+ * (ICHANCY_AGENT_RESOLVER), which opens the sealed password with TenantSecretService. TenantModule
+ * is @Global, so in the api and worker graphs this import only documents the dependency; it is what
+ * makes the smaller graphs (the CLI, the feature-module integration specs) resolve it at all.
+ *
  * ASSUMPTIONS about other agents' code (both verified against the files on disk):
- *  - `PrismaModule` (@Global) provides PrismaService — injected by IchancyCallLogService.
+ *  - `PrismaModule` (@Global) provides PrismaService — injected by IchancyCallLogService and the
+ *    agent resolver.
  *  - `CacheModule` (@Global) provides RedisService + LockService — injected by the session store.
  *  - ICHANCY_FAKE IS now declared in env.schema.ts and read via AppConfigService.
  *    It previously was not, and that was a live safety hole rather than a tidiness issue:
@@ -21,8 +27,10 @@
  */
 import { Logger, Module, type Provider } from '@nestjs/common';
 import { AppConfigService } from '@core/config/config.service';
+import { TenantModule } from '@core/tenant/tenant.module';
 import { FakeIchancyAdapter } from './fake-ichancy.adapter';
 import { HttpIchancyAdapter } from './http-ichancy.adapter';
+import { ICHANCY_AGENT_RESOLVER } from './ichancy-agent';
 import { ICHANCY_CALL_LOG, IchancyCallLogService } from './ichancy-call-log.service';
 import { IchancyHealthService } from './ichancy-health.service';
 import { ICHANCY_AUTH_CLIENT, IchancyHttpClient } from './ichancy-http.client';
@@ -30,6 +38,7 @@ import { IchancySessionService } from './ichancy-session.service';
 import { ICHANCY_SESSION_STORE, RedisIchancySessionStore } from './ichancy-session.store';
 import { ICHANCY_PORT, type IchancyPort } from './ichancy.port';
 import { IchancyCheckCommand } from './commands/ichancy-check.command';
+import { TenantIchancyAgentResolver } from './tenant-ichancy-agent.resolver';
 import { BrowserIchancyTransport } from './transport/browser.transport';
 import { CookieHarvesterService } from './transport/cookie-harvester.service';
 import { FetchIchancyTransport } from './transport/fetch.transport';
@@ -63,7 +72,7 @@ const portProvider: Provider = {
     new Logger('IchancyModule').log(
       useFake
         ? 'Ichancy adapter: FAKE (in-memory). No real money can move.'
-        : `Ichancy adapter: REAL -> ${config.ichancy.baseUrl}`,
+        : "Ichancy adapter: REAL -> each operator's own agent, from its tenant row",
     );
     return useFake ? fake : http;
   },
@@ -97,6 +106,7 @@ const transportProvider: Provider = {
 };
 
 @Module({
+  imports: [TenantModule],
   providers: [
     IchancyCallLogService,
     { provide: ICHANCY_CALL_LOG, useExisting: IchancyCallLogService },
@@ -118,6 +128,9 @@ const transportProvider: Provider = {
     RedisIchancySessionStore,
     { provide: ICHANCY_SESSION_STORE, useExisting: RedisIchancySessionStore },
     IchancySessionService,
+    // The only source of the credentials an Ichancy call is made with: the operator's own row.
+    TenantIchancyAgentResolver,
+    { provide: ICHANCY_AGENT_RESOLVER, useExisting: TenantIchancyAgentResolver },
     HttpIchancyAdapter,
     FakeIchancyAdapter,
     portProvider,
@@ -127,8 +140,10 @@ const transportProvider: Provider = {
   ],
   exports: [
     ICHANCY_PORT,
-    // The worker's warm-up/health checks call ensureSession()/describe(); tests script the fake.
+    // The worker's per-agent warm-up calls ensureSession(); platform credential edits invalidate.
     IchancySessionService,
+    // Everything that needs "whose agent is this operator" asks the same resolver the adapters use.
+    ICHANCY_AGENT_RESOLVER,
     FakeIchancyAdapter,
     // Read by the player-link backfill (as a gate) and by the alert cron (state changes only).
     IchancyHealthService,

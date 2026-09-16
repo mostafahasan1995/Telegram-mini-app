@@ -4,8 +4,15 @@
  *   - exactly one replay after a token refresh, never two POSTs of a money call for any other reason
  *   - `result: []` / `result: 1` / string money are all handled without inventing a balance
  */
-import { type AppConfigService } from '@core/config/config.service';
 import { HttpIchancyAdapter } from './http-ichancy.adapter';
+import {
+  IchancyAgentErrorCodes,
+  IchancyAgentUnavailableError,
+  ichancyAgentKey,
+  type IchancyAgent,
+  type IchancyAgentCandidate,
+  type IchancyAgentResolver,
+} from './ichancy-agent';
 import {
   type IchancyAttempt,
   type IchancyCallParams,
@@ -55,8 +62,12 @@ class StubSession {
   token = 'access-1';
   refreshCalls = 0;
   failGetAccessToken = false;
+  /** The agent key of every session request, in order. */
+  readonly agentKeys: string[] = [];
+  readonly signedIn: IchancyAgent[] = [];
 
-  getAccessToken(): Promise<string> {
+  getAccessToken(agent: IchancyAgent): Promise<string> {
+    this.agentKeys.push(agent.agentKey);
     if (this.failGetAccessToken) {
       return Promise.reject(
         new IchancySessionError('ICHANCY_SESSION_MISSING', 'No Ichancy session in Redis'),
@@ -65,23 +76,56 @@ class StubSession {
     return Promise.resolve(this.token);
   }
 
-  refreshAfterUnauthorized(_stale: string | null): Promise<string> {
+  refreshAfterUnauthorized(agent: IchancyAgent, _stale: string | null): Promise<string> {
+    this.agentKeys.push(agent.agentKey);
     this.refreshCalls += 1;
     this.token = `access-${String(this.refreshCalls + 1)}`;
     return Promise.resolve(this.token);
   }
+
+  signInNow(agent: IchancyAgent): Promise<{ kind: 'ok'; data: { agentKey: string; generation: number } }> {
+    this.signedIn.push(agent);
+    return Promise.resolve({ kind: 'ok', data: { agentKey: agent.agentKey, generation: 1 } });
+  }
 }
 
-const config = {
-  ichancy: {
-    baseUrl: 'https://agent.example.com',
-    username: 'agent',
-    password: 'secret',
-    agentId: 'AGENT-1',
-    currency: 'NSP',
-    timeoutMs: 8_000,
-  },
-} as unknown as AppConfigService;
+function agentOf(baseUrl: string, username: string, agentId: string, currency: string): IchancyAgent {
+  return {
+    tenantId: `tenant-${username}`,
+    baseUrl,
+    username,
+    password: `password-of-${username}`,
+    agentId,
+    currency,
+    agentKey: ichancyAgentKey(baseUrl, username),
+    credentialDigest: `digest-${username}`,
+  };
+}
+
+const AGENT = agentOf('https://agent.example.com', 'agent', 'AGENT-1', 'NSP');
+
+/** Answers the agent of "the operator in context", or the error a real resolver would throw. */
+class StubResolver implements IchancyAgentResolver {
+  current: IchancyAgent | IchancyAgentUnavailableError = AGENT;
+
+  forCurrentTenant(): Promise<IchancyAgent> {
+    return this.current instanceof IchancyAgentUnavailableError
+      ? Promise.reject(this.current)
+      : Promise.resolve(this.current);
+  }
+
+  forTenant(): Promise<IchancyAgent> {
+    return this.forCurrentTenant();
+  }
+
+  fromCandidate(candidate: IchancyAgentCandidate): IchancyAgent {
+    return {
+      ...agentOf(candidate.baseUrl, candidate.username, candidate.agentId, candidate.currency),
+      tenantId: candidate.tenantId,
+      password: candidate.password,
+    };
+  }
+}
 
 const ok = (result: unknown): ScriptedResponse => ({
   httpStatus: 200,
@@ -108,16 +152,121 @@ const playersPage = (records: unknown[]): ScriptedResponse =>
 describe('HttpIchancyAdapter', () => {
   let http: StubHttpClient;
   let session: StubSession;
+  let resolver: StubResolver;
   let adapter: HttpIchancyAdapter;
 
   beforeEach(() => {
     http = new StubHttpClient();
     session = new StubSession();
+    resolver = new StubResolver();
     adapter = new HttpIchancyAdapter(
-      config,
       http as unknown as IchancyHttpClient,
       session as unknown as IchancySessionService,
+      resolver,
     );
+  });
+
+  describe("whose agent: the operator's in context, and only that one", () => {
+    const B = agentOf('https://agents.operator-b.example', 'agent_b', '2002', 'USD');
+
+    it("makes the whole registration as the operator's own agent: base URL, token and parentId", async () => {
+      resolver.current = B;
+      http.on('registerPlayer', ok(1));
+      http.on('getPlayersForCurrentAgent', playersPage([{ playerId: 'P-7', username: 'player_7' }]));
+
+      await adapter.ensurePlayer({ login: 'player_7', email: 'p7@example.com', password: 'hunter22' });
+
+      expect(http.calls.map((call) => call.agent.baseUrl)).toEqual([B.baseUrl, B.baseUrl]);
+      expect(http.calls.every((call) => call.agent.agentKey === B.agentKey)).toBe(true);
+      expect(http.calls[0]?.body).toMatchObject({ player: { parentId: '2002' } });
+      expect(new Set(session.agentKeys)).toEqual(new Set([B.agentKey]));
+    });
+
+    it("moves money and reads wallets in the operator's own currency", async () => {
+      resolver.current = B;
+      http.on('depositToPlayer', ok({ balance: '1.00', currencyCode: 'USD' }));
+      http.on('getAgentAllWallets', ok([
+        { currencyCode: 'NSP', balance: '999.00', availableWallet: '999.00' },
+        { currencyCode: 'USD', balance: '12.00', availableWallet: '10.00' },
+      ]));
+
+      await adapter.creditPlayer({ ichancyPlayerId: 'P-1', amountMinor: 100n, comment: 'X' });
+      const wallet = await adapter.getAgentWallet();
+
+      expect(http.calls[0]?.body).toMatchObject({ currencyCode: 'USD', currency: 'USD' });
+      expect(wallet).toEqual({ kind: 'ok', data: { balanceMinor: 1_200n, availableMinor: 1_000n } });
+    });
+
+    it('throws, sending nothing, when no operator is in context', async () => {
+      resolver.current = new IchancyAgentUnavailableError(
+        IchancyAgentErrorCodes.NO_TENANT_CONTEXT,
+        'No operator in the tenant context',
+      );
+
+      await expect(
+        adapter.creditPlayer({ ichancyPlayerId: 'P-1', amountMinor: 100n, comment: 'X' }),
+      ).rejects.toMatchObject({ code: 'ICHANCY_NO_TENANT_CONTEXT' });
+      expect(http.calls).toHaveLength(0);
+      expect(session.agentKeys).toHaveLength(0);
+    });
+
+    it('rejects, sending nothing, for an operator with no usable agent', async () => {
+      resolver.current = new IchancyAgentUnavailableError(
+        IchancyAgentErrorCodes.AGENT_UNCONFIGURED,
+        'The Ichancy password of operator t is not set',
+      );
+
+      expect(await adapter.getPlayerBalance('P-1')).toMatchObject({
+        kind: 'rejected',
+        code: 'ICHANCY_AGENT_UNCONFIGURED',
+      });
+      expect(http.calls).toHaveLength(0);
+    });
+
+    it('verifies candidate credentials with a real sign-in of exactly those credentials', async () => {
+      const result = await adapter.signIn({
+        tenantId: 'tenant-c',
+        baseUrl: 'https://agents.c.example',
+        username: 'agent_c',
+        password: 'new-password',
+        agentId: '3003',
+        currency: 'NSP',
+      });
+
+      expect(result.kind).toBe('ok');
+      expect(session.signedIn).toHaveLength(1);
+      expect(session.signedIn[0]).toMatchObject({
+        tenantId: 'tenant-c',
+        username: 'agent_c',
+        password: 'new-password',
+        agentKey: ichancyAgentKey('https://agents.c.example', 'agent_c'),
+      });
+    });
+
+    it("lists the agent's own players a page at a time, counting rows it cannot use", async () => {
+      http.on(
+        'getPlayersForCurrentAgent',
+        playersPage([
+          { playerId: 'P-1', username: 'first', email: 'first@example.com', parentId: 3003 },
+          { playerId: 'P-2', username: 'second' },
+          { username: 'no-id' },
+        ]),
+      );
+
+      const page = await adapter.listAgentPlayers({ start: 100, limit: 100 });
+
+      expect(page).toEqual({
+        kind: 'ok',
+        data: {
+          records: [
+            { ichancyPlayerId: 'P-1', login: 'first', email: 'first@example.com', parentId: '3003' },
+            { ichancyPlayerId: 'P-2', login: 'second', email: null, parentId: null },
+          ],
+          received: 3,
+        },
+      });
+      expect(http.calls[0]?.body).toEqual({ start: 100, limit: 100, filter: {} });
+    });
   });
 
   describe('token expiry', () => {

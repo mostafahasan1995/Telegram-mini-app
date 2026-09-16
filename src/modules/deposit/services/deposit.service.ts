@@ -26,6 +26,7 @@ import {
   DepositStatus,
   PaymentRail,
   ProofSource,
+  TenantStatus,
   type DepositRequest,
   type PaymentDestination,
   type PaymentMethod,
@@ -55,6 +56,8 @@ import { OutboxService } from '@core/outbox/outbox.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { isUniqueConstraintError, mapPrismaError } from '@core/prisma/prisma-errors';
 import type { Tx } from '@core/prisma/tx.type';
+import { boundChatOf } from '@core/telegram/utils/chat-membership.util';
+import { requireEffectiveTenantId, TenantErrorCodes } from '@core/tenant';
 
 import { DEPOSIT_AGGREGATE, DEPOSIT_TOPICS, MAX_PROOFS_PER_DEPOSIT } from '../deposit.constants';
 import {
@@ -186,7 +189,10 @@ function blankToUndefined(value: string | null | undefined): string | undefined 
  * PROOF_REQUIRED, REFERENCE_MALFORMED, SENDER_ACCOUNT_MALFORMED and DESTINATION_MISSING all still
  * throw at SUBMIT, exactly as before.
  */
-const CONFIG_DRIFT_CODES: ReadonlySet<string> = new Set(['AMOUNT_BELOW_MINIMUM', 'AMOUNT_ABOVE_MAXIMUM']);
+const CONFIG_DRIFT_CODES: ReadonlySet<string> = new Set([
+  'AMOUNT_BELOW_MINIMUM',
+  'AMOUNT_ABOVE_MAXIMUM',
+]);
 
 @Injectable()
 export class DepositService {
@@ -218,6 +224,10 @@ export class DepositService {
    * where two concurrent requests each see a compliant total.
    */
   async create(actor: Actor, input: CreateDepositInput): Promise<CreatedDeposit> {
+    // First, before anything else is resolved: a suspended operator's player is told the one thing
+    // that is actually wrong, not a rail or limit error that would send them trying another amount.
+    await this.assertOperatorServing();
+
     // Method resolution, destination rotation and the rail's own field rules all belong to the
     // payment-method module and are reached through PAYMENT_METHOD_PORT (see ../ports). Duplicating
     // any of them here would mean two answers to "is this amount allowed on this rail?".
@@ -413,6 +423,7 @@ export class DepositService {
 
       const proof = await this.insertProof(tx, {
         depositRequestId: deposit.id,
+        tenantId: deposit.tenantId,
         bucket: stored.bucket,
         storageKey: stored.key,
         mimeType: normalized.mimeType,
@@ -425,6 +436,7 @@ export class DepositService {
       });
 
       const report = await this.duplicates.findDuplicates(tx, {
+        tenantId: deposit.tenantId,
         proofId: proof.id,
         depositRequestId: deposit.id,
         playerId: deposit.playerId,
@@ -454,6 +466,7 @@ export class DepositService {
 
     // The perceptual index is a rebuildable cache; a failure here must never undo a committed proof.
     await this.duplicates.index({
+      tenantId: deposit.tenantId,
       proofId: outcome.proofId,
       depositRequestId: deposit.id,
       playerId: deposit.playerId,
@@ -486,7 +499,10 @@ export class DepositService {
    */
   async attachStoredProof(input: StoredProofInput): Promise<StoredProofResult> {
     const deposit = await this.prisma.depositRequest.findUnique({
-      where: { id: input.depositRequestId },
+      // The operator whose bot received the photo. The id was picked from that player's own open
+      // deposits, so this only ever matches; pinning it keeps a receipt from landing on another
+      // operator's deposit if a caller ever passes an id from somewhere else.
+      where: { id: input.depositRequestId, tenantId: requireEffectiveTenantId() },
     });
     if (deposit === null) {
       throw new NotFoundError(DepositErrorCodes.DEPOSIT_NOT_FOUND, 'Deposit not found.');
@@ -512,6 +528,7 @@ export class DepositService {
     return this.prisma.runInTransaction(async (tx) => {
       const proof = await this.insertProof(tx, {
         depositRequestId: deposit.id,
+        tenantId: deposit.tenantId,
         bucket: input.bucket,
         storageKey: input.storageKey,
         mimeType: input.mimeType,
@@ -670,6 +687,11 @@ export class DepositService {
     },
   ): Promise<{ deposit: DepositRequest; replayed: boolean }> {
     const data: Prisma.DepositRequestUncheckedCreateInput = {
+      // EFFECTIVE, not home: when platform staff open a deposit while looking at operator X, the
+      // money is X's and so is the row. Nothing earlier in this path holds a tenant of its own —
+      // the payment method and destination arrive through PAYMENT_METHOD_PORT as plain values — so
+      // the request context is the authority here.
+      tenantId: requireEffectiveTenantId(),
       shortId: generateShortId(),
       playerId: args.input.playerId,
       paymentMethodId: args.method.id,
@@ -713,6 +735,50 @@ export class DepositService {
     }
   }
 
+  /**
+   * "No new deposit can be started" is what the console's suspend dialog promises a suspension does
+   * (manager-account-dashboard src/features/tenants/messages.ts, tenants.suspend.confirmBody), so it
+   * is enforced here, where every path that opens a deposit meets it: the mini app's POST and the
+   * bot's buttons alike.
+   *
+   * ONLY the start of new money is gated. Proof upload, cancel, review and crediting stay open,
+   * because the same dialog promises that "credits already in flight still land", and a player who
+   * has already paid must still be able to attach the receipt.
+   *
+   * WHY A DIRECT READ AND NOT TenantRegistryService: it is one primary-key lookup on a route that is
+   * rate limited to a dozen calls a minute per player, and it sees a suspension the moment it
+   * commits instead of up to 30 seconds later. It also keeps this module's dependencies to Prisma.
+   * The operator is the effective tenant, which for a player is the one signed into their session.
+   *
+   * THE STAFF GROUP (owner decision, 2026-09-15): an operator with no staff group bound may not take
+   * money, because every review card and alert of the deposit it opens would go nowhere. Activation
+   * already refuses such an operator, but a row can be ACTIVE at "no group" without passing through
+   * it: one activated before the rule existed, or one a seed switched on. Suspending those in a data
+   * migration would silently stop a live operator, so they are refused here instead, at the start
+   * of new money only, exactly like a suspension. The player sees the same paused wording (what they
+   * can do about it is the same: nothing); the code tells the console and the logs the real cause.
+   */
+  private async assertOperatorServing(): Promise<void> {
+    const operator = await this.prisma.tenant.findUnique({
+      where: { id: requireEffectiveTenantId() },
+      select: { status: true, adminChatId: true },
+    });
+    const paused =
+      'Deposits are paused for this cashier right now, so a new deposit cannot be started. ' +
+      'A deposit you have already paid for still goes through.';
+
+    if (operator?.status !== TenantStatus.ACTIVE) {
+      throw new BusinessRuleError(TenantErrorCodes.TENANT_NOT_ACTIVE, paused, {
+        status: operator?.status ?? null,
+      });
+    }
+    if (boundChatOf(operator.adminChatId) === null) {
+      throw new BusinessRuleError(TenantErrorCodes.TENANT_STAFF_GROUP_REQUIRED, paused, {
+        status: operator.status,
+      });
+    }
+  }
+
   private policyGate(
     tx: Tx,
     input: CreateDepositInput,
@@ -729,6 +795,12 @@ export class DepositService {
     tx: Tx,
     args: {
       depositRequestId: string;
+      /**
+       * Taken off the deposit this proof is being attached to, never off the ambient context: the
+       * evidence for a payment has to live in the same operator as the payment, or a reviewer of
+       * that operator opens a card with no receipt on it.
+       */
+      tenantId: string;
       bucket: string;
       storageKey: string;
       mimeType: string;
@@ -743,6 +815,7 @@ export class DepositService {
   ) {
     try {
       return await this.deposits.createProof(tx, {
+        tenantId: args.tenantId,
         depositRequestId: args.depositRequestId,
         source: args.source,
         bucket: args.bucket,
@@ -902,7 +975,7 @@ export class DepositService {
     }
 
     const player = await tx.player.findUnique({
-      where: { id: deposit.playerId },
+      where: { id: deposit.playerId, tenantId: deposit.tenantId },
       select: { createdAt: true },
     });
     if (player !== null && Date.now() - player.createdAt.getTime() < 24 * 60 * MINUTE_MS) {

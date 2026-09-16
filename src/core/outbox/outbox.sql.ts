@@ -12,6 +12,13 @@
  *   attempts + 1    — incremented AT CLAIM, not at failure: a process that dies mid-publish must
  *                     still burn an attempt, otherwise a crash loop retries the same row forever
  *
+ * CROSS-TENANT BY DESIGN: one relay drains every operator's outbox. Raw SQL is invisible to
+ * tenant-scope.extension.ts — that extension can only rewrite a Prisma `where` object — so there is
+ * no tenant filter here to be surprised by, and none is missing. Do NOT "fix" this by adding a
+ * tenant_id predicate: the relay would then drain only whichever operator happened to be ambient,
+ * and every other operator's side effects would sit PENDING forever. The tenant is applied one
+ * level down instead, per message, by the dispatch processor.
+ *
  * Kept out of the service so the claim query can be asserted by a spec without a Nest container.
  */
 import { Prisma } from '@prisma/client';
@@ -19,9 +26,14 @@ import { Prisma } from '@prisma/client';
 /**
  * Columns the relay needs, aliased to camelCase so the result maps straight onto ClaimedOutboxRow.
  * `m.*` is deliberately not used: an added column would silently change the row shape.
+ *
+ * tenant_id earns its place: because the claim deliberately spans operators, the row itself is the
+ * only thing that can say whose message this is. Drop it and the relay would have to re-read every
+ * claimed row to find out — an extra query, and a race with anything editing the row meanwhile.
  */
 const CLAIMED_COLUMNS = Prisma.sql`
       m.id,
+      m.tenant_id      AS "tenantId",
       m.aggregate_type AS "aggregateType",
       m.aggregate_id   AS "aggregateId",
       m.topic,

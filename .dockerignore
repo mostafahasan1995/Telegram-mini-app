@@ -1,18 +1,52 @@
+# WHY this list: the build context is uploaded to the Docker daemon before the first instruction
+# runs, and everything in it can reach an image layer through a careless COPY. Keeping it lean makes
+# builds faster and keeps secrets out by construction rather than by care.
+#
+# MUST STAY INCLUDED (the `tools` image runs migrations, db-bootstrap and the seed from them):
+#   package.json, package-lock.json, prisma/ (schema, migrations, sql/, seed/), prisma.config.ts,
+#   scripts/, src/, tsconfig*.json, nest-cli.json.
+# If you add a pattern here, check it cannot match one of those.
+
+# ---- dependencies and build output: always rebuilt inside the image ----
 node_modules
 dist
 dist-worker
 coverage
+*.tsbuildinfo
+.eslintcache
+.nest
+
+# ---- VCS, CI and editors ----
 .git
 .gitignore
+.gitattributes
+.github
+.idea
+.vscode
+
+# ---- secrets: never in the context. .env.example holds placeholders only ----
 .env
 .env.*
 !.env.example
+
+# ---- local runtime data ----
 *.log
-*.tsbuildinfo
-.eslintcache
-.idea
-.vscode
-docker-compose.yml
+logs
+tmp
+uploads
+
+# ---- docs and local-only tooling ----
+docs
 README.md
+plan2.md
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# ---- tests: the image never runs them; CI runs them on the source tree ----
 test
 **/*.spec.ts
+jest.config.cjs
+jest-int.config.cjs
+eslint.config.mjs
+.prettierrc

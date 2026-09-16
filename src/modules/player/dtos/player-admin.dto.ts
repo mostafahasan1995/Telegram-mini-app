@@ -76,6 +76,6 @@ export interface IchancyAccountView {
   readonly ichancyPlayerId: string;
   readonly ichancyLogin: string;
   readonly created: boolean;
-  /** The agent this account hangs off — `parentId` on registerPlayer, from ICHANCY_AGENT_ID. */
+  /** The agent this account hangs off — `parentId` on registerPlayer, the operator's own agent id. */
   readonly agentId: string;
 }

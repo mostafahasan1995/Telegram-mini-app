@@ -20,6 +20,7 @@ import { RolesGuard } from './guards/roles.guard';
 import { AdminIdentityService } from './services/admin-identity.service';
 import { InitDataService } from './services/init-data.service';
 import { LoginCodeService } from './services/login-code.service';
+import { PasswordHasherService } from './services/password-hasher.service';
 import { SessionService } from './services/session.service';
 
 @Module({
@@ -44,12 +45,21 @@ import { SessionService } from './services/session.service';
     InitDataService,
     SessionService,
     AdminIdentityService,
-    // Shared by the admin console and the player app: both exchange a bot-minted code for a token,
-    // and modules/player may not import modules/admin.
+    // The player app's bot-minted sign-in code. The staff console's code door was retired; staff
+    // sign in with a username and password through PasswordHasherService below.
     LoginCodeService,
+    // Console passwords. Stateless, so one instance serves the credentials route and the staff
+    // directory alike.
+    PasswordHasherService,
     { provide: APP_GUARD, useClass: AuthGuard },
     { provide: APP_GUARD, useClass: RolesGuard },
   ],
-  exports: [InitDataService, SessionService, AdminIdentityService, LoginCodeService],
+  exports: [
+    InitDataService,
+    SessionService,
+    AdminIdentityService,
+    LoginCodeService,
+    PasswordHasherService,
+  ],
 })
 export class AuthModule {}

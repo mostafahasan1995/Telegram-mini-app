@@ -6,10 +6,11 @@
  * to exist before a referrer can be attached to it. /start is also the first contact for most
  * users, well before they ever open the mini app, and a row here costs nothing.
  *
- * WHY /start ALSO CREATES THE ICHANCY ACCOUNT: this bot is the PLAYER-facing surface, and the one
- * Ichancy identity it holds is the AGENT's (ICHANCY_USERNAME/ICHANCY_PASSWORD, signed in by the
- * worker). Every account it opens is registered with `parentId: ICHANCY_AGENT_ID`, i.e. as a CHILD
- * of that agent — that is what makes the money flow legal: a credit is drawn from the agent's float
+ * WHY /start ALSO CREATES THE ICHANCY ACCOUNT: this bot is the PLAYER-facing surface of ONE operator,
+ * and the one Ichancy identity it acts with is that operator's AGENT (the username, sealed password
+ * and agent id on its tenant row, resolved per call by TenantIchancyAgentResolver; never env). Every
+ * account it opens is registered with `parentId` = that operator's agent id, i.e. as a CHILD of that
+ * agent — that is what makes the money flow legal: a credit is drawn from the agent's float
  * into an account the agent owns. Pressing Start therefore has to end with the player owning such an
  * account, not with a row that only becomes a real account at the first credit. See
  * ensureGamingAccount below for why it happens AFTER the greeting and why a failure is not fatal.
@@ -63,10 +64,7 @@ import { AppConfigService } from '@core/config/config.service';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { RedisService } from '@core/cache/redis.service';
 import { AdminIdentityService } from '@core/auth/services/admin-identity.service';
-import {
-  LoginCodeService,
-  LOGIN_CODE_TTL_MINUTES,
-} from '@core/auth/services/login-code.service';
+import { LoginCodeService, LOGIN_CODE_TTL_MINUTES } from '@core/auth/services/login-code.service';
 import { OnCallback, OnCommand } from '@core/telegram/decorators/handlers.decorator';
 import {
   CALLBACK_DATA_MAX_BYTES,
@@ -74,6 +72,9 @@ import {
   encodeCallbackData,
 } from '@core/telegram/utils/callback-data.util';
 import { ICHANCY_PORT, type IchancyPort, isIchancyOk } from '@core/ichancy';
+// The leaf file, not the '@core/tenant' barrel: the barrel also exports TenantModule, and this module
+// deliberately stays out of the Nest graphs it would pull in.
+import { requireEffectiveTenantId } from '@core/tenant/tenant.storage';
 import { isAppException } from '@common/exceptions/app.exception';
 import { formatMinorToDecimal, parseDecimalToMinor } from '@common/helpers/money.util';
 import { playerActor, type Actor } from '@common/types/actor.type';
@@ -87,6 +88,18 @@ import { PlayerErrorCodes } from '../player.constants';
 import type { LinkedIchancyAccount } from '../player-link.port';
 
 const ABOUT_NAME = 'Ichancy Cashier';
+
+/**
+ * Whose players these handlers act on: the operator whose bot received the update.
+ *
+ * An inbound Telegram update carries no tenant: `from.id` is a Telegram account, and the same account
+ * can be a player of two operators. Each operator has its own bot, the webhook resolves the operator
+ * from the path token the update arrived on, and TelegramUpdateProcessor dispatches the update inside
+ * `runWithTenant()` for that operator. Reading it here, instead of naming a fixed operator, is what
+ * files a second operator's players under that operator. Outside a dispatched update this throws,
+ * which is a bug worth hearing about rather than a tenant worth guessing.
+ */
+const botTenantId = (): string => requireEffectiveTenantId();
 
 /**
  * OUR callback namespace. `dep` belongs to the deposit module's ADMIN card
@@ -389,8 +402,8 @@ export class PlayerTelegramHandlers {
 
     if (ctx.chat?.type !== 'private') {
       await ctx.reply(
-        'Not here — a login code must never be posted in a group. '
-          + 'Open a direct chat with me and send /login there.',
+        'Not here — a login code must never be posted in a group. ' +
+          'Open a direct chat with me and send /login there.',
       );
       return;
     }
@@ -402,12 +415,12 @@ export class PlayerTelegramHandlers {
     try {
       const { code } = await this.loginCodes.mint('player', BigInt(from.id));
       await ctx.reply(
-        `<b>تسجيل الدخول للتطبيق</b>\n\n`
-          + `<code>${code}</code>\n\n`
-          + `صالح ${LOGIN_CODE_TTL_MINUTES} دقائق، ولمرة واحدة فقط.\n`
-          + `أدخله في شاشة تسجيل الدخول بالتطبيق.\n\n`
-          + `إذا لم تطلب هذا الرمز، تجاهله — الرمز بلا فائدة بدون التطبيق، `
-          + `وإرسال /login مرة أخرى يلغي هذا الرمز.`,
+        `<b>تسجيل الدخول للتطبيق</b>\n\n` +
+          `<code>${code}</code>\n\n` +
+          `صالح ${LOGIN_CODE_TTL_MINUTES} دقائق، ولمرة واحدة فقط.\n` +
+          `أدخله في شاشة تسجيل الدخول بالتطبيق.\n\n` +
+          `إذا لم تطلب هذا الرمز، تجاهله — الرمز بلا فائدة بدون التطبيق، ` +
+          `وإرسال /login مرة أخرى يلغي هذا الرمز.`,
         { parse_mode: 'HTML' },
       );
     } catch (error: unknown) {
@@ -431,7 +444,7 @@ export class PlayerTelegramHandlers {
     const payload = typeof ctx.match === 'string' ? ctx.match : '';
 
     const referral = await this.referrals
-      .bindFromStartPayload(playerId, BigInt(from.id), payload, 'telegram:/start')
+      .bindFromStartPayload(botTenantId(), playerId, BigInt(from.id), payload, 'telegram:/start')
       .catch((error: unknown) => {
         // A broken deep link must never stop someone using the bot.
         this.logger.warn(`Referral capture failed for player ${playerId}: ${describeError(error)}`);
@@ -464,9 +477,9 @@ export class PlayerTelegramHandlers {
    * Opens the player's Ichancy account — as a CHILD of our agent — the moment they press Start.
    *
    * The parent link itself is not decided here: PlayerLinkService derives the credentials and
-   * HttpIchancyAdapter.ensurePlayer sends `parentId: ICHANCY_AGENT_ID` on registerPlayer, so every
-   * account this bot creates hangs off the one agent the worker is signed in as. This method only
-   * decides WHEN that happens.
+   * HttpIchancyAdapter.ensurePlayer sends the operator's own agent id as `parentId` on registerPlayer,
+   * so every account this bot creates hangs off the agent of the operator the update arrived for. This
+   * method only decides WHEN that happens.
    *
    * WHY AFTER THE GREETING: registering is a registerPlayer call plus a getPlayersForCurrentAgent
    * lookup (the API answers the number 1, never an id), each bounded by ICHANCY_TIMEOUT_MS. Someone
@@ -530,7 +543,7 @@ export class PlayerTelegramHandlers {
    * strings nobody can retype from memory.
    */
   private async credentialLines(playerId: string): Promise<string[]> {
-    const player = await this.playerRepo.findById(playerId);
+    const player = await this.playerRepo.findByIdInTenant(botTenantId(), playerId);
     if (player === null) return [];
 
     let credentials: { login: string; password: string };
@@ -591,9 +604,10 @@ export class PlayerTelegramHandlers {
    * player's command, and a card that says "new player" for one would be a lie.
    *
    * WHY ctx.api RATHER THAN BotService.notifyAdmins: BotService lives in @core/telegram, which
-   * PlayerModule does not import — and importing it would drag the Bot factory (a getMe round trip at
-   * construction) into every graph that boots PlayerModule on its own, including
-   * src/modules/modules.int.spec.ts. `ctx.api` IS the very Api instance serving this update, autoRetry
+   * PlayerModule does not import — and importing it would drag the Telegram module (its queue, its
+   * webhook controller and the per-operator bot registry) into every graph that boots PlayerModule
+   * on its own, including src/modules/modules.int.spec.ts. `ctx.api` IS the Api of the operator's
+   * own bot serving this update, autoRetry
    * included; the only thing given up is BotService's blocked/unreachable classification, which the
    * catch below replaces. A card that cannot be delivered must never cost the player their /start.
    *
@@ -609,6 +623,24 @@ export class PlayerTelegramHandlers {
   ): Promise<void> {
     const from = ctx.from;
     if (from === undefined) return;
+
+    // WHERE: this operator's own admin group, read off its tenant row. `Tenant` is not a scoped
+    // model, so the id is named explicitly; 0 is what an operator with no admin group yet holds.
+    const tenantId = requireEffectiveTenantId();
+    const adminChat = await this.prisma.tenant
+      .findUnique({ where: { id: tenantId }, select: { adminChatId: true } })
+      .catch((error: unknown) => {
+        this.logger.warn(
+          `Could not read the admin chat of tenant ${tenantId}: ${describeError(error)}`,
+        );
+        return null;
+      });
+    if (adminChat === null || adminChat.adminChatId === 0n) {
+      this.logger.debug(
+        `No admin chat set for tenant ${tenantId}; new player ${playerId} not announced`,
+      );
+      return;
+    }
 
     const ordinal = await this.prisma.player.count().catch((error: unknown) => {
       this.logger.debug(`Could not count players for the arrivals card: ${describeError(error)}`);
@@ -653,7 +685,7 @@ export class PlayerTelegramHandlers {
     );
 
     try {
-      await ctx.api.sendMessage(this.config.telegram.adminChatId.toString(), lines.join('\n'), {
+      await ctx.api.sendMessage(adminChat.adminChatId.toString(), lines.join('\n'), {
         parse_mode: 'HTML',
         link_preview_options: { is_disabled: true },
         // The group is watching a review queue, not an arrivals board: this must not buzz phones.
@@ -778,7 +810,7 @@ export class PlayerTelegramHandlers {
     const from = ctx.from;
     if (from === undefined || from.is_bot) return;
 
-    const player = await this.playerRepo.findByTelegramUserId(BigInt(from.id));
+    const player = await this.playerRepo.findByTelegramUserId(botTenantId(), BigInt(from.id));
     if (player === null) {
       await this.reply(ctx, 'Please send /start first to set up your account.');
       return;
@@ -793,8 +825,8 @@ export class PlayerTelegramHandlers {
         [
           'حسابك قيد التجهيز — أرسل /start مرة أخرى بعد قليل.',
           '',
-          'Your gaming account is still being prepared. Send /start again in a moment;'
-            + ' it is also created automatically with your first deposit.',
+          'Your gaming account is still being prepared. Send /start again in a moment;' +
+            ' it is also created automatically with your first deposit.',
         ].join('\n'),
         this.miniAppKeyboard(),
       );
@@ -849,7 +881,10 @@ export class PlayerTelegramHandlers {
     });
 
     const name = [view.firstName, view.lastName].filter((part) => part !== null).join(' ');
-    const referralCode = `ref_${view.telegramUserId}`;
+    // A player talking to the bot is a Telegram account, so the id is there; only an imported row
+    // (which cannot reach this handler) has none.
+    const telegramId = view.telegramUserId ?? '—';
+    const referralCode = `ref_${telegramId}`;
     const username = this.botUsername(ctx);
 
     const lines = [
@@ -857,7 +892,7 @@ export class PlayerTelegramHandlers {
       '',
       `Name: <b>${esc(name.length > 0 ? name : 'not set')}</b>`,
       view.telegramUsername === null ? null : `Username: @${esc(view.telegramUsername)}`,
-      `Telegram id: <code>${esc(view.telegramUserId)}</code>`,
+      `Telegram id: <code>${esc(telegramId)}</code>`,
       `Currency: <b>${esc(view.currencyCode)}</b>`,
       `Account: <b>${esc(view.status)}</b>${eligibility === null ? '' : eligibility.eligible ? ' ✅' : ' ⛔'}`,
     ];
@@ -1206,7 +1241,8 @@ export class PlayerTelegramHandlers {
 
     const from = ctx.from;
     const isAdmin =
-      from !== undefined && (await this.admins.isAdmin(BigInt(from.id)).catch(() => false));
+      from !== undefined &&
+      (await this.admins.isAdminByTelegram(botTenantId(), BigInt(from.id)).catch(() => false));
 
     if (isAdmin) {
       lines.push(
@@ -1544,7 +1580,7 @@ export class PlayerTelegramHandlers {
     if (from === undefined || from.is_bot) return null;
 
     try {
-      const player = await this.playerRepo.findByTelegramUserId(BigInt(from.id));
+      const player = await this.playerRepo.findByTelegramUserId(botTenantId(), BigInt(from.id));
       if (player !== null) return player;
     } catch (error: unknown) {
       this.logger.error(
@@ -1574,6 +1610,7 @@ export class PlayerTelegramHandlers {
       const { playerId, isNew } = await this.prisma.runInTransaction((tx) =>
         this.players.upsertFromTelegram(
           tx,
+          botTenantId(),
           {
             telegramUserId: BigInt(from.id),
             telegramUsername: from.username ?? null,

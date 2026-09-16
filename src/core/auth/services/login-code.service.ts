@@ -1,11 +1,12 @@
 /**
- * One-time login codes that let a NATIVE app sign in as the Telegram account talking to the bot.
+ * One-time login codes that let the NATIVE player app sign in as the Telegram account talking to
+ * the bot (`/login` in a bot chat, then `POST /v1/auth/bot-code`).
  *
- * WHY THIS LIVES IN core/auth AND NOT IN A MODULE: both `modules/admin` (staff console) and
- * `modules/player` (the player app) need it, and `eslint-plugin-boundaries` makes
- * modules/player -> modules/admin a build failure. Core is the only place both may import, and the
- * mechanism is genuinely identical for the two audiences — only what the redeemed id resolves to
- * differs.
+ * THE ADMIN HALF IS GONE. The staff console used to sign in the same way, through the bot's
+ * `/console` command and `POST /v1/admin/auth/bot-code`. Both were removed on 2026-09-05 (dashboard
+ * API-CONTRACT.md §2a): staff are username+password accounts, most have no Telegram account, and a
+ * bot that hands out console credentials leaves them in a chat log. Nothing may mint or redeem an
+ * admin code again, which is why 'admin' is no longer a scope this service accepts.
  *
  * WHY A NATIVE APP NEEDS THIS AT ALL: the only other way in is `POST /v1/auth/telegram`, which
  * verifies Telegram initData. initData is produced by the Telegram webview and signed with the bot
@@ -13,9 +14,9 @@
  * talking to it — Telegram signed the update — so a code minted in a bot chat and redeemed over HTTP
  * carries that proof across to the app.
  *
- * WHY THE SCOPE IS PART OF THE KEY: an admin code must never be redeemable on the player route, nor
- * the reverse. Scoping the Redis key makes that structural rather than a check someone can forget:
- * a code minted for 'player' is simply not found when looked up under 'admin'.
+ * WHY THE SCOPE IS STILL PART OF THE KEY: it keeps the Redis key layout (`login-code:player:...`)
+ * that live codes were minted under, and it keeps any future audience structurally apart — a code
+ * minted under one scope is simply not found when looked up under another.
  *
  * WHY THE CODE IS HASHED: the stored value is `sha256(normalized code)`, never the code. A dump of
  * Redis — or a SCAN by anything sharing the instance — would otherwise hand over live credentials
@@ -36,8 +37,11 @@ import { createHash, randomInt } from 'node:crypto';
 
 import { RedisService } from '../../cache/redis.service';
 
-/** Which audience a code was minted for. Part of the Redis key, so the two can never cross. */
-export type LoginCodeScope = 'admin' | 'player';
+/**
+ * Which audience a code was minted for. Part of the Redis key. Only the player app remains; the
+ * retired admin scope must not come back (see the header).
+ */
+export type LoginCodeScope = 'player';
 
 /** No I, O, 0 or 1 — see the header. 32 symbols keeps the maths easy to reason about. */
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';

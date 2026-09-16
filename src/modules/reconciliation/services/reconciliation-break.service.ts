@@ -3,8 +3,13 @@
  *
  * WHY upsert-by-dedupeKey and not insert: every detector here runs on a schedule, so the SAME
  * finding is re-observed on every tick. Inserting each time would bury the one new problem under a
- * hundred copies of an old one. The dedupe key is a UNIQUE column, so the database — not the
+ * hundred copies of an old one. The dedupe key is UNIQUE PER TENANT, so the database — not the
  * application — is what makes "one row per finding" true under concurrency.
+ *
+ * WHY the key is scoped to an operator rather than global: two operators can hit the same finding
+ * — the same invariant, on the same day, for the same currency — and a global key would let the
+ * first one's break swallow the second's. Each operator has to see its own money problem, so every
+ * read and write here names a tenant.
  *
  * WHY a re-observation never re-opens a RESOLVED row: a human decided that finding was dealt with.
  * If the underlying condition is genuinely still there, the next tick's numbers will differ and the
@@ -21,10 +26,19 @@ import { AuditService } from '@core/audit/audit.service';
 import { toNullableJson } from '@core/queue/json.util';
 import { PrismaService } from '@core/prisma/prisma.service';
 import type { Tx } from '@core/prisma/tx.type';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 import { ReconciliationErrorCodes } from '../enums/reconciliation-error-code.enum';
 
 export interface OpenBreakInput {
+  /**
+   * The operator whose books the finding is about. A detector that already knows — because it was
+   * handed a destination, a player or a ledger account — MUST pass it, since the row it examined is
+   * more authoritative than whatever context the sweep happens to be standing in. Omitting it falls
+   * back to the ambient tenant, which is correct for a detector running inside `runWithTenant()`
+   * for one operator and a loud error for one that forgot to enter a context at all.
+   */
+  tenantId?: string;
   category: BreakCategory;
   severity: number;
   currencyCode: string;
@@ -73,10 +87,14 @@ export class ReconciliationBreakService {
         : input.actualMinor - input.expectedMinor;
 
     const detail = toNullableJson(input.detail);
+    const tenantId = input.tenantId ?? requireEffectiveTenantId();
 
     return tx.reconciliationBreak.upsert({
-      where: { dedupeKey: input.dedupeKey },
+      // The dedupe key is only unique within an operator, so the tenant is half of the key that
+      // decides "new finding" from "same finding again".
+      where: { tenantId_dedupeKey: { tenantId, dedupeKey: input.dedupeKey } },
       create: {
+        tenantId,
         category: input.category,
         status: BreakStatus.OPEN,
         severity: input.severity,
@@ -122,9 +140,34 @@ export class ReconciliationBreakService {
     return this.prisma.runInTransaction((tx) => this.observe(tx, input));
   }
 
+  /**
+   * One break, in the effective operator. Another operator's break id is BREAK_NOT_FOUND, exactly
+   * like an id that never existed: its money figures and the deposit and player ids in it are the
+   * reconnaissance for reading that operator's deposits.
+   */
+  async getInTenant(breakId: string): Promise<ReconciliationBreak> {
+    const row = await this.prisma.reconciliationBreak.findUnique({
+      where: { id: breakId, tenantId: requireEffectiveTenantId() },
+    });
+    if (row === null) {
+      throw new NotFoundError(
+        ReconciliationErrorCodes.BREAK_NOT_FOUND,
+        'That reconciliation break does not exist.',
+      );
+    }
+    return row;
+  }
+
   async resolve(input: ResolveBreakInput): Promise<ReconciliationBreak> {
     return this.prisma.runInTransaction(async (tx) => {
-      const existing = await tx.reconciliationBreak.findUnique({ where: { id: input.breakId } });
+      // EFFECTIVE, not `input.admin.tenantId`: the principal carries the admin's HOME tenant, which
+      // for a PLATFORM_ADMIN is tenant zero and holds no breaks at all. Writing the filter out by
+      // hand matters because `findUnique` is deliberately NOT covered by the tenant-scope
+      // extension — without it, a break id from another operator would resolve and close here.
+      const tenantId = requireEffectiveTenantId();
+      const existing = await tx.reconciliationBreak.findUnique({
+        where: { id: input.breakId, tenantId },
+      });
       if (existing === null) {
         throw new NotFoundError(
           ReconciliationErrorCodes.BREAK_NOT_FOUND,
@@ -144,7 +187,7 @@ export class ReconciliationBreakService {
       }
 
       const updated = await tx.reconciliationBreak.update({
-        where: { id: input.breakId },
+        where: { id: input.breakId, tenantId },
         data: {
           status: input.status,
           resolvedAt: new Date(),
@@ -174,8 +217,10 @@ export class ReconciliationBreakService {
 
   async assign(breakId: string, admin: AuthenticatedAdmin): Promise<ReconciliationBreak> {
     return this.prisma.runInTransaction(async (tx) => {
+      // Same reasoning as resolve(): the tenant is part of the selector, so an id belonging to
+      // another operator misses and raises rather than quietly taking their break.
       const updated = await tx.reconciliationBreak.update({
-        where: { id: breakId },
+        where: { id: breakId, tenantId: requireEffectiveTenantId() },
         data: { assignedToAdminId: admin.adminUserId, status: BreakStatus.INVESTIGATING },
       });
       await this.audit.write(tx, {

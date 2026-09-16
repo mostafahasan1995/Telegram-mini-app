@@ -5,8 +5,25 @@
  * never handled, with no error anywhere.
  */
 
-/** DI token for the singleton grammY Bot. */
-export const TELEGRAM_BOT = 'TELEGRAM_BOT';
+/**
+ * DI token for OPTIONAL grammY client options (`ApiClientOptions`) applied to every tenant's Bot and
+ * to the getMe that identifies it. Nothing binds it in production, so the Bot API is reached the
+ * normal way. Tests bind a `fetch` stub, so no suite can reach api.telegram.org by accident.
+ */
+export const TELEGRAM_API_CLIENT_OPTIONS = 'TELEGRAM_API_CLIENT_OPTIONS';
+
+/** The webhook route, without its per-operator path token. Unversioned on purpose: Telegram holds it. */
+export const TELEGRAM_WEBHOOK_ROUTE = 'telegram/webhook';
+
+/**
+ * The URL an operator's bot is registered under: `<API_BASE_URL>/telegram/webhook/<path token>`.
+ *
+ * One builder, used by the controller's route and by whatever registers a webhook, so the URL
+ * Telegram is given and the route that answers it cannot drift apart. The path token is the
+ * operator's own (`tenants.webhook_path_token`); nothing deployment-wide takes part.
+ */
+export const telegramWebhookUrl = (baseUrl: string, pathToken: string): string =>
+  `${baseUrl.replace(/\/+$/, '')}/${TELEGRAM_WEBHOOK_ROUTE}/${pathToken}`;
 
 /** BullMQ queue carrying inbound updates from the api role to the worker. */
 export const TELEGRAM_UPDATE_QUEUE = 'telegram-updates';
@@ -22,20 +39,55 @@ export const TELEGRAM_SECRET_HEADER = 'x-telegram-bot-api-secret-token';
 
 /**
  * Redis dedupe window for update ids. Telegram retries an unacknowledged update for a while and
- * then gives up; an hour comfortably covers that. Postgres' UNIQUE(update_id) is the real
- * guarantee — this only spares it the duplicate traffic.
+ * then gives up; an hour comfortably covers that. Postgres' UNIQUE(tenant_id, update_id) is the
+ * real guarantee — this only spares it the duplicate traffic.
  */
 export const TELEGRAM_UPDATE_DEDUPE_TTL_SECONDS = 3_600;
 
-export const telegramUpdateDedupeKey = (updateId: number | bigint | string): string =>
-  `tg:upd:${updateId}`;
+/**
+ * WHY BOTH IDENTIFIERS BELOW CARRY THE TENANT: `update_id` is a counter Telegram keeps PER BOT, and
+ * every operator has its own bot. Sooner or later two operators' bots both deliver an update 1000.
+ * Keyed on the update id alone, the second one is a "duplicate" and a player's tap or an admin's
+ * approval is silently dropped for whichever operator happened to be second.
+ */
+export const telegramUpdateDedupeKey = (
+  tenantId: string,
+  updateId: number | bigint | string,
+): string => `tg:upd:${tenantId}:${updateId}`;
+
+/** BullMQ job id. Hyphens rather than colons, because colons separate BullMQ's own Redis keys. */
+export const telegramUpdateJobId = (tenantId: string, updateId: number | bigint | string): string =>
+  `tg-${tenantId}-${updateId}`;
 
 /**
- * Cached getMe result. Presetting `botInfo` is what lets a Bot be constructed without a network
- * call at boot; caching it means we pay for getMe once a week instead of on every container start.
+ * A tenant's cached getMe result. Presetting `botInfo` is what lets a tenant's Bot dispatch an update
+ * without a network round trip; caching it means getMe runs once a week per bot, not on every
+ * container start.
+ *
+ * WHY THE KEY CARRIES THE TENANT AND THE BOT ID: one global key let whichever bot answered first
+ * describe every bot, and survived a token change for its whole TTL. Keyed per tenant and per bot,
+ * a different bot can never read another's identity. The cached VALUE also carries a fingerprint of
+ * the exact token it was fetched with, and a token that does not match is treated as a miss, so a
+ * rotated or retyped token for the same bot is identified afresh instead of inheriting "known good".
  */
-export const BOT_INFO_CACHE_KEY = 'telegram:botinfo';
+export const telegramBotInfoCacheKey = (tenantId: string, botId: string): string =>
+  `telegram:botinfo:${tenantId}:${botId}`;
 export const BOT_INFO_TTL_SECONDS = 7 * 24 * 3_600;
+
+/**
+ * How long a process trusts the Bot it already built before re-reading the tenant's sealed token.
+ * A token changed from the dashboard lands in another process, whose `invalidate()` cannot reach this
+ * one's memory, so this bounds how long an old token keeps serving here. Short for the same reason
+ * TENANT_REGISTRY_TTL_SECONDS is, and the re-read is one primary-key lookup.
+ */
+export const TENANT_BOT_RECHECK_SECONDS = 30;
+
+/**
+ * How long a token that cannot work (unset, unreadable, or rejected by Telegram) is remembered
+ * before Telegram or the database is asked again. Without it, every queued update for a broken
+ * operator would call getMe and get the same 401. A changed token skips the wait.
+ */
+export const TENANT_BOT_FAILURE_MEMO_SECONDS = 60;
 
 /**
  * Update types we actually handle. Narrowing this at setWebhook time means Telegram never sends us

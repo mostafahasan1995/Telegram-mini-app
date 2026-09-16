@@ -19,6 +19,24 @@
  * WHY I3 is repaired automatically and I1/I2 are not: recomputing a cache from the entries that are
  * the truth is a safe, reversible operation. Repairing an unbalanced TRANSACTION would mean inventing
  * a ledger entry, which is exactly the thing no automated process may ever do.
+ *
+ * ══ WHOSE BOOKS ═════════════════════════════════════════════════════════════════════════════
+ * The checks are raw aggregates over the whole ledger, so ONE pass finds violations belonging to
+ * every operator at once — the "scan across operators, then handle each finding in its own context"
+ * sweep shape. A break is then filed against the operator that owns the offending ROW: the
+ * transaction for I1, the account for I3, looked up here because LedgerInvariantViolation carries
+ * only a subject id. `runAsPlatform()` would file an operator's imbalance against the platform,
+ * where the people who can fix it will never see it.
+ *
+ * I2 is the exception and the one real gap: "all SYP entries sum to X" is a number computed across
+ * every operator's entries and names no owner, so it cannot become a break. It is logged and
+ * alerted, never filed. Closing that needs InvariantsService to group I2 by tenant and carry a
+ * tenantId on every violation.
+ *
+ * WHY a request narrows the report: an admin pressing "run invariants" is inside their own tenant
+ * context, and the raw scan has just read every operator's ledger. Handing back another operator's
+ * transaction ids — or a cross-operator total — would make this endpoint a disclosure, so when a
+ * context exists the report is narrowed to that operator's own findings and only those open breaks.
  */
 import { Injectable, Logger } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
@@ -26,9 +44,15 @@ import { BreakCategory } from '@prisma/client';
 
 import { LockService } from '@core/cache/lock.service';
 import { AppConfigService } from '@core/config/config.service';
-import { InvariantsService, type LedgerInvariantReport } from '@core/ledger';
+import {
+  InvariantsService,
+  type LedgerInvariantReport,
+  type LedgerInvariantViolation,
+} from '@core/ledger';
 import { PrismaService } from '@core/prisma/prisma.service';
+import { acrossTenants } from '@core/prisma/tenant-scope.extension';
 import { BotService } from '@core/telegram/services/bot.service';
+import { getEffectiveTenantId, runWithTenant } from '@core/tenant';
 
 import {
   breakKeys,
@@ -67,8 +91,8 @@ export class InvariantCheckCron {
     if (handle === null) return;
 
     try {
-      const report = await this.runOnce();
-      if (!report.ok) await this.alert(report);
+      const { report, owners } = await this.sweep();
+      if (!report.ok) await this.alert(report, owners);
     } catch (cause) {
       this.logger.error(
         `invariant check failed: ${cause instanceof Error ? cause.message : String(cause)}`,
@@ -80,72 +104,212 @@ export class InvariantCheckCron {
 
   /** Exposed for the admin endpoint and for tests. */
   async runOnce(): Promise<LedgerInvariantReport> {
+    return (await this.sweep()).report;
+  }
+
+  /** The report, plus which operator owns each violation in it (null when nothing names one). */
+  private async sweep(): Promise<{
+    report: LedgerInvariantReport;
+    owners: ReadonlyMap<LedgerInvariantViolation, string | null>;
+  }> {
     const report = await this.prisma.runInTransaction((tx) =>
       this.invariants.checkAll(tx, INVARIANT_ROW_LIMIT),
     );
 
+    // Undefined on the cron tick, which is what makes this a sweep of every operator. Set when an
+    // admin ran it from a request, and then it is both the filter on what comes back and the limit
+    // on which operators' breaks this run may touch.
+    const scope = getEffectiveTenantId();
+    const visible: LedgerInvariantViolation[] = [];
+    const owners = new Map<LedgerInvariantViolation, string | null>();
+    let unattributed = 0;
+
     for (const violation of report.violations) {
-      const isCacheDrift = violation.invariant === 'I3_ACCOUNT_BALANCE_MATCHES_ENTRIES';
+      const tenantId = await this.ownerOf(violation);
+      owners.set(violation, tenantId);
 
-      await this.breaks.observeStandalone({
-        // BreakCategory has no separate member for a cache drift; the severity is what tells an
-        // operator whether the books are wrong or only the number the approval path reads is.
-        category: BreakCategory.LEDGER_IMBALANCE,
-        severity: isCacheDrift ? SEVERITY_CACHE_DRIFT : SEVERITY_LEDGER_IMBALANCE,
-        currencyCode: violation.currencyCode,
-        dedupeKey: breakKeys.invariant(violation.invariant, violation.subject),
-        expectedMinor: violation.expectedMinor,
-        actualMinor: violation.actualMinor,
-        ...(isCacheDrift ? { ledgerAccountId: violation.subject } : {}),
-        detail: {
-          invariant: violation.invariant,
-          subject: violation.subject,
-          message: violation.detail,
-          truncated: report.truncated,
-        },
-      });
-
-      // I3 only: rewrite the cache from the entries, which are the truth. Detection and repair live
-      // next to each other on purpose — a repair that drifts from its detector fixes the wrong thing.
-      if (isCacheDrift) {
-        const repaired = await this.prisma.runInTransaction((tx) =>
-          this.invariants.recomputeAccountCache(tx, violation.subject),
-        );
-        this.logger.warn(
-          `repaired cached balance for account ${violation.subject}: ` +
-            `${violation.actualMinor.toString()} -> ${repaired.toString()}`,
-        );
+      if (tenantId === null) {
+        // I2, or a subject row that has since been deleted. Nothing to file it against, and
+        // guessing an owner for a money break is worse than an alert with no row behind it.
+        unattributed += 1;
+        this.logger.error(`unattributable ledger violation, no break opened: ${violation.detail}`);
+        if (scope === undefined) visible.push(violation);
+        continue;
       }
+      if (scope !== undefined && tenantId !== scope) continue;
+
+      visible.push(violation);
+      await runWithTenant(tenantId, () => this.record(tenantId, violation, report.truncated));
     }
 
-    if (report.ok) {
+    if (visible.length === 0) {
       this.logger.debug('ledger invariants OK');
     } else {
-      this.logger.error(`ledger invariants: ${report.violations.length} violation(s)`);
+      this.logger.error(
+        `ledger invariants: ${visible.length} violation(s)` +
+          (unattributed > 0 ? `, ${unattributed} with no owner` : ''),
+      );
     }
-    return report;
+
+    // Rebuilt rather than returned as-is: `ok` has to agree with the violations actually being
+    // handed back, or a narrowed report would say "failed" while listing nothing.
+    return {
+      report: {
+        ok: visible.length === 0,
+        checkedAt: report.checkedAt,
+        violations: visible,
+        truncated: report.truncated,
+      },
+      owners,
+    };
   }
 
   /**
-   * One message, not one per violation: a broken ledger can produce a hundred rows and a hundred
-   * alerts is an alert nobody reads. Sent through BotService directly rather than through a queue —
-   * an alert that waits behind a backlog of review cards is an alert that arrives too late.
+   * Open (or re-observe) the break for one violation, and repair it when repairing is safe. Always
+   * called inside the owning operator's context.
    */
-  private async alert(report: LedgerInvariantReport): Promise<void> {
-    const worst = report.violations.filter(
-      (violation) => violation.invariant !== 'I3_ACCOUNT_BALANCE_MATCHES_ENTRIES',
-    );
-    const lines = [
-      `🚨 <b>LEDGER INVARIANTS FAILED</b>`,
-      `${report.violations.length} violation(s)${report.truncated ? ' (truncated)' : ''}`,
-      '',
-      ...report.violations.slice(0, 8).map((violation) => `• ${violation.detail}`),
-    ];
-    if (worst.length > 0) {
-      lines.push('', '<b>At least one is a real imbalance, not a cache drift.</b>');
+  private async record(
+    tenantId: string,
+    violation: LedgerInvariantViolation,
+    truncated: boolean,
+  ): Promise<void> {
+    const isCacheDrift = violation.invariant === 'I3_ACCOUNT_BALANCE_MATCHES_ENTRIES';
+
+    await this.breaks.observeStandalone({
+      // From the offending row, not from the ambient context: the sweep enters a context per
+      // finding, and the row it examined is the more authoritative of the two.
+      tenantId,
+      // BreakCategory has no separate member for a cache drift; the severity is what tells an
+      // operator whether the books are wrong or only the number the approval path reads is.
+      category: BreakCategory.LEDGER_IMBALANCE,
+      severity: isCacheDrift ? SEVERITY_CACHE_DRIFT : SEVERITY_LEDGER_IMBALANCE,
+      currencyCode: violation.currencyCode,
+      dedupeKey: breakKeys.invariant(violation.invariant, violation.subject),
+      expectedMinor: violation.expectedMinor,
+      actualMinor: violation.actualMinor,
+      ...(isCacheDrift ? { ledgerAccountId: violation.subject } : {}),
+      detail: {
+        invariant: violation.invariant,
+        subject: violation.subject,
+        message: violation.detail,
+        truncated,
+      },
+    });
+
+    // I3 only: rewrite the cache from the entries, which are the truth. Detection and repair live
+    // next to each other on purpose — a repair that drifts from its detector fixes the wrong thing.
+    if (isCacheDrift) {
+      const repaired = await this.prisma.runInTransaction((tx) =>
+        this.invariants.recomputeAccountCache(tx, violation.subject),
+      );
+      this.logger.warn(
+        `repaired cached balance for account ${violation.subject}: ` +
+          `${violation.actualMinor.toString()} -> ${repaired.toString()}`,
+      );
     }
-    // notifyAdmins ONLY — never notifyFeed: "our books do not add up" is an internal engineering
-    // signal, and in a group that may contain customers it reads as "your money is missing".
-    await this.bot.notifyAdmins(lines.join('\n'), { parseMode: 'HTML', linkPreview: false });
+  }
+
+  /**
+   * The operator a violation belongs to, or null when nothing can name one.
+   *
+   * The lookups carry ALL_TENANTS because they must answer the same way whether this run is a
+   * context-less sweep or an admin request standing in one operator: scoped to the caller, a
+   * transaction id from another operator would come back empty and a real imbalance would be
+   * dismissed as "no owner". Reading the id is all it does; what the caller may then DO with the
+   * finding is decided against `scope` above.
+   */
+  private async ownerOf(violation: LedgerInvariantViolation): Promise<string | null> {
+    if (violation.invariant === 'I2_GLOBAL_ZERO_SUM') {
+      // The subject is a currency code and the sum spans every operator's entries, so there is no
+      // one book to blame. See the header.
+      return null;
+    }
+
+    if (violation.invariant === 'I3_ACCOUNT_BALANCE_MATCHES_ENTRIES') {
+      const account = await this.prisma.ledgerAccount.findFirst({
+        where: acrossTenants({ id: violation.subject }),
+        select: { tenantId: true },
+      });
+      return account?.tenantId ?? null;
+    }
+
+    const transaction = await this.prisma.ledgerTransaction.findFirst({
+      where: acrossTenants({ id: violation.subject }),
+      select: { tenantId: true },
+    });
+    return transaction?.tenantId ?? null;
+  }
+
+  /**
+   * One message PER OPERATOR, not one per violation: a broken ledger can produce a hundred rows and
+   * a hundred alerts is an alert nobody reads. Sent through BotService directly rather than through a
+   * queue — an alert that waits behind a backlog of review cards is an alert that arrives too late.
+   *
+   * WHO IS TOLD: the operator that owns the offending rows, in its own admin group, through its own
+   * bot, and about its own violations only. That is the same owner the break was filed against, so
+   * the alert points at a break its staff can actually see; the dashboard files SYSTEM_ALERT under an
+   * operator's destinations, and there is no platform chat or platform bot. Sent whatever the
+   * operator's status, because a suspended operator's books still have to add up.
+   *
+   * WHAT IS NOT SENT ANYWHERE: a violation with no owner (I2's cross-operator sum, or a subject row
+   * that has gone). Naming it to any one operator would disclose a figure computed over the others'
+   * entries, so it stays in the error log above, and a warning says it was not delivered.
+   */
+  private async alert(
+    report: LedgerInvariantReport,
+    owners: ReadonlyMap<LedgerInvariantViolation, string | null>,
+  ): Promise<void> {
+    const byOwner = new Map<string, LedgerInvariantViolation[]>();
+    let ownerless = 0;
+    for (const violation of report.violations) {
+      const tenantId = owners.get(violation) ?? null;
+      if (tenantId === null) {
+        ownerless += 1;
+        continue;
+      }
+      byOwner.set(tenantId, [...(byOwner.get(tenantId) ?? []), violation]);
+    }
+
+    if (ownerless > 0) {
+      this.logger.warn(
+        `${ownerless} ledger violation(s) with no owning operator were not sent to any Telegram ` +
+          'chat: there is no platform destination, and no single operator may see them',
+      );
+    }
+
+    for (const [tenantId, violations] of byOwner) {
+      const worst = violations.filter(
+        (violation) => violation.invariant !== 'I3_ACCOUNT_BALANCE_MATCHES_ENTRIES',
+      );
+      const lines = [
+        `🚨 <b>LEDGER INVARIANTS FAILED</b>`,
+        `${violations.length} violation(s)${report.truncated ? ' (truncated)' : ''}`,
+        '',
+        ...violations.slice(0, 8).map((violation) => `• ${violation.detail}`),
+      ];
+      if (worst.length > 0) {
+        lines.push('', '<b>At least one is a real imbalance, not a cache drift.</b>');
+      }
+      try {
+        // Admins ONLY — never the feed: "our books do not add up" is an internal signal, and in a
+        // group that may contain customers it reads as "your money is missing".
+        const sent = await this.bot.notifyAdmins(tenantId, lines.join('\n'), {
+          parseMode: 'HTML',
+          linkPreview: false,
+        });
+        if (sent === null) {
+          this.logger.warn(
+            `ledger invariant alert for tenant ${tenantId} not delivered: its admin chat is ` +
+              'unset or unreachable (the break is still recorded)',
+          );
+        }
+      } catch (cause) {
+        // One operator's broken bot must not cost the next operator its alert.
+        this.logger.error(
+          `ledger invariant alert for tenant ${tenantId} failed: ` +
+            `${cause instanceof Error ? cause.message : String(cause)}`,
+        );
+      }
+    }
   }
 }

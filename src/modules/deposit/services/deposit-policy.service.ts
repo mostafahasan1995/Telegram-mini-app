@@ -17,6 +17,7 @@ import { PlayerStatus, type PlayerLimit } from '@prisma/client';
 import { BusinessRuleError } from '@common/exceptions/app.exception';
 import { formatMinorToDecimal } from '@common/helpers/money.util';
 import type { Tx } from '@core/prisma/tx.type';
+import { requireEffectiveTenantId } from '@core/tenant';
 
 import { DEPOSIT_CAP_WINDOW_HOURS, MAX_OPEN_DEPOSITS_PER_PLAYER } from '../deposit.constants';
 import { DepositErrorCodes } from '../enums/deposit-error-code.enum';
@@ -93,7 +94,8 @@ export class DepositPolicyService {
 
   private async assertPlayerActive(tx: Tx, playerId: string): Promise<void> {
     const player = await tx.player.findUniqueOrThrow({
-      where: { id: playerId },
+      // The signed-in player's own operator, the one this deposit is being opened in.
+      where: { id: playerId, tenantId: requireEffectiveTenantId() },
       select: { status: true },
     });
     // PENDING_ICHANCY is fine: the mirror account is created lazily by the credit worker, and

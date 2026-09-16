@@ -45,46 +45,39 @@ export interface JwtSettings {
   readonly refreshTtlMs: number;
 }
 
+/**
+ * Deployment-wide Telegram BEHAVIOUR. There is deliberately no bot identity here: no token, no
+ * webhook path or secret, no chat id. Each operator's are columns on its tenant row, set from the
+ * dashboard, and are read per tenant by TenantBotRegistry, BotService and the webhook controller.
+ * A webhook URL is `<app.baseUrl>/telegram/webhook/<that tenant's path token>`.
+ */
 export interface TelegramSettings {
-  readonly botToken: string;
-  /** Compared against the X-Telegram-Bot-Api-Secret-Token header on every update. */
-  readonly webhookSecret: string;
-  /** Unguessable path segment for the webhook endpoint. */
-  readonly webhookPathToken: string;
-  /** Full webhook path, e.g. /telegram/webhook/<token>. */
-  readonly webhookPath: string;
-  /** Absolute URL to hand to setWebhook. */
-  readonly webhookUrl: string;
-  readonly adminChatId: bigint;
   /**
-   * OPTIONAL second group that also receives the credited-deposit card. Null = the feature is off
-   * and BotService.notifyFeed is a no-op. Never used for operational alerts: this group may contain
-   * customers, so only the masked credit card goes there.
-   */
-  readonly feedChatId: bigint | null;
-  /**
-   * True => the feed group gets the FULL card (cashier float + player identifiers) instead of the
-   * masked one. Defaults to false: masked is the only safe default for a group we do not control
-   * the membership of.
+   * True => an operator's feed group (`tenants.feed_chat_id`) gets the FULL card (cashier float +
+   * player identifiers) instead of the masked one. Defaults to false: masked is the only safe
+   * default for a group we do not control the membership of.
    */
   readonly feedFullDetail: boolean;
   /**
    * Hours between automatic postings of the activity report. 0 = the schedule is OFF (the /report
    * command is unaffected).
    *
-   * The schedule posts to `feedChatId ?? adminChatId` — the feed group when there is one, the admin
-   * group when there is not, so the feature is never silent just because the OPTIONAL feed group was
-   * never configured. See modules/admin/services/report-schedule.cron.ts.
+   * Each ACTIVE operator gets its own report through its own bot: in its feed group when that is
+   * declared staff-only by `feedFullDetail`, in its admin group otherwise. See
+   * modules/admin/services/report-schedule.cron.ts.
    */
   readonly reportScheduleHours: number;
 }
 
 export interface IchancySettings {
+  /** The deployment's Ichancy host: PlatformDefaults' seed and the transports' cookie host. */
   readonly baseUrl: string;
-  readonly username: string;
-  readonly password: string;
-  /** Our agent's affiliateId — parentId on registerPlayer, filter value on getChildren. */
-  readonly agentId: string;
+  /**
+   * ICHANCY_AGENT_ID, or null. It only seeds PlatformDefaults' agent id. There is deliberately no
+   * username or password here: every Ichancy call is made with the credentials on the tenant row of
+   * the operator that owns the work, so no deployment-wide agent account can be reached from code.
+   */
+  readonly agentId: string | null;
   readonly currency: string;
   readonly timeoutMs: number;
   /** True => every Ichancy call is served by the in-memory fake. No real money can move. */
@@ -178,15 +171,7 @@ export class AppConfigService {
       refreshTtlMs: env.REFRESH_TTL_DAYS * 24 * 60 * 60 * 1000,
     });
 
-    const webhookPath = `/telegram/webhook/${env.TELEGRAM_WEBHOOK_PATH_TOKEN}`;
     this._telegram = Object.freeze({
-      botToken: env.TELEGRAM_BOT_TOKEN,
-      webhookSecret: env.TELEGRAM_WEBHOOK_SECRET,
-      webhookPathToken: env.TELEGRAM_WEBHOOK_PATH_TOKEN,
-      webhookPath,
-      webhookUrl: `${env.API_BASE_URL}${webhookPath}`,
-      adminChatId: env.TELEGRAM_ADMIN_CHAT_ID,
-      feedChatId: env.TELEGRAM_FEED_CHAT_ID ?? null,
       // Unset => masked. The unsafe variant must always be an explicit choice.
       feedFullDetail: env.TELEGRAM_FEED_FULL_DETAIL ?? false,
       // Already defaulted (6) and range-checked by the schema; 0 means the operator turned it off.
@@ -195,9 +180,7 @@ export class AppConfigService {
 
     this._ichancy = Object.freeze({
       baseUrl: env.ICHANCY_BASE_URL,
-      username: env.ICHANCY_USERNAME,
-      password: env.ICHANCY_PASSWORD,
-      agentId: env.ICHANCY_AGENT_ID,
+      agentId: env.ICHANCY_AGENT_ID ?? null,
       currency: env.ICHANCY_CURRENCY,
       timeoutMs: env.ICHANCY_TIMEOUT_MS,
       // Unset => fake only under test, so CI can never reach the real agent API by omission.

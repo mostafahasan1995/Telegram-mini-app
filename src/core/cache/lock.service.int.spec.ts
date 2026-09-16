@@ -4,24 +4,30 @@
  * SET NX PX either wins or loses, and the compare-and-delete Lua script either runs atomically or
  * it does not. A mocked Redis would assert only that we call the methods we call.
  *
- * Run with `npm run test:int` (docker compose up redis first).
+ * Redis comes from the shared harness (test/setup/redis-container.ts): a throwaway container under
+ * `npm run test:int`, or the escape hatch when REDIS_TEST_URL is set:
+ *   REDIS_TEST_URL=redis://<throwaway>/9 npx jest --config jest-int.config.cjs --runInBand \
+ *     src/core/cache/lock.service.int.spec.ts
+ * No guessed default: this suite FLUSHDBs, and a localhost Redis on a developer machine may be the
+ * one a live cashier stack uses. Point the escape hatch at database 9 (or any throwaway) you own.
  */
 import { Redis } from 'ioredis';
+
+import { startRedis, stopRedis } from '../../../test/setup/redis-container';
 import { CacheService } from './cache.service';
 import { LockService, LockUnavailableError, type LockHandle } from './lock.service';
 import { redisUrlToOptions } from './redis-url.util';
 import { type RedisService } from './redis.service';
 
-// Database 9 so a stray run never touches development data.
-const REDIS_URL = process.env.TEST_REDIS_URL ?? 'redis://localhost:6379/9';
-
 describe('cache + lock (integration)', () => {
+  let redisUrl: string;
   let redis: Redis;
   let locks: LockService;
   let cache: CacheService;
 
   beforeAll(async () => {
-    redis = new Redis(REDIS_URL, { maxRetriesPerRequest: null });
+    redisUrl = (await startRedis()).url;
+    redis = new Redis(redisUrl, { maxRetriesPerRequest: null });
     await redis.ping();
     // RedisService is a Redis subclass that only adds lifecycle hooks, so a plain client is a
     // faithful stand-in for what these services actually use.
@@ -36,6 +42,7 @@ describe('cache + lock (integration)', () => {
   afterAll(async () => {
     await redis.flushdb();
     await redis.quit();
+    await stopRedis();
   });
 
   describe('LockService', () => {
@@ -218,7 +225,7 @@ describe('cache + lock (integration)', () => {
 
   describe('redisUrlToOptions', () => {
     it('produces options that actually connect', async () => {
-      const client = new Redis(redisUrlToOptions(REDIS_URL));
+      const client = new Redis(redisUrlToOptions(redisUrl));
       expect(await client.ping()).toBe('PONG');
       await client.quit();
     });

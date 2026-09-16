@@ -40,6 +40,12 @@ export const CommonErrorCodes = {
   INIT_DATA_USER_MISSING: 'INIT_DATA_USER_MISSING',
   /** The same initData hash was presented twice — a replay. */
   INIT_DATA_REPLAYED: 'INIT_DATA_REPLAYED',
+  /**
+   * The operator's bot token is not set or cannot be opened, so there is no key to check initData
+   * against. A server-side configuration gap (503), never the player's fault, and never a 401 that
+   * would tell the app its perfectly valid initData was forged.
+   */
+  INIT_DATA_BOT_UNAVAILABLE: 'INIT_DATA_BOT_UNAVAILABLE',
 
   // ---- Telegram webhook ----------------------------------------------------
   TELEGRAM_WEBHOOK_SECRET_INVALID: 'TELEGRAM_WEBHOOK_SECRET_INVALID',

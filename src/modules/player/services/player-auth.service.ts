@@ -28,6 +28,8 @@ import { InitDataService } from '@core/auth/services/init-data.service';
 import { LoginCodeService } from '@core/auth/services/login-code.service';
 import { SessionService } from '@core/auth/services/session.service';
 import { UnauthorizedError } from '@common/exceptions/app.exception';
+// Not the '@core/tenant' barrel: it re-exports TENANT_ZERO_ID but not TENANT_BOOTSTRAP_ID.
+import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
 import { PlayerErrorCodes } from '../player.constants';
 import { initDataNonceKey } from '@core/auth/auth.constants';
 import type { IssuedSession, SessionContext } from '@core/auth/auth.types';
@@ -36,6 +38,24 @@ import type { AuthTokensView } from '../dtos/auth.dto';
 import type { PlayerView } from '../dtos/player.view';
 import { PlayerService } from './player.service';
 import { ReferralService } from './referral.service';
+
+/**
+ * ⚠ INTERIM: ONLY THE BOOTSTRAP OPERATOR'S PLAYERS CAN SIGN IN TO THE MINI APP.
+ *
+ * WHY NOT requireEffectiveTenantId() HERE, unlike every other service: both sign-in routes are
+ * @Public(). They arrive with no bearer token, so TenantContextMiddleware never opened a context
+ * and there is nothing ambient to require — the tenant is precisely what signing in establishes.
+ *
+ * Every operator has its own bot now, and initData is signed with the token of the bot whose web
+ * app was opened. But the mini app does not yet say WHICH operator it was opened for, and the API
+ * contract has not decided how it will (a tenant hint in the request, a per-operator origin, ...).
+ * Until that is decided, sign-in is pinned to the bootstrap operator: InitDataService checks the
+ * signature against THAT operator's sealed bot token, and a player of any other operator gets
+ * INIT_DATA_HASH_INVALID, because their initData was signed by a different bot. That is a known,
+ * deliberate gap for a later step, not a bug to paper over by trying every operator's token (which
+ * would turn one signature check into a search across operators).
+ */
+const SIGN_IN_TENANT_ID = TENANT_BOOTSTRAP_ID;
 
 export interface LoginResult {
   player: PlayerView;
@@ -62,49 +82,56 @@ export class PlayerAuthService {
   ) {}
 
   async loginWithInitData(rawInitData: string, context: SessionContext): Promise<LoginResult> {
-    // 1 — authenticate.
-    const verified = this.initData.verify(rawInitData);
+    // 1 — authenticate, against the bot of the operator sign-in is pinned to (see SIGN_IN_TENANT_ID).
+    const verified = await this.initData.verify(rawInitData, SIGN_IN_TENANT_ID);
 
     // 2 — one initData, one login.
     await this.sessions.consumeInitDataNonce(verified.hash);
 
     try {
       // 3 — player row + audit, atomically.
-      const { player, playerId, isNew } = await this.prisma.runInTransaction(async (tx) => {
-        const upserted = await this.players.upsertFromTelegram(
-          tx,
-          {
-            telegramUserId: verified.user.id,
-            telegramUsername: verified.user.username ?? null,
-            firstName: verified.user.firstName,
-            lastName: verified.user.lastName ?? null,
-            languageCode: verified.user.languageCode ?? null,
-          },
-          this.config.ichancy.currency,
-        );
+      const { player, playerId, tenantId, isNew } = await this.prisma.runInTransaction(
+        async (tx) => {
+          const upserted = await this.players.upsertFromTelegram(
+            tx,
+            SIGN_IN_TENANT_ID,
+            {
+              telegramUserId: verified.user.id,
+              telegramUsername: verified.user.username ?? null,
+              firstName: verified.user.firstName,
+              lastName: verified.user.lastName ?? null,
+              languageCode: verified.user.languageCode ?? null,
+            },
+            this.config.ichancy.currency,
+          );
 
-        await this.audit.write(tx, {
-          action: 'player.login',
-          actor: { type: 'PLAYER', id: upserted.playerId },
-          subjectType: 'Player',
-          subjectId: upserted.playerId,
-          after: {
-            telegramAuthDate: verified.authDate.toISOString(),
-            chatType: verified.chatType ?? null,
-          },
-        });
+          await this.audit.write(tx, {
+            action: 'player.login',
+            actor: { type: 'PLAYER', id: upserted.playerId },
+            subjectType: 'Player',
+            subjectId: upserted.playerId,
+            after: {
+              telegramAuthDate: verified.authDate.toISOString(),
+              chatType: verified.chatType ?? null,
+            },
+          });
 
-        return upserted;
-      });
+          return upserted;
+        },
+      );
 
-      // 4 — session.
-      const issued = await this.sessions.issueForPlayer(playerId, verified.user.id, {
+      // 4 — session. The session belongs to the operator the PLAYER ROW does — `tenantId` read back
+      // off the upsert, not the SIGN_IN_TENANT_ID we guessed going in. A returning player keeps the
+      // operator they registered with, and a session in a different tenant than its player is a
+      // token whose `tid` claim would point every later request at somebody else's data.
+      const issued = await this.sessions.issueForPlayer(tenantId, playerId, verified.user.id, {
         ...context,
         telegramAuthDate: verified.authDate,
       });
 
       // Best effort, after the session exists. A referral is worth nothing next to a login.
       const referral = await this.captureReferral(
+        tenantId,
         playerId,
         verified.user.id,
         verified.startParam ?? null,
@@ -152,8 +179,11 @@ export class PlayerAuthService {
     }
 
     const row = await this.prisma.player.findUnique({
-      where: { telegramUserId },
-      select: { id: true },
+      where: { tenantId_telegramUserId: { tenantId: SIGN_IN_TENANT_ID, telegramUserId } },
+      // `tenantId` is selected so the session below is stamped with the ROW's operator rather than
+      // the constant we searched with. They are the same value today; they stop being the same the
+      // moment a second bot exists, and this line is what keeps this code correct on that day.
+      select: { id: true, tenantId: true },
     });
     if (row === null) {
       throw new UnauthorizedError(
@@ -174,7 +204,12 @@ export class PlayerAuthService {
     });
 
     const player = await this.players.getOwnView(playerId);
-    const issued = await this.sessions.issueForPlayer(playerId, telegramUserId, context);
+    const issued = await this.sessions.issueForPlayer(
+      row.tenantId,
+      playerId,
+      telegramUserId,
+      context,
+    );
 
     return {
       player,
@@ -197,6 +232,7 @@ export class PlayerAuthService {
   }
 
   private async captureReferral(
+    tenantId: string,
     playerId: string,
     telegramUserId: bigint,
     startParam: string | null,
@@ -204,6 +240,9 @@ export class PlayerAuthService {
     if (startParam === null) return 'IGNORED_NO_PAYLOAD';
     try {
       const result = await this.referrals.bindFromStartPayload(
+        // The referred player's operator: a `ref_<telegram id>` payload must only ever resolve to
+        // a referrer standing in the same tenant as the player being attributed.
+        tenantId,
         playerId,
         telegramUserId,
         startParam,

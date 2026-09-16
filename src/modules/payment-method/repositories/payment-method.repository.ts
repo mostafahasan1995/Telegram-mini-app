@@ -38,12 +38,24 @@ export class PaymentMethodRepository extends BaseRepository<
     return client.paymentMethod;
   }
 
-  findById(id: string, tx?: Tx): Promise<PaymentMethod | null> {
-    return this._findUnique({ id }, tx);
+  /**
+   * WHY THERE IS NO `findById(id)`: an id arrives from a URL, and a method id is readable by any
+   * Telegram user of an operator's bot (it rides in the /deposit keyboard's callback data). A bare
+   * primary-key lookup let one operator's staff read, rewrite and attach destinations to another
+   * operator's method. The tenant is part of the selector, so another operator's id misses exactly
+   * like an unknown one — same query shape, same 404 — and no by-id form exists to be reached for.
+   */
+  findByIdInTenant(tenantId: string, id: string, tx?: Tx): Promise<PaymentMethod | null> {
+    return this._findUnique({ id, tenantId }, tx);
   }
 
-  findByCode(code: string, tx?: Tx): Promise<PaymentMethod | null> {
-    return this._findUnique({ code }, tx);
+  /**
+   * `code` is unique only WITHIN an operator now, so the tenant is part of the key rather than a
+   * filter applied after the fact: two operators are each free to call their method SYRIATEL_CASH,
+   * and the runtime tenant filter does not reach findUnique.
+   */
+  findByCode(tenantId: string, code: string, tx?: Tx): Promise<PaymentMethod | null> {
+    return this._findUnique({ tenantId_code: { tenantId, code } }, tx);
   }
 
   /** Ordered exactly as the mini app should render them. */
@@ -59,7 +71,13 @@ export class PaymentMethodRepository extends BaseRepository<
     return this.run('create', () => (tx ?? this.prisma).paymentMethod.create({ data }));
   }
 
-  update(id: string, data: Prisma.PaymentMethodUpdateInput, tx?: Tx): Promise<PaymentMethod> {
-    return this._update({ id }, data, tx);
+  /** Pinned like the read above; a miss is P2025, which the error filter answers with a 404. */
+  updateInTenant(
+    tenantId: string,
+    id: string,
+    data: Prisma.PaymentMethodUpdateInput,
+    tx?: Tx,
+  ): Promise<PaymentMethod> {
+    return this._update({ id, tenantId }, data, tx);
   }
 }

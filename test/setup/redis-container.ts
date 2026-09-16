@@ -1,5 +1,6 @@
 /**
- * Redis 7 for the integration suite. One per Jest worker, same reasoning as postgres-container.ts.
+ * Redis 7 for the integration suite. One per test FILE — a fresh module registry per file makes
+ * this module-level singleton per suite, not per worker — same reasoning as postgres-container.ts.
  *
  * WHY a real Redis rather than a mock: the things this project puts in Redis are the things a mock
  * gets wrong. `SET NX PX` is what makes the Ichancy session single-flight; the per-player credit

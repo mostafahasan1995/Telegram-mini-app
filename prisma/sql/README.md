@@ -1,6 +1,6 @@
 # Hand-written SQL
 
-Prisma Migrate owns the tables. These five files own the guarantees Prisma's schema language cannot
+Prisma Migrate owns the tables. These six files own the guarantees Prisma's schema language cannot
 express — the ones that keep a cashier honest when application code is wrong.
 
 They are **not** applied automatically. Prisma will never run a file it did not generate, and it will
@@ -14,12 +14,14 @@ leaves them alone).
 | `003_app_role_grants.sql` | The application role holds only SELECT + INSERT on those three tables, plus a sane baseline elsewhere. | Grants are outside the schema entirely. |
 | `004_partial_indexes.sql` | Partial UNIQUE on `(payment_method_id, external_reference)` for non-rejected deposits; one `DEPOSIT_CLAIM` and one `DEPOSIT_CREDIT` transaction per deposit; hot-path partial indexes for the outbox relay, open deposits, active self-exclusions and unprocessed Telegram updates. | `@@unique` / `@@index` have no `WHERE`. |
 | `005_four_eyes_check.sql` | `second_approver_admin_id <> decided_by_admin_id`, no second approval without a first decision, and non-negative money columns. | Prisma has no CHECK constraints. |
+| `006_tenant_isolation.sql` | A `PLATFORM_ADMIN` row can exist only in tenant zero; `platform_defaults` holds exactly one row; every child row's `tenant_id` must equal its parent's (13 composite foreign keys across the money path); tenant zero takes no deposits. | Prisma has no CHECK constraints, and `@relation` cannot express a foreign key on `(tenant_id, id)`. |
 
 ## Applying them
 
-Order matters: **001 → 002 → 003 → 004 → 005**, and only after `prisma migrate` has created the
-tables. Note that 002 must come before any attempt to backfill data, and 003 needs the app role to
-exist already.
+Order matters: **001 → 002 → 003 → 004 → 005 → 006**, and only after `prisma migrate` has created
+the tables. Note that 002 must come before any attempt to backfill data, 003 needs the app role to
+exist already, and **006 requires the `20260911090000_multi_tenant_core` migration** — it builds
+foreign keys against `tenant_id`.
 
 ### Recommended: fold them into a Prisma migration
 
@@ -64,3 +66,17 @@ The integration suite (`npm run test:int`, testcontainers) is where these belong
 postgres:17, apply the migrations plus these files, then assert that an unbalanced posting, a ledger
 UPDATE, a duplicate reference and a self-approved deposit all raise. A guarantee nobody tested is a
 guarantee nobody has.
+
+For 006 specifically, the four cases that matter — each verified by hand against postgres:17 when
+the file was written, and each belonging in the suite:
+
+| Attempt | Expected |
+| --- | --- |
+| `PLATFORM_ADMIN` row with a `tenant_id` other than tenant zero | `admin_users_platform_admin_tenant_zero_check` |
+| A deposit in operator A referencing a player in operator B | `deposit_requests_player_id_tenant_fkey` |
+| A second `platform_defaults` row | `platform_defaults_singleton_check` |
+| A deposit whose `tenant_id` is tenant zero | `deposit_requests_not_tenant_zero_check` |
+
+The positive cases matter just as much: the same `telegram_user_id` registering as a player at two
+different operators must SUCCEED, and it is the one behaviour that regresses silently if somebody
+"fixes" a composite unique back to a global one.

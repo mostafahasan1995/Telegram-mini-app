@@ -11,11 +11,12 @@
  * re-target historical payments. Retire the row and add a new one.
  */
 import { Injectable } from '@nestjs/common';
-import type { PaymentDestination } from '@prisma/client';
+import type { PaymentDestination, PaymentMethod } from '@prisma/client';
 
 import { PrismaService } from '@core/prisma/prisma.service';
 import { AuditService } from '@core/audit/audit.service';
 import { isUniqueConstraintError } from '@core/prisma/prisma-errors';
+import { requireEffectiveTenantId } from '@core/tenant';
 import { formatMinorToDecimal } from '@common/helpers/money.util';
 import { adminActor } from '@common/types/actor.type';
 import { ConflictError, NotFoundError } from '@common/exceptions/app.exception';
@@ -69,7 +70,9 @@ export class PaymentDestinationService {
     paymentMethodId: string,
     includeInactive: boolean,
   ): Promise<AdminPaymentDestinationView[]> {
-    await this.assertMethodExists(paymentMethodId);
+    // Pinned lookup first: without it a foreign method id answered 200 [] where an unknown one
+    // answered 404, which confirmed the id exists.
+    await this.loadMethodOrThrow(requireEffectiveTenantId(), paymentMethodId);
     const rows = await this.destinations.listForMethod(paymentMethodId, !includeInactive);
     return rows.map(toAdminDestinationView);
   }
@@ -79,13 +82,23 @@ export class PaymentDestinationService {
     paymentMethodId: string,
     dto: CreatePaymentDestinationDto,
   ): Promise<AdminPaymentDestinationView> {
-    await this.assertMethodExists(paymentMethodId);
+    const tenantId = requireEffectiveTenantId();
+    const method = await this.loadMethodOrThrow(tenantId, paymentMethodId);
+    // Unreachable while the lookup above is pinned; kept so that a future change to it cannot turn
+    // back into a write for another operator. Answered as a missing method, never as a distinct
+    // error that would confirm the id.
+    if (method.tenantId !== tenantId) throw this.methodNotFound();
     const dailyCapMinor = toMinorOrNull(dto.dailyCap, 'dailyCap');
 
     const created = await this.prisma
       .runInTransaction(async (tx) => {
         const destination = await this.destinations.create(
           {
+            // From the CONTEXT, never copied off the method row. Copying it is exactly how one
+            // operator's staff put their own wallet into another operator's rotation: the method
+            // was fetched by bare id, both sides of the composite foreign key then named the victim,
+            // and the database had nothing to object to.
+            tenantId,
             paymentMethodId,
             label: dto.label,
             accountIdentifier: dto.accountIdentifier,
@@ -127,9 +140,12 @@ export class PaymentDestinationService {
     dto: UpdatePaymentDestinationDto,
   ): Promise<AdminPaymentDestinationView> {
     const dailyCapMinor = toMinorOrNull(dto.dailyCap, 'dailyCap');
+    // EFFECTIVE: a PLATFORM_ADMIN with X-Tenant-Id edits that operator's accounts; anyone else, and a
+    // platform admin without the header, reaches only their own operator's.
+    const tenantId = requireEffectiveTenantId();
 
     const updated = await this.prisma.runInTransaction(async (tx) => {
-      const current = await this.destinations.findById(id, tx);
+      const current = await this.destinations.findByIdInTenant(tenantId, id, tx);
       if (current === null) {
         throw new NotFoundError(
           PaymentMethodErrorCodes.DESTINATION_NOT_FOUND,
@@ -137,7 +153,8 @@ export class PaymentDestinationService {
         );
       }
 
-      const destination = await this.destinations.update(
+      const destination = await this.destinations.updateInTenant(
+        tenantId,
         id,
         {
           ...(dto.label !== undefined ? { label: dto.label } : {}),
@@ -170,7 +187,7 @@ export class PaymentDestinationService {
   }
 
   async getOrThrow(id: string): Promise<PaymentDestination> {
-    const destination = await this.destinations.findById(id);
+    const destination = await this.destinations.findByIdInTenant(requireEffectiveTenantId(), id);
     if (destination === null) {
       throw new NotFoundError(
         PaymentMethodErrorCodes.DESTINATION_NOT_FOUND,
@@ -180,14 +197,21 @@ export class PaymentDestinationService {
     return destination;
   }
 
-  private async assertMethodExists(paymentMethodId: string): Promise<void> {
-    const method = await this.methods.findById(paymentMethodId);
-    if (method === null) {
-      throw new NotFoundError(
-        PaymentMethodErrorCodes.PAYMENT_METHOD_NOT_FOUND,
-        'That payment method does not exist.',
-      );
-    }
+  /**
+   * Existence check, IN THE GIVEN OPERATOR. Another operator's method is a 404 with the same body as
+   * an id that never existed (API-CONTRACT.md §5: another operator's id is a 404, not a leak).
+   */
+  private async loadMethodOrThrow(tenantId: string, paymentMethodId: string): Promise<PaymentMethod> {
+    const method = await this.methods.findByIdInTenant(tenantId, paymentMethodId);
+    if (method === null) throw this.methodNotFound();
+    return method;
+  }
+
+  private methodNotFound(): NotFoundError {
+    return new NotFoundError(
+      PaymentMethodErrorCodes.PAYMENT_METHOD_NOT_FOUND,
+      'That payment method does not exist.',
+    );
   }
 
   private snapshot(destination: PaymentDestination): Record<string, unknown> {

@@ -22,6 +22,7 @@ import { Prisma } from '@prisma/client';
 import { fromDbJson, stableStringify, toNullableJson } from '@core/queue/json.util';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { isUniqueConstraintError, mapPrismaError } from '@core/prisma/prisma-errors';
+import { requireEffectiveTenantId } from '@core/tenant';
 import type { Tx } from '@core/prisma/tx.type';
 
 import {
@@ -56,6 +57,10 @@ export class IdempotencyService {
   async begin(input: IdempotencyBeginInput): Promise<IdempotencyBeginResult> {
     const { scope, key, requestHash } = input;
     const ttlSeconds = input.ttlSeconds ?? DEFAULT_IDEMPOTENCY_TTL_SECONDS;
+    // The uniqueness that serializes two retries is now UNIQUE(tenant_id, scope, key), so the
+    // INSERT and the SELECT that reads its conflict MUST name the same tenant — resolved once here
+    // rather than per round, because two operators may legitimately use the same client key.
+    const tenantId = requireEffectiveTenantId();
 
     for (let round = 0; round < IDEMPOTENCY_BEGIN_MAX_ROUNDS; round += 1) {
       // lockedAt is set from JS rather than left to the column default: the fence compares it for
@@ -67,6 +72,7 @@ export class IdempotencyService {
       try {
         const created = await this.prisma.idempotencyKey.create({
           data: {
+            tenantId,
             scope,
             key,
             requestHash,
@@ -87,7 +93,7 @@ export class IdempotencyService {
       }
 
       const existing = await this.prisma.idempotencyKey.findUnique({
-        where: { scope_key: { scope, key } },
+        where: { tenantId_scope_key: { tenantId, scope, key } },
       });
       // Reaped between our INSERT and our SELECT. Rare, but the retry is free.
       if (existing === null) continue;
