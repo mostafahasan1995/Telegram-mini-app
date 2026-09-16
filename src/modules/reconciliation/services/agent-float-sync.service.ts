@@ -25,7 +25,9 @@
  * SINGLE-OPERATOR operation that demands a tenant context, and the tick — which has no request and
  * therefore no context — reads the operator list and runs the whole comparison once per operator
  * inside `runWithTenant()`. That is the "iterate operators" sweep shape: the unit of work is a
- * per-operator report, not a row to be claimed, so there is nothing to scan across tenants.
+ * per-operator report, not a row to be claimed, so there is nothing to scan across tenants. That
+ * list is ACTIVE OPERATORS ONLY, and never the platform — tenant zero has no agent to ask, and
+ * asking anyway is what filled the worker's log with errors every five minutes; see `operators()`.
  *
  * One operator's failure must not end the sweep, so each pass is caught on its own. `runAsPlatform`
  * would be exactly wrong here: a float drift is the OPERATOR's money problem and a break filed
@@ -53,7 +55,7 @@ import {
 } from '@core/ledger';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { BotService } from '@core/telegram/services/bot.service';
-import { requireEffectiveTenantId, runWithTenant } from '@core/tenant';
+import { TENANT_ZERO_ID, requireEffectiveTenantId, runWithTenant } from '@core/tenant';
 
 import { ReconciliationErrorCodes } from '../enums/reconciliation-error-code.enum';
 import {
@@ -160,13 +162,28 @@ export class AgentFloatSyncService {
    * The operators to sweep. ACTIVE only: a SUSPENDED or CLOSED operator takes no money, so its
    * float cannot drift, and comparing it would open breaks against a book nobody is keeping.
    *
+   * ══ NEVER TENANT ZERO ═══════════════════════════════════════════════════════════════════════
+   * The platform is not an operator. It has no Ichancy agent at all — TenantIchancyAgentResolver
+   * refuses it by id with ICHANCY_PLATFORM_HAS_NO_AGENT — and its row is ACTIVE by seed
+   * (prisma/seed/tenant.seed.ts), so without this clause the sweep asked for the platform's wallet
+   * and logged that refusal at ERROR every five minutes, forever. A scheduled error that is never a
+   * problem is how an owner learns to skim past the log, and it is precisely the log where a real
+   * operator's float drift has to be visible. Nothing is attempted for tenant zero, so nothing is
+   * reported about it.
+   *
+   * The same exclusion TenantRegistryService.listActiveOperators makes, written out here because
+   * the sweep also needs each operator's `currencyCode`, which that list does not carry.
+   *
+   * Excluded HERE, in the sweep, and deliberately NOT inside `sync()`: a person who points the
+   * console at tenant zero still gets the explicit refusal rather than a silent empty answer.
+   *
    * No ALL_TENANTS marker: `tenants` is the registry itself and carries no `tenant_id`, so the
    * tenant-scope extension leaves it alone by construction. It is still a cross-operator read, and
    * a deliberate one — this list IS the sweep.
    */
   private async operators(): Promise<{ id: string; currencyCode: string }[]> {
     return this.prisma.tenant.findMany({
-      where: { status: TenantStatus.ACTIVE },
+      where: { status: TenantStatus.ACTIVE, id: { not: TENANT_ZERO_ID } },
       select: { id: true, currencyCode: true },
       orderBy: { slug: 'asc' },
     });
