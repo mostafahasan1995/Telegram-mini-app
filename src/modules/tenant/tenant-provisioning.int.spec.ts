@@ -31,7 +31,7 @@
  * audit rows holding them in place. API_BASE_URL and the defaults row are restored to what they held.
  *
  * Run with the escape hatch (no testcontainers):
- *   POSTGRES_TEST_URL=... REDIS_TEST_URL=... TEST_REDIS_URL=... TEST_DATABASE_URL=... \
+ *   POSTGRES_TEST_URL=... REDIS_TEST_URL=... \
  *     npx jest --config jest-int.config.cjs --runInBand src/modules/tenant/tenant-provisioning.int.spec.ts
  */
 import { randomUUID } from 'node:crypto';

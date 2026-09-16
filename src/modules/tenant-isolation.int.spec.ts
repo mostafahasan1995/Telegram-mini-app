@@ -19,7 +19,7 @@
  * rather than passing on one operator's fixtures.
  *
  * Run with the escape hatch (no testcontainers):
- *   POSTGRES_TEST_URL=... REDIS_TEST_URL=... TEST_REDIS_URL=... TEST_DATABASE_URL=... \
+ *   POSTGRES_TEST_URL=... REDIS_TEST_URL=... \
  *     npx jest --config jest-int.config.cjs --runInBand src/modules/tenant-isolation.int.spec.ts
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';

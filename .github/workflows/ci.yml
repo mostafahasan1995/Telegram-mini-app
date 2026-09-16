@@ -69,7 +69,12 @@ jobs:
     # GitHub-hosted Ubuntu runners provide) and has not yet been proven green in CI. Once it has been
     # green for a while, add `integration` to the image job's `needs` and delete this comment.
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # 45, not 30: Jest gives every test FILE a fresh module registry, so the module-level singleton in
+    # test/setup/postgres-container.ts is one container per suite, not one per worker — 18 suites now
+    # each start Postgres (plus `prisma db push`) and Redis. 12 suites fitted in 30 minutes; the six
+    # that this job could not run before add five more databases to that, which is too close to the
+    # edge for a job whose failure mode is a cancelled run that says nothing about the code.
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:

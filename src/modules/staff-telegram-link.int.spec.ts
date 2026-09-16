@@ -20,7 +20,7 @@
  *    and unlinking takes the tap away at once.
  *
  * Run with the escape hatch (no testcontainers):
- *   POSTGRES_TEST_URL=... REDIS_TEST_URL=... TEST_REDIS_URL=... TEST_DATABASE_URL=... \
+ *   POSTGRES_TEST_URL=... REDIS_TEST_URL=... \
  *     npx jest --config jest-int.config.cjs --runInBand src/modules/staff-telegram-link.int.spec.ts
  */
 import { randomUUID } from 'node:crypto';
