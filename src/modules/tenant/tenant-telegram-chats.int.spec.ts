@@ -1111,5 +1111,47 @@ describe('Staff and feed groups (integration)', () => {
       expect((await rowOf(operator.id)).adminChatId).toBe(supergroup);
       expect((await refusalsOf(operator)).map((meta) => meta?.['reason'])).toEqual(['BOT_NOT_ADMIN']);
     });
+
+    it('binds the supergroup when the bind command still carries the id the group had before', async () => {
+      const operator = await createOperator('pin-stale-id');
+      const basic = newGroup();
+      const supergroup = newGroup();
+      botIn(operator, basic, 'member', 'group');
+      // Adding the bot is the update Telegram sends first, and what puts the group in the directory.
+      await deliver(operator, membership(operator, basic, 'member', { type: 'group' }));
+      const { nonce } = await issueLink(operator);
+
+      // Refused on chat grounds, so the link is pinned to this group and not used up. A 429 from
+      // Telegram leaves the same state, with a job queued to retry the command exactly as it stands.
+      await deliver(operator, startCommand(basic, operator.username, nonce, 'group'));
+      expect(await linkOf(operator)).toMatchObject({ usedAt: null, pinnedChatId: basic });
+
+      // The owner promotes the bot; the group becomes a supergroup and the pin moves with it.
+      telegram.migrateChat(basic, supergroup);
+      telegram.setBotMember(operator.token, supergroup, { status: 'administrator' });
+      await deliver(operator, {
+        update_id: freshUpdateId(),
+        message: {
+          message_id: 4,
+          date: now(),
+          chat: { id: Number(basic), type: 'group', title: `B1 group ${basic}` },
+          migrate_to_chat_id: Number(supergroup),
+        },
+      } as unknown as Update);
+      expect(await linkOf(operator)).toMatchObject({ usedAt: null, pinnedChatId: supergroup });
+
+      // That same command again, still carrying the id Telegram delivered it in. It is the SAME
+      // group, so it binds the supergroup instead of being refused as another one.
+      await deliver(operator, startCommand(basic, operator.username, nonce, 'group'));
+
+      expect((await rowOf(operator.id)).adminChatId).toBe(supergroup);
+      expect(await linkOf(operator)).toMatchObject({
+        usedChatId: supergroup,
+        pinnedChatId: supergroup,
+      });
+      expect((await refusalsOf(operator)).map((meta) => meta?.['reason'])).toEqual(['BOT_NOT_ADMIN']);
+      expect(sentTo(operator, supergroup).at(-1)).toContain('staff group');
+      expect(sentTo(operator, basic).join('\n')).not.toContain(OTHER_GROUP_REPLY);
+    });
   });
 });

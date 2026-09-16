@@ -39,7 +39,8 @@
  * refused with LINK_OTHER_CHAT: a member cannot replay it in a group they control and take the staff
  * group, and its review cards, there. Two groups racing for one unpinned link cannot both pin it. The
  * pinned chat keeps what it had: a retry once the bot's rights are fixed, the "already bound" reply, and
- * its link when it becomes a supergroup (TelegramChatMigrationService moves the pin with the chat).
+ * its link when it becomes a supergroup: TelegramChatMigrationService moves the pin with the chat,
+ * and currentChatId follows a command still delivered under the old id to the new one.
  */
 import { Injectable, Logger } from '@nestjs/common';
 import {
@@ -386,7 +387,7 @@ export class ChatBindingService {
     message: Message,
     nonceHash: string,
   ): Promise<StartGroupOutcome> {
-    const chatId = BigInt(message.chat.id);
+    const deliveredChatId = BigInt(message.chat.id);
     const telegramUserId = message.from === undefined ? null : BigInt(message.from.id);
 
     // Pinned to THIS operator: a link another operator issued is unknown here, whoever's group it is.
@@ -397,10 +398,13 @@ export class ChatBindingService {
     if (link === null) {
       // Silent in the group: an unknown payload tells whoever typed it nothing. Never the payload.
       this.logger.warn(
-        `Tenant ${tenantId}: a bind command in chat ${chatId} matched no bind link of this operator; ignored`,
+        `Tenant ${tenantId}: a bind command in chat ${deliveredChatId} matched no bind link of this operator; ignored`,
       );
       return 'ignored';
     }
+
+    // Only once a link of this operator is in hand, so an unknown payload still costs no query.
+    const chatId = await this.currentChatId(tenantId, deliveredChatId);
 
     const refusal = (
       reason: BindRefusalReason,
@@ -425,7 +429,8 @@ export class ChatBindingService {
     }
 
     // Before anything can refuse it on chat grounds and leave it unused. The chat Telegram delivered
-    // the command in, not a verified id: that is the chat whose members have read the nonce.
+    // the command in (followed to the supergroup it has become, never to some other chat), not a
+    // verified id: that is the chat whose members have read the nonce.
     if (!(await this.pinToChat(tenantId, link.id, chatId))) {
       await this.refuseInChat(refusal('LINK_OTHER_CHAT', chatId, null));
       return 'refused';
@@ -492,6 +497,29 @@ export class ChatBindingService {
         `Tenant ${record.tenantId}: a refused bind (${record.reason}) was not recorded: ${describeError(error)}`,
       );
     }
+  }
+
+  /**
+   * The id this chat has NOW. A group that becomes a supergroup gets a new id, and everything stored
+   * under the old one is moved (TelegramChatMigrationService), the pin of a live link included. The
+   * command in hand can be older than that move: this method's caller rethrows a 429 or a 5xx from
+   * Telegram so the update job retries, and the retry still carries the id Telegram delivered the
+   * command with. Pinning THAT id would miss the pin the SAME chat now holds, and the owner's own
+   * group would be refused LINK_OTHER_CHAT — audited against a dead id, and answered in it.
+   *
+   * The trail is the migrated sighting the move leaves behind, and only Telegram's own
+   * `migrate_to_chat_id` produces one, so no other chat's id can ever lead to this pin: the link
+   * still belongs to the first chat that presented it. Followed once — a supergroup does not migrate
+   * again — and a chat with no sighting (never added, so never seen) is left exactly as it came.
+   */
+  private async currentChatId(tenantId: string, chatId: bigint): Promise<bigint> {
+    const sighting = await runWithTenant(tenantId, () =>
+      this.prisma.telegramDiscoveredChat.findFirst({
+        where: { tenantId, chatId },
+        select: { migratedToChatId: true },
+      }),
+    );
+    return sighting?.migratedToChatId ?? chatId;
   }
 
   /**

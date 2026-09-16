@@ -12,6 +12,11 @@
  * unpinned or already this chat's, none otherwise), so the order of the steps and every refusal can be
  * asserted. The same rules against real rows, racing groups included, are in
  * src/modules/tenant/tenant-telegram-chats.int.spec.ts.
+ *
+ * A promoted group is NOT another chat: when the pinned group has become a supergroup, a command
+ * still carrying the old id belongs to the same chat and binds the new one (currentChatId). The
+ * migrated sighting is the only trail that says so, and the fake below answers it the way the
+ * directory does.
  */
 import {
   TelegramBotChatStatus,
@@ -39,6 +44,9 @@ const LINK_ID = '33333333-3333-4333-8333-333333333333';
 const NONCE_HASH = 'a'.repeat(64);
 const STAFF_GROUP = -1_001_000_000_001n;
 const OTHER_GROUP = -1_001_000_000_002n;
+/** A basic group and the supergroup it became when the bot was promoted in it. */
+const BASIC_GROUP = -1_001_000_000_003n;
+const SUPERGROUP = -1_001_000_000_004n;
 
 const OTHER_CHAT_REPLY_EN =
   'This link was opened in another group. Create a new one from the console.';
@@ -101,6 +109,8 @@ function build(
     link?: Partial<LinkRow> | null;
     boundStaffChat?: bigint;
     verify?: (chatId: bigint) => ChatVerification;
+    /** A group this operator has seen become a supergroup, as the migrated sighting records it. */
+    migratedTo?: { from: bigint; to: bigint };
   } = {},
 ) {
   const link: LinkRow = {
@@ -149,8 +159,19 @@ function build(
     telegramChatBindLink: { updateMany: claim },
     depositRequest: { findMany: jest.fn().mockResolvedValue([]) },
   };
+  // The directory row the migration leaves behind: the old chat, marked with the id it moved to. It
+  // is how a command delivered under that old id is recognised as the same chat.
+  const migrated = options.migratedTo ?? null;
+  const sighting = jest.fn(({ where }: { where: { chatId: bigint } }) =>
+    Promise.resolve(
+      migrated === null || where.chatId !== migrated.from
+        ? null
+        : { migratedToChatId: migrated.to },
+    ),
+  );
   const prisma = {
     telegramChatBindLink: { findFirst, updateMany: pin },
+    telegramDiscoveredChat: { findFirst: sighting },
     runInTransaction: jest.fn((body: (client: typeof tx) => Promise<unknown>) => body(tx)),
   } as unknown as PrismaService;
 
@@ -297,6 +318,49 @@ describe('ChatBindingService.bindFromStartGroup — the link belongs to the firs
     expect(h.refusals()).toEqual([expect.objectContaining({ reason })]);
     expect(h.pin).not.toHaveBeenCalled();
     expect(h.verifyChat).not.toHaveBeenCalled();
+  });
+
+  it('binds the supergroup a pinned group became, when the command still carries the old id', async () => {
+    // The first attempt pinned the basic group and then died on a 429 from Telegram, so the update
+    // job retries with the id Telegram delivered the command in. In between, the owner promoted the
+    // bot, the group became a supergroup, and TelegramChatMigrationService moved the pin with it.
+    const h = build({
+      link: { pinnedChatId: SUPERGROUP },
+      migratedTo: { from: BASIC_GROUP, to: SUPERGROUP },
+    });
+
+    await expect(h.bind(BASIC_GROUP)).resolves.toBe('bound');
+
+    // Pinned, verified, bound and answered as the supergroup — never as the id that is now dead.
+    expect(h.pin).toHaveBeenCalledWith({
+      where: {
+        id: LINK_ID,
+        tenantId: TENANT_ID,
+        OR: [{ pinnedChatId: null }, { pinnedChatId: SUPERGROUP }],
+      },
+      data: { pinnedChatId: SUPERGROUP },
+    });
+    expect(h.verifiedChats()).toEqual([SUPERGROUP]);
+    expect(h.staffChat()).toBe(SUPERGROUP);
+    expect(h.link).toMatchObject({ pinnedChatId: SUPERGROUP, usedChatId: SUPERGROUP });
+    expect(h.refusals()).toEqual([]);
+    expect(h.sentTo(BASIC_GROUP)).toEqual([]);
+  });
+
+  it('still refuses another chat while the pinned group is one that was promoted', async () => {
+    const h = build({
+      link: { pinnedChatId: SUPERGROUP },
+      migratedTo: { from: BASIC_GROUP, to: SUPERGROUP },
+    });
+
+    // OTHER_GROUP migrated into nothing, so it is still simply another chat.
+    await expect(h.bind(OTHER_GROUP)).resolves.toBe('refused');
+
+    expect(h.refusals()).toEqual([
+      expect.objectContaining({ reason: 'LINK_OTHER_CHAT', chatId: OTHER_GROUP.toString() }),
+    ]);
+    expect(h.verifyChat).not.toHaveBeenCalled();
+    expect(h.staffChat()).toBe(0n);
   });
 
   it('pins nothing for a nonce that matches no link of this operator', async () => {
