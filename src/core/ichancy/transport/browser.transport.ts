@@ -28,15 +28,21 @@
  */
 import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common';
 
-import { AppConfigService } from '@core/config/config.service';
+import { AppConfigService, proxyHostPort } from '@core/config/config.service';
 
-import { isCloudflareChallenge } from '../error-map';
+import { isCloudflareBlock, isCloudflareBlockBody, isCloudflareChallenge } from '../error-map';
 
 import {
   type IchancyTransport,
   type IchancyTransportRequest,
   type IchancyTransportResponse,
 } from './ichancy-transport';
+import {
+  type ProxyRelay,
+  type RelayUpstream,
+  relayUpstreamFrom,
+  startProxyRelay,
+} from './proxy-relay';
 
 /**
  * Minimal structural types for the bits of Playwright we touch. Declared locally so this file
@@ -46,6 +52,8 @@ import {
 interface PlaywrightPage {
   goto(url: string, options?: { waitUntil?: string; timeout?: number }): Promise<unknown>;
   title(): Promise<string>;
+  /** Full rendered HTML. Read to tell a solvable challenge from a terminal edge block. */
+  content(): Promise<string>;
   evaluate<T>(fn: string, arg?: unknown): Promise<T>;
   isClosed(): boolean;
 }
@@ -127,8 +135,13 @@ function buildInPageFetch(input: {
   ].join('\n');
 }
 
-/** Cloudflare's interstitial, as seen from inside the page. Same markers as the error map. */
-const CHALLENGE_TITLES = ['just a moment', 'attention required'];
+/**
+ * Titles of the SOLVABLE challenge, as seen from inside the page. 'attention required' is gone on
+ * purpose: it is the title of the TERMINAL block page, and treating it as solvable is what made a
+ * block poll for 45s and then replay (see the block detector below and error-map.ts). A block is
+ * detected from the page CONTENT and wins over these titles.
+ */
+const CHALLENGE_TITLES = ['just a moment'];
 
 /** How long to let a Managed Challenge run before giving up on a navigation. */
 const CHALLENGE_TIMEOUT_MS = 45_000;
@@ -228,6 +241,22 @@ export function looksChallenged(response: IchancyTransportResponse): boolean {
 }
 
 /**
+ * Is this response Cloudflare's TERMINAL block rather than a solvable challenge?
+ *
+ * The block case is why `post` must NOT re-solve or replay: re-navigating cannot clear a reputation
+ * block, and a replay of a non-idempotent call (registerPlayer) risks an undeletable second account
+ * for nothing. A block stays an ambiguous failure — the money classification is unchanged — but it
+ * is handled by returning the response for the error map to label CLOUDFLARE_BLOCKED, never by the
+ * challenge re-solve path.
+ */
+export function looksBlocked(response: IchancyTransportResponse): boolean {
+  return isCloudflareBlock(response.status, response.text, response.contentType);
+}
+
+/** What the origin page currently is. Diagnostic only; printed by ichancy:check. */
+export type OriginState = 'app' | 'challenge' | 'blocked';
+
+/**
  * Loaded on demand so `playwright` can stay an OPTIONAL dependency: a deployment that uses the fetch
  * transport (an allowlisted IP, or the fake adapter) must not need a 300 MB browser in its image.
  * The error names the fix rather than surfacing a bare MODULE_NOT_FOUND.
@@ -264,6 +293,17 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
    * stamped the configured (Firefox) string over a Chrome binary.
    */
   private chromiumUserAgent: string | null = null;
+  /**
+   * The local CONNECT relay for a CREDENTIALED proxy, one per browser lifetime. Null when the proxy
+   * is direct, credential-free, or unset. Closed alongside the browser so a relaunch starts fresh.
+   */
+  private relay: ProxyRelay | null = null;
+  /**
+   * The last thing the origin was observed to be — 'app', 'challenge' or 'blocked' — or null before
+   * anything has been observed. Diagnostic only (ichancy:check prints it); it steers no money
+   * decision. Set by solveChallenge (at launch/warm-up) and by post (per call).
+   */
+  private lastOriginState: OriginState | null = null;
 
   constructor(private readonly config: AppConfigService) {}
 
@@ -315,7 +355,26 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
       throw error;
     }
 
-    if (!looksChallenged(first)) return first;
+    // A TERMINAL BLOCK, checked before the challenge path and NEVER replayed. Cloudflare denied this
+    // egress IP at its edge; re-navigating cannot earn a clearance it will never grant, and replaying
+    // a non-idempotent call (registerPlayer) for a request the origin never saw risks an undeletable
+    // second account for nothing. Return it as-is: the error map labels it CLOUDFLARE_BLOCKED, which
+    // is `ambiguous` exactly like a challenge, so the money classification is unchanged. The fix is a
+    // trusted exit IP (ICHANCY_PROXY_URL), not another re-solve.
+    if (looksBlocked(first)) {
+      this.lastOriginState = 'blocked';
+      this.logger.error(
+        'Cloudflare BLOCKED this egress at its edge (terminal, not a solvable challenge). Not ' +
+          'replaying. Set ICHANCY_PROXY_URL to a trusted exit; every retry only lowers the IP score.',
+      );
+      return first;
+    }
+
+    if (!looksChallenged(first)) {
+      // Ichancy answered (JSON, an origin error, anything that is not a Cloudflare interstitial).
+      this.lastOriginState = 'app';
+      return first;
+    }
 
     // The clearance lapsed while we were idle. Re-navigating re-solves it — the browser can, which
     // is the entire reason this transport exists — and the call is replayed ONCE.
@@ -323,7 +382,9 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
     // WHY REPLAYING IS SAFE HERE AND NOT IN GENERAL: a challenged request never reached Ichancy. The
     // 403 comes from Cloudflare's edge, with its own interstitial as the body, so no agent-side
     // state was touched and no money moved. A retry after any OTHER failure would not be safe and is
-    // deliberately not done — see the header of ichancy-http.client.ts.
+    // deliberately not done — see the header of ichancy-http.client.ts. A BLOCK is handled above and
+    // never reaches here.
+    this.lastOriginState = 'challenge';
     this.logger.warn('Cloudflare challenged the call; re-solving in the browser and retrying once');
     await withDeadline(this.solveChallenge(page), LAUNCH_BUDGET_MS, 'Cloudflare re-solve');
     return this.runInPage(page, request, headers);
@@ -349,12 +410,19 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
     readonly headless: boolean;
     readonly launched: boolean;
     readonly chromiumUserAgent: string | null;
+    /** Egress `host:port`, or null for direct. NEVER the proxy password — host:port only. */
+    readonly proxy: string | null;
+    /** Last observed origin page: 'app' | 'challenge' | 'blocked', or null before anything ran. */
+    readonly lastOriginState: OriginState | null;
   } {
+    const proxy = this.config.ichancy.proxy ?? null;
     return {
       transport: this.name,
       headless: this.config.ichancy.browserHeadless,
       launched: this.browser?.isConnected() === true,
       chromiumUserAgent: this.chromiumUserAgent,
+      proxy: proxy === null ? null : proxyHostPort(proxy.server),
+      lastOriginState: this.lastOriginState,
     };
   }
 
@@ -392,8 +460,21 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
     this.context = null;
     this.page = null;
     this.chromiumUserAgent = null;
+    this.closeRelay();
     if (browser === null) return;
     await browser.close().catch(() => undefined);
+  }
+
+  /** Tear down the CONNECT relay, if any. One relay per browser, so it dies with the browser. */
+  private closeRelay(): void {
+    const relay = this.relay;
+    this.relay = null;
+    if (relay === null) return;
+    try {
+      relay.close();
+    } catch (error: unknown) {
+      this.logger.warn(`Could not close the proxy relay: ${describe(error)}`);
+    }
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -403,6 +484,7 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
     // report a dead browser's clearance as this one's.
     this.context = null;
     this.page = null;
+    this.closeRelay();
     if (browser === null) return;
     // Never let a shutdown hang on a wedged browser: an unclosed Chromium is a leaked process, but a
     // process that will not exit is worse.
@@ -485,6 +567,39 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
     return loadChromium();
   }
 
+  /**
+   * Decide how Chromium egresses and return the launch `proxy` option (or undefined for direct).
+   *
+   * A CREDENTIALED proxy gets the local CONNECT relay — headless Chromium cannot authenticate to an
+   * HTTP proxy on the CONNECT (measured 2026-09-16), so `server` points at the relay on 127.0.0.1
+   * with no auth and the relay injects the upstream Proxy-Authorization itself. A credential-free
+   * proxy is passed straight through; unset is direct. Logged ONCE, host:port only — the proxy
+   * password is never printed here or anywhere.
+   */
+  private async prepareEgress(): Promise<{ server: string } | undefined> {
+    const proxy = this.config.ichancy.proxy ?? null;
+    if (proxy === null) {
+      this.logger.log('Ichancy browser egress: direct');
+      return undefined;
+    }
+    if (proxy.username === null && proxy.password === null) {
+      this.logger.log(`Ichancy browser egress: proxy ${proxyHostPort(proxy.server)}`);
+      return { server: proxy.server };
+    }
+    const relay = await this.startRelay(relayUpstreamFrom(proxy));
+    this.relay = relay;
+    this.logger.log(`Ichancy browser egress: proxy ${proxyHostPort(proxy.server)} via local relay`);
+    return { server: `http://127.0.0.1:${String(relay.port)}` };
+  }
+
+  /**
+   * Seam for the unit spec: overriding this pins the relay wiring (which upstream, which auth, that
+   * Chromium is launched at the relay) without opening a real socket. Nothing else changes.
+   */
+  protected startRelay(up: RelayUpstream): Promise<ProxyRelay> {
+    return startProxyRelay(up);
+  }
+
   private async launch(): Promise<PlaywrightPage> {
     const chromium = await this.loadChromium();
     const settings = this.config.ichancy;
@@ -493,50 +608,59 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
       `Launching Chromium for the Ichancy transport (headless=${String(settings.browserHeadless)})`,
     );
 
-    const browser = await chromium.launch({
-      headless: settings.browserHeadless,
-      // --disable-blink-features=AutomationControlled removes the `navigator.webdriver` flag that
-      // bot protection reads first. The rest are the standard flags for running in a container.
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--no-sandbox',
-        '--disable-dev-shm-usage',
-      ],
-    });
+    // Started BEFORE launch so the relay socket exists when Chromium dials it, and stored on `this`
+    // so the catch below (and discardBrowser/onModuleDestroy) can tear it down. One per browser.
+    const launchProxy = await this.prepareEgress();
 
-    // THE UA IS DERIVED FROM THIS BROWSER, WITH ONE WORD REMOVED. Read both halves before changing
-    // it — the obvious "fixes" in either direction have each caused an outage.
-    //
-    // Setting a CONFIGURED UA (ICHANCY_USER_AGENT) was wrong: a Chrome 151 binary announcing Firefox
-    // 153 makes the header, the TLS/JA3 fingerprint and the JS environment disagree, which is what
-    // bot protection fingerprints for.
-    //
-    // Setting NO UA was also wrong, and worse. Playwright's headless build announces itself as
-    // `HeadlessChrome/151.0.7922.34` — measured on 2026-08-20 — which is the loudest bot signal
-    // there is. With that string the Turnstile challenge never handed over a clearance; with the
-    // same binary announcing plain `Chrome`, the page cleared in 3.5 seconds.
-    //
-    // So: take Chromium's OWN User-Agent and delete only the word "Headless". Every version number
-    // stays true to the binary, nothing is hardcoded to rot, and the one token that exists purely to
-    // advertise automation is gone.
-    const rawUserAgent = await this.readDefaultUserAgent(browser);
-    const userAgent =
-      rawUserAgent === null ? undefined : rawUserAgent.replace('HeadlessChrome', 'Chrome');
-    if (rawUserAgent !== null && userAgent !== rawUserAgent) {
-      this.logger.log(`Masking the headless marker in the User-Agent: ${String(userAgent)}`);
-    }
-
-    const context = await browser.newContext({
-      ...(userAgent === undefined ? {} : { userAgent }),
-      locale: 'en-US',
-      viewport: { width: 1280, height: 800 },
-    });
-
-    // Everything after the launch can throw — `page.goto` inside solveChallenge most of all — and
-    // until 2026-08-20 `this.browser` was assigned FIRST, so a throw left a live Chromium with
-    // nothing referencing it and the next attempt simply overwrote the field. Under a 5-minute cron
-    // that orphaned one browser every five minutes until the box ran out of memory.
+    // Everything after the relay starts can throw — `chromium.launch`, `newContext`, and `page.goto`
+    // inside solveChallenge most of all. Until 2026-08-20 `this.browser` was assigned before the
+    // try, so a throw left a live Chromium orphaned; the relay is an OS socket with the same hazard.
+    // One try now covers launch through the challenge, closing BOTH the browser and the relay.
+    let browser: PlaywrightBrowser | null = null;
     try {
+      browser = await chromium.launch({
+        headless: settings.browserHeadless,
+        // --disable-blink-features=AutomationControlled removes the `navigator.webdriver` flag that
+        // bot protection reads first. The rest are the standard flags for running in a container.
+        args: [
+          '--disable-blink-features=AutomationControlled',
+          '--no-sandbox',
+          '--disable-dev-shm-usage',
+        ],
+        // PROXY AT LAUNCH LEVEL, not per-context, on purpose: the readDefaultUserAgent throwaway
+        // context below inherits it too, so not even that diagnostic can leak a request from the VPS
+        // IP. Omitted entirely when direct, leaving launch byte-for-byte as before.
+        ...(launchProxy === undefined ? {} : { proxy: launchProxy }),
+      });
+
+      // THE UA IS DERIVED FROM THIS BROWSER, WITH ONE WORD REMOVED. Read both halves before changing
+      // it — the obvious "fixes" in either direction have each caused an outage.
+      //
+      // Setting a CONFIGURED UA (ICHANCY_USER_AGENT) was wrong: a Chrome 151 binary announcing
+      // Firefox 153 makes the header, the TLS/JA3 fingerprint and the JS environment disagree, which
+      // is what bot protection fingerprints for.
+      //
+      // Setting NO UA was also wrong, and worse. Playwright's headless build announces itself as
+      // `HeadlessChrome/151.0.7922.34` — measured on 2026-08-20 — which is the loudest bot signal
+      // there is. With that string the Turnstile challenge never handed over a clearance; with the
+      // same binary announcing plain `Chrome`, the page cleared in 3.5 seconds.
+      //
+      // So: take Chromium's OWN User-Agent and delete only the word "Headless". Every version number
+      // stays true to the binary, nothing is hardcoded to rot, and the one token that exists purely
+      // to advertise automation is gone.
+      const rawUserAgent = await this.readDefaultUserAgent(browser);
+      const userAgent =
+        rawUserAgent === null ? undefined : rawUserAgent.replace('HeadlessChrome', 'Chrome');
+      if (rawUserAgent !== null && userAgent !== rawUserAgent) {
+        this.logger.log(`Masking the headless marker in the User-Agent: ${String(userAgent)}`);
+      }
+
+      const context = await browser.newContext({
+        ...(userAgent === undefined ? {} : { userAgent }),
+        locale: 'en-US',
+        viewport: { width: 1280, height: 800 },
+      });
+
       this.browser = browser;
       this.context = context;
 
@@ -559,7 +683,8 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
       this.context = null;
       this.page = null;
       this.chromiumUserAgent = null;
-      await browser.close().catch(() => undefined);
+      this.closeRelay();
+      if (browser !== null) await browser.close().catch(() => undefined);
       throw error;
     }
   }
@@ -606,6 +731,23 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
     }
 
     for (;;) {
+      // A TERMINAL BLOCK must win over the challenge titles and bail the poll IMMEDIATELY. Read from
+      // the page CONTENT (not just the title) so the block markers the error map knows —
+      // "sorry, you have been blocked", error 1020 — are caught even when the title is generic.
+      // Without this, a block page (title "Attention Required!") is not in CHALLENGE_TITLES, so the
+      // loop treats it as "cleared", never sees cf_clearance, and burns the full 45s before giving
+      // up — the exact waste this fix removes. The block is not solvable here; only ICHANCY_PROXY_URL
+      // (a trusted exit IP) can change it, so return and let post()/the error map report it.
+      const body = await page.content().catch(() => '');
+      if (isCloudflareBlockBody(body)) {
+        this.lastOriginState = 'blocked';
+        this.logger.error(
+          'Cloudflare BLOCKED this egress at its edge (terminal). Not polling the challenge. Set ' +
+            'ICHANCY_PROXY_URL to a trusted exit; a browser cannot clear a reputation block.',
+        );
+        return;
+      }
+
       const title = (await page.title().catch(() => 'just a moment')).toLowerCase();
       const cleared = !CHALLENGE_TITLES.some((marker) => title.includes(marker));
 
@@ -617,6 +759,7 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
         // A short settle after the cookie appears: the challenge's final reload is usually still in
         // flight, and starting a fetch into it only earns an "Execution context was destroyed".
         await delay(CHALLENGE_POLL_MS * 2);
+        this.lastOriginState = 'app';
         this.logger.log(`Cloudflare cleared in ${String(Date.now() - startedAt)}ms`);
         return;
       }

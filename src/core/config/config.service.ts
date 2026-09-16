@@ -14,6 +14,16 @@ export const ENV_TOKEN = 'ICHANCY_VALIDATED_ENV';
 export type AppRole = 'api' | 'worker';
 export type NodeEnv = 'development' | 'test' | 'production';
 
+/**
+ * `host:port` of a validated proxy URL (`scheme://host:port`, no credentials, no path — see
+ * env.schema.ts's optionalProxyUrl). For the launch banner, describeTransport and ichancy:check,
+ * none of which may ever print the proxy password. It does NOT use `new URL()`, whose port parsing
+ * is unreliable for non-special schemes like `socks5:`.
+ */
+export function proxyHostPort(server: string): string {
+  return server.replace(/^[a-z0-9]+:\/\//i, '').replace(/\/.*$/, '');
+}
+
 export interface AppSettings {
   readonly role: AppRole;
   readonly nodeEnv: NodeEnv;
@@ -115,6 +125,17 @@ export interface IchancySettings {
    * gets no warning. That is harmless, because the value they chose is the value in use.
    */
   readonly userAgentIsDefault: boolean;
+  /**
+   * Forward proxy for Ichancy egress, or null for DIRECT. `server` is `scheme://host:port` with NO
+   * credentials; `username`/`password` are carried separately and MUST NEVER reach a log or
+   * describeTransport() — host:port only. Built from ICHANCY_PROXY_URL / _USERNAME / _PASSWORD; null
+   * whenever ICHANCY_PROXY_URL is blank, which is the unchanged direct-egress behaviour.
+   */
+  readonly proxy: {
+    readonly server: string;
+    readonly username: string | null;
+    readonly password: string | null;
+  } | null;
 }
 
 export interface S3Settings {
@@ -202,6 +223,17 @@ export class AppConfigService {
           : join(tmpdir(), 'ichancy-agent-profile'),
       transport: env.ICHANCY_TRANSPORT,
       browserHeadless: env.ICHANCY_BROWSER_HEADLESS,
+      // Blank URL => null => direct egress, byte-for-byte the old behaviour. The URL carries no
+      // credentials (env.schema refuses them there); username/password are optional even when a URL
+      // is set (an open proxy, or IP-authenticated).
+      proxy:
+        env.ICHANCY_PROXY_URL === undefined
+          ? null
+          : Object.freeze({
+              server: env.ICHANCY_PROXY_URL,
+              username: env.ICHANCY_PROXY_USERNAME ?? null,
+              password: env.ICHANCY_PROXY_PASSWORD ?? null,
+            }),
     });
 
     this._s3 = Object.freeze({

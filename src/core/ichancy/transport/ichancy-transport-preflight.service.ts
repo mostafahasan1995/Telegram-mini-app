@@ -29,7 +29,7 @@
 import { Injectable, Logger, type OnApplicationBootstrap } from '@nestjs/common';
 import { existsSync } from 'node:fs';
 
-import { AppConfigService } from '@core/config/config.service';
+import { AppConfigService, proxyHostPort } from '@core/config/config.service';
 
 import { BrowserIchancyTransport, MISSING_PLAYWRIGHT_MESSAGE } from './browser.transport';
 
@@ -63,6 +63,16 @@ export class IchancyTransportPreflightService implements OnApplicationBootstrap 
     }
 
     await this.requireChromium();
+
+    // Say once, at boot, where the Ichancy egress goes — host:port only, NEVER the password. On the
+    // VPS the direct IP is Cloudflare-blocked, so seeing "direct" here next to CLOUDFLARE_BLOCKED
+    // rows is the whole diagnosis; seeing the proxy confirms the trusted exit is wired.
+    const proxy = settings.proxy ?? null;
+    this.logger.log(
+      `Ichancy egress: ${
+        proxy === null ? 'direct' : `proxy ${proxyHostPort(proxy.server)} (relay when credentialed)`
+      }`,
+    );
 
     if (!settings.userAgentIsDefault) {
       this.logger.warn(
