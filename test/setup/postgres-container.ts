@@ -63,7 +63,7 @@ const SQL_FILES = [
 
 const PROJECT_ROOT = join(__dirname, '..', '..');
 
-/** Module-level, therefore one per Jest worker process. */
+/** Module-level, therefore one per test FILE — see WHAT IT SPANS above, not one per worker. */
 let handle: PostgresHandle | null = null;
 let starting: Promise<PostgresHandle> | null = null;
 
