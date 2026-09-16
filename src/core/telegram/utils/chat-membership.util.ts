@@ -113,7 +113,9 @@ const START_WITH_PAYLOAD = /^\/start(?:@([A-Za-z0-9_]{1,64}))?[ \t]+(\S{1,128})[
 /**
  * ══ THE NONCE NEVER RESTS ANYWHERE ═══════════════════════════════════════════════════════════════
  * A link refused on chat grounds (the bot not yet an administrator) stays usable for its 15 minutes,
- * so the nonce in `/start@bot <nonce>` is a live credential in that window. The webhook therefore
+ * so the nonce in `/start@bot <nonce>` is a live credential in that window. Every member of the group
+ * can read it there, which is why the link is pinned to the first chat that presents it
+ * (ChatBindingService, LINK_OTHER_CHAT); nobody else may learn it from storage. The webhook therefore
  * replaces it with its sha256 (redactBindNonce) BEFORE the update is written to
  * `telegram_updates.payload` or queued in Redis, and the worker looks the link up by that hash, which
  * is exactly what `telegram_chat_bind_links.nonce_hash` already holds. A reader of the database or

@@ -1144,6 +1144,10 @@ model TelegramChatBindLink {
   expiresAt       DateTime            @map("expires_at") @db.Timestamptz(6)
   usedAt          DateTime?           @map("used_at") @db.Timestamptz(6)
   usedChatId      BigInt?             @map("used_chat_id")
+  /// The first chat that presented the nonce (`/start@<bot> <nonce>`), set by one conditional update.
+  /// Every member of that chat can read the nonce, so the same link from any other chat is refused
+  /// (LINK_OTHER_CHAT). Moves with the chat when it becomes a supergroup. Null: not presented yet.
+  pinnedChatId    BigInt?             @map("pinned_chat_id")
   revokedAt       DateTime?           @map("revoked_at") @db.Timestamptz(6)
   createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
 

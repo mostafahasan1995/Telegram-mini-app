@@ -14,6 +14,8 @@
  *    update, so a concurrent rebind to some other chat is never overwritten);
  *  - `deposit_requests.admin_chat_id`, the stored location of each review card, so an in-flight card is
  *    edited in the supergroup (and reposted there if Telegram did not carry the message across);
+ *  - the pin of a live one-time bind link (ChatBindingService), so the group that opened it can still
+ *    use it: promoting the bot in a basic group, the owner's fix for BOT_NOT_ADMIN, is what moves it;
  *  - the discovered-chat row: copied to the new id, the old row kept and marked `migratedToChatId`.
  * Idempotent: both service messages, a send error and a verification can all report the same move.
  *
@@ -71,6 +73,11 @@ export class TelegramChatMigrationService {
         const cards = await tx.depositRequest.updateMany({
           where: { tenantId, adminChatId: fromChatId },
           data: { adminChatId: toChatId },
+        });
+        // A used or revoked link keeps the id it had, as evidence.
+        await tx.telegramChatBindLink.updateMany({
+          where: { tenantId, pinnedChatId: fromChatId, usedAt: null, revokedAt: null },
+          data: { pinnedChatId: toChatId },
         });
 
         const sighting = await tx.telegramDiscoveredChat.findFirst({

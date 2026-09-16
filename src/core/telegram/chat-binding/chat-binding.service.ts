@@ -30,6 +30,16 @@
  * link is only issued to one. Anybody can add a public bot to their own group and type /start in it;
  * without a live link of THIS operator (looked up by operator AND nonce hash, so another operator's
  * link is simply unknown here) nothing happens, and no reply tells them anything.
+ *
+ * ══ A LINK BELONGS TO THE FIRST CHAT THAT PRESENTS IT ═══════════════════════════════════════════
+ * `/start@<bot> <nonce>` is a visible message, so every member of the group the link was opened in can
+ * read the nonce. A link refused on chat grounds, or opened in the group that is already bound, is not
+ * used up. So the first chat that presents a live link is recorded on it (`pinnedChatId`) by one
+ * conditional update, before Telegram is asked anything, and the same nonce from any other chat is
+ * refused with LINK_OTHER_CHAT: a member cannot replay it in a group they control and take the staff
+ * group, and its review cards, there. Two groups racing for one unpinned link cannot both pin it. The
+ * pinned chat keeps what it had: a retry once the bot's rights are fixed, the "already bound" reply, and
+ * its link when it becomes a supergroup (TelegramChatMigrationService moves the pin with the chat).
  */
 import { Injectable, Logger } from '@nestjs/common';
 import {
@@ -72,8 +82,16 @@ export const WAITING_FOR_REVIEW: readonly DepositStatus[] = Object.freeze([
 /** Recorded on the audit row: which door the bind came through. */
 export type ChatBindVia = 'startgroup' | 'console' | 'patch';
 
-/** Why a link could not be used, beside the chat reasons Telegram's answer gives. */
-export type LinkRefusalReason = 'LINK_EXPIRED' | 'LINK_USED' | 'LINK_REVOKED' | 'OPERATOR_CLOSED';
+/**
+ * Why a link could not be used, beside the chat reasons Telegram's answer gives. LINK_OTHER_CHAT: a
+ * different chat presented this link first (see A LINK BELONGS TO THE FIRST CHAT THAT PRESENTS IT).
+ */
+export type LinkRefusalReason =
+  | 'LINK_EXPIRED'
+  | 'LINK_USED'
+  | 'LINK_REVOKED'
+  | 'LINK_OTHER_CHAT'
+  | 'OPERATOR_CLOSED';
 
 export type BindRefusalReason = ChatRejectionReason | LinkRefusalReason;
 
@@ -136,6 +154,9 @@ const REFUSAL_REPLIES: Readonly<Record<BindRefusalReason, string>> = {
   LINK_REVOKED:
     'تم استبدال هذا الرابط برابط أحدث. استخدم الرابط الأحدث من لوحة التحكم.\n' +
     'This link was replaced by a newer one. Use the newest link from the console.',
+  LINK_OTHER_CHAT:
+    'تم فتح رابط الربط هذا في مجموعة أخرى. أنشئ رابطاً جديداً من لوحة التحكم.\n' +
+    'This link was opened in another group. Create a new one from the console.',
   OPERATOR_CLOSED:
     'لا يمكن ربط مجموعة بهذا الحساب.\nNo group can be bound to this operator.',
   NOT_FOUND:
@@ -358,7 +379,7 @@ export class ChatBindingService {
   /**
    * The `/start@<bot> <nonce>` a startgroup link produced, in the group the bot was just added to.
    * Telegram failures that say nothing about the chat are thrown, so the update job retries; the link
-   * is only used up by a successful commit, so a retry can still bind.
+   * is only used up by a successful commit, so a retry can still bind, from the chat it is pinned to.
    */
   async bindFromStartGroup(
     tenantId: string,
@@ -400,6 +421,13 @@ export class ChatBindingService {
     const unusable = linkRefusalOf(link, new Date());
     if (unusable !== null) {
       await this.refuseInChat(refusal(unusable, chatId, null));
+      return 'refused';
+    }
+
+    // Before anything can refuse it on chat grounds and leave it unused. The chat Telegram delivered
+    // the command in, not a verified id: that is the chat whose members have read the nonce.
+    if (!(await this.pinToChat(tenantId, link.id, chatId))) {
+      await this.refuseInChat(refusal('LINK_OTHER_CHAT', chatId, null));
       return 'refused';
     }
 
@@ -464,6 +492,21 @@ export class ChatBindingService {
         `Tenant ${record.tenantId}: a refused bind (${record.reason}) was not recorded: ${describeError(error)}`,
       );
     }
+  }
+
+  /**
+   * Pins the link to `chatId` unless another chat presented it first. One conditional UPDATE, never a
+   * read then a write: of two chats racing, the second waits on the first's row lock and then no longer
+   * matches. True when the link is pinned to this chat, now or already.
+   */
+  private async pinToChat(tenantId: string, linkId: string, chatId: bigint): Promise<boolean> {
+    const pinned = await runWithTenant(tenantId, () =>
+      this.prisma.telegramChatBindLink.updateMany({
+        where: { id: linkId, tenantId, OR: [{ pinnedChatId: null }, { pinnedChatId: chatId }] },
+        data: { pinnedChatId: chatId },
+      }),
+    );
+    return pinned.count === 1;
   }
 
   private async refuseInChat(record: BindRefusalRecord): Promise<void> {

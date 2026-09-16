@@ -17,13 +17,16 @@
  *    never registers a player;
  *  - another operator's link, an expired, reused or revoked link, a channel, a private chat and a bot
  *    that is not an administrator are all refused, and a refused link can still be used once fixed;
+ *  - a link belongs to the first group that presents it: replayed from another group it is refused
+ *    (LINK_OTHER_CHAT), groups racing for it cannot both have it, and the first group keeps its retry,
+ *    its "already bound" reply and its link when it becomes a supergroup;
  *  - binding from the directory, by PATCH and removal follow their rules, and an operator's own staff
  *    can do none of it;
  *  - a group that becomes a supergroup moves every stored id, from its service message and from a send;
  *  - a bot removed from the staff group keeps the binding and shows in health.
  *
  * Run with the escape hatch (no testcontainers):
- *   POSTGRES_TEST_URL=... REDIS_TEST_URL=... TEST_REDIS_URL=... TEST_DATABASE_URL=... \
+ *   POSTGRES_TEST_URL=... REDIS_TEST_URL=... \
  *     npx jest --config jest-int.config.cjs --runInBand src/modules/tenant/tenant-telegram-chats.int.spec.ts
  */
 import { createHash } from 'node:crypto';
@@ -31,7 +34,7 @@ import { createHash } from 'node:crypto';
 import { getQueueToken } from '@nestjs/bullmq';
 import { AdminRole, DepositStatus, PlayerStatus } from '@prisma/client';
 import { type Job, type Queue } from 'bullmq';
-import { type Update } from 'grammy/types';
+import { type Message, type Update } from 'grammy/types';
 import request from 'supertest';
 import { z } from 'zod';
 
@@ -42,6 +45,7 @@ import { FakeIchancyAdapter } from '@core/ichancy/fake-ichancy.adapter';
 import { PrismaService } from '@core/prisma/prisma.service';
 import { QUEUE_NAMES } from '@core/queue/queue.constants';
 import { TASKS } from '@core/queue/queue.types';
+import { ChatBindingService } from '@core/telegram/chat-binding/chat-binding.service';
 import { TelegramChatProjectionService } from '@core/telegram/chat-binding/chat-projection.service';
 import { StaffTelegramLinkService } from '@core/telegram/staff-link/staff-telegram-link.service';
 import { TelegramUpdateProcessor } from '@core/telegram/processors/telegram-update.processor';
@@ -258,14 +262,19 @@ describe('Staff and feed groups (integration)', () => {
       },
     }) as unknown as Update;
 
-  const startCommand = (chatId: bigint, mention: string, nonce: string): Update => {
+  const startCommand = (
+    chatId: bigint,
+    mention: string,
+    nonce: string,
+    type: 'group' | 'supergroup' = 'supergroup',
+  ): Update => {
     const command = `/start@${mention}`;
     return {
       update_id: freshUpdateId(),
       message: {
         message_id: 1,
         date: now(),
-        chat: { id: Number(chatId), type: 'supergroup', title: `B1 group ${chatId}` },
+        chat: { id: Number(chatId), type, title: `B1 group ${chatId}` },
         from: OWNER,
         text: `${command} ${nonce}`,
         entities: [{ type: 'bot_command', offset: 0, length: command.length }],
@@ -945,5 +954,162 @@ describe('Staff and feed groups (integration)', () => {
     expect(live.nonceHash).toBe(createHash('sha256').update(again).digest('hex'));
     expect(live.usedAt).toBeNull();
     expect(await rowOf(operator.id)).toMatchObject({ status: 'ACTIVE', adminChatId: second });
+  });
+
+  describe('a link belongs to the first group that presents it', () => {
+    const OTHER_GROUP_REPLY =
+      'This link was opened in another group. Create a new one from the console.';
+
+    const linkOf = (operator: Operator) =>
+      prisma.telegramChatBindLink.findFirstOrThrow({
+        where: { tenantId: operator.id },
+        orderBy: { createdAt: 'desc' },
+      });
+
+    const refusalsOf = async (operator: Operator) =>
+      (await audits(operator.id, 'tenant.telegramChat.bindRefused')).map(
+        (row) => (row.after as { $meta?: Record<string, unknown> } | null)?.$meta,
+      );
+
+    it('refuses a link refused on chat grounds when a member replays it from a group they control, and the first group still binds once fixed', async () => {
+      const operator = await createOperator('pin-refused');
+      const group = newGroup();
+      const intruder = newGroup();
+      botIn(operator, group, 'member');
+      botIn(operator, intruder, 'administrator');
+      const { nonce } = await issueLink(operator);
+
+      // Refused on chat grounds: nothing bound, the link not used up, and pinned to this group.
+      await deliver(operator, startCommand(group, operator.username, nonce));
+      expect((await rowOf(operator.id)).adminChatId).toBe(0n);
+      expect(await linkOf(operator)).toMatchObject({ usedAt: null, pinnedChatId: group });
+
+      // Every member of that group read the nonce. Typed in a group where the bot is an administrator:
+      await deliver(operator, startCommand(intruder, operator.username, nonce));
+      expect((await rowOf(operator.id)).adminChatId).toBe(0n);
+      expect(sentTo(operator, intruder)).toEqual([expect.stringContaining(OTHER_GROUP_REPLY)]);
+      expect(await linkOf(operator)).toMatchObject({ usedAt: null, pinnedChatId: group });
+
+      // The owner fixes the bot's rights and opens the link again in the first group.
+      botIn(operator, group, 'administrator');
+      await deliver(operator, startCommand(group, operator.username, nonce));
+      expect((await rowOf(operator.id)).adminChatId).toBe(group);
+      const link = await linkOf(operator);
+      expect(link).toMatchObject({ usedChatId: group, pinnedChatId: group });
+
+      expect(await refusalsOf(operator)).toEqual([
+        expect.objectContaining({ reason: 'BOT_NOT_ADMIN', chatId: group.toString() }),
+        expect.objectContaining({
+          reason: 'LINK_OTHER_CHAT',
+          purpose: 'STAFF',
+          chatId: intruder.toString(),
+          via: 'startgroup',
+          linkId: link.id,
+          telegramUserId: String(OWNER.id),
+        }),
+      ]);
+      expect(
+        JSON.stringify(await audits(operator.id, 'tenant.telegramChat.bindRefused')),
+      ).not.toContain(nonce);
+    });
+
+    it('refuses a link opened in the group already bound when it is replayed from another group: the staff group and its cards stay', async () => {
+      const operator = await createOperator('pin-bound');
+      const staff = newGroup();
+      botIn(operator, staff, 'administrator');
+      await putChat(operator, 'STAFF', staff).expect(200);
+      await api()
+        .post(`/v1/admin/tenants/${operator.id}/activate`)
+        .set('authorization', platformBearer)
+        .expect(200);
+      const waiting = await seedDeposit(operator.id, DepositStatus.SUBMITTED);
+
+      const { nonce } = await issueLink(operator);
+      await deliver(operator, startCommand(staff, operator.username, nonce));
+      expect(sentTo(operator, staff).at(-1)).toContain('already the staff group');
+
+      const intruder = newGroup();
+      botIn(operator, intruder, 'administrator');
+      await deliver(operator, startCommand(intruder, operator.username, nonce));
+
+      expect(await rowOf(operator.id)).toMatchObject({ status: 'ACTIVE', adminChatId: staff });
+      expect((await queuedCards()).map((job) => job.data.depositRequestId)).not.toContain(waiting);
+      expect(sentTo(operator, intruder)).toEqual([expect.stringContaining(OTHER_GROUP_REPLY)]);
+      expect(await audits(operator.id, 'tenant.telegramChat.bound')).toHaveLength(1);
+      expect((await refusalsOf(operator)).map((meta) => meta?.['reason'])).toEqual([
+        'LINK_OTHER_CHAT',
+      ]);
+      expect(await linkOf(operator)).toMatchObject({ usedAt: null, pinnedChatId: staff });
+
+      // The bound group still hears it is bound.
+      const repliesBefore = sentTo(operator, staff).length;
+      await deliver(operator, startCommand(staff, operator.username, nonce));
+      expect(sentTo(operator, staff)).toHaveLength(repliesBefore + 1);
+      expect(sentTo(operator, staff).at(-1)).toContain('already the staff group');
+    });
+
+    it('lets exactly one of several groups racing for one unpinned link have it', async () => {
+      const operator = await createOperator('pin-race');
+      // Four, not more: the contention that matters is several chats on ONE row, which four make as
+      // well as forty, and DB_POOL_MAX is 5 here — a wider race would queue on connections instead.
+      const groups = Array.from({ length: 4 }, () => newGroup());
+      for (const group of groups) botIn(operator, group, 'administrator');
+      const { nonce } = await issueLink(operator);
+      const nonceHash = createHash('sha256').update(nonce).digest('hex');
+      const bindings = ctx.app.get(ChatBindingService);
+
+      // Straight into the service and all at once, so the only thing between them is the pin.
+      const outcomes = await Promise.all(
+        groups.map((group) =>
+          ctx.inTenant(
+            () =>
+              bindings.bindFromStartGroup(
+                operator.id,
+                startCommand(group, operator.username, nonce).message as Message,
+                nonceHash,
+              ),
+            operator.id,
+          ),
+        ),
+      );
+
+      expect(outcomes.filter((outcome) => outcome === 'bound')).toHaveLength(1);
+      const winner = groups[outcomes.indexOf('bound')];
+      expect(await linkOf(operator)).toMatchObject({ pinnedChatId: winner, usedChatId: winner });
+      expect((await rowOf(operator.id)).adminChatId).toBe(winner);
+      expect((await refusalsOf(operator)).map((meta) => meta?.['reason'])).toEqual(
+        Array.from({ length: groups.length - 1 }, () => 'LINK_OTHER_CHAT'),
+      );
+      expect(await audits(operator.id, 'tenant.telegramChat.bound')).toHaveLength(1);
+    });
+
+    it('moves the pin when the group becomes a supergroup as the bot is promoted, so the owner can still open the link there', async () => {
+      const operator = await createOperator('pin-migrate');
+      const basic = newGroup();
+      const supergroup = newGroup();
+      botIn(operator, basic, 'member', 'group');
+      const { nonce } = await issueLink(operator);
+
+      await deliver(operator, startCommand(basic, operator.username, nonce, 'group'));
+      expect(await linkOf(operator)).toMatchObject({ usedAt: null, pinnedChatId: basic });
+
+      // Promoting the bot with custom rights turns the basic group into a supergroup with a new id.
+      telegram.migrateChat(basic, supergroup);
+      telegram.setBotMember(operator.token, supergroup, { status: 'administrator' });
+      await deliver(operator, {
+        update_id: freshUpdateId(),
+        message: {
+          message_id: 3,
+          date: now(),
+          chat: { id: Number(basic), type: 'group', title: 'B1 basic' },
+          migrate_to_chat_id: Number(supergroup),
+        },
+      } as unknown as Update);
+      expect(await linkOf(operator)).toMatchObject({ usedAt: null, pinnedChatId: supergroup });
+
+      await deliver(operator, startCommand(supergroup, operator.username, nonce));
+      expect((await rowOf(operator.id)).adminChatId).toBe(supergroup);
+      expect((await refusalsOf(operator)).map((meta) => meta?.['reason'])).toEqual(['BOT_NOT_ADMIN']);
+    });
   });
 });
