@@ -56,9 +56,10 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      # src/core/file/image.util.spec.ts exercises sharp on real images. It times out on the Windows
-      # development laptop; it is NOT skipped here. sharp ships prebuilt linux-x64 binaries, so it is
-      # expected to pass on this runner — if it fails here too, that is a finding, not noise.
+      # src/core/file/image.util.spec.ts exercises sharp on real images, and its 5-megapixel fixture
+      # carries a 30 s timeout of its own: Jest's 5 s default is a bound on the machine, and this job
+      # gates image and deploy. Nothing is skipped here — sharp ships prebuilt linux-x64 binaries, so
+      # a failure on this runner is a finding, not noise.
       - name: Unit tests
         run: npm test
 

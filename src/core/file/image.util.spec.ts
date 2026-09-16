@@ -47,14 +47,28 @@ async function makeImage(
   return options.format === 'png' ? pipeline.png().toBuffer() : pipeline.jpeg().toBuffer();
 }
 
+/**
+ * Jest's 5 s default is a bound on the MACHINE, not on the code. The fixture below is 5 megapixels
+ * (3200×1600), and normalizing it is a real libvips decode, resize and re-encode plus the JS loop
+ * that paints it: well under a second on an idle box, and over 5 s on a loaded runner — it has timed
+ * out on untouched commits, so it is a timing flake and not a regression. The `verify` job gates the
+ * image and deploy jobs, so that flake can redden a deploy at random. Nothing below is asserted any
+ * less strictly; the test is only given the time the work actually takes.
+ */
+const SHARP_TIMEOUT_MS = 30_000;
+
 describe('normalizeImage', () => {
-  it('downscales the long edge to MAX_IMAGE_DIMENSION and keeps the aspect ratio', async () => {
-    const normalized = await normalizeImage(await makeImage(3200, 1600));
-    expect(normalized.width).toBe(MAX_IMAGE_DIMENSION);
-    expect(normalized.height).toBe(MAX_IMAGE_DIMENSION / 2);
-    expect(normalized.mimeType).toBe(NORMALIZED_MIME_TYPE);
-    expect(normalized.sourceWidth).toBe(3200);
-  });
+  it(
+    'downscales the long edge to MAX_IMAGE_DIMENSION and keeps the aspect ratio',
+    async () => {
+      const normalized = await normalizeImage(await makeImage(3200, 1600));
+      expect(normalized.width).toBe(MAX_IMAGE_DIMENSION);
+      expect(normalized.height).toBe(MAX_IMAGE_DIMENSION / 2);
+      expect(normalized.mimeType).toBe(NORMALIZED_MIME_TYPE);
+      expect(normalized.sourceWidth).toBe(3200);
+    },
+    SHARP_TIMEOUT_MS,
+  );
 
   it('never upscales a small receipt', async () => {
     const normalized = await normalizeImage(await makeImage(320, 200));
