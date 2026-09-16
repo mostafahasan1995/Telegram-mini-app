@@ -9,11 +9,16 @@
  * identical and silently asserts nothing. That is not hypothetical: the shared dev container this
  * project was built against has all 21 tables and zero of these triggers.
  *
- * WHY one container per JEST WORKER rather than per file or per suite: starting Postgres costs
- * seconds and truncating costs milliseconds. Jest runs each worker in its own process, so a
- * module-level singleton is exactly "one per worker" — files in the same worker share it, and
- * workers never share state with each other. `truncateAll()` between tests is what keeps them
- * isolated.
+ * WHY a module-level singleton rather than a container per test: starting Postgres costs
+ * seconds and truncating costs milliseconds, so `truncateAll()` between tests is what keeps
+ * tests isolated.
+ *
+ * WHAT IT SPANS — ONE CONTAINER PER SUITE, NOT PER WORKER: Jest gives every test FILE a fresh
+ * module registry, so each file that calls `startPostgres()` gets its own `handle`, and its own
+ * container, even at `maxWorkers: 1`. Workers never share state either way. So a suite that
+ * never calls `stopPostgres()` leaves its container running until the process exits, and the
+ * integration job pays for one container per suite — which is why that job's timeout is set the
+ * way it is (.github/workflows/ci.yml).
  *
  * The `ichancy_app` role is created before 003 runs so the least-privilege grants are actually
  * exercised. Tests connect as the OWNER by default (they need to truncate); `appUrl` is there for
