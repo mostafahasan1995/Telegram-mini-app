@@ -46,16 +46,33 @@ describe('proxy URL helpers', () => {
     ).toBe('http://p:3128');
   });
 
-  it('relayUpstreamFrom carries host/port/tls and the pre-emptive Basic header', () => {
+  it('relayUpstreamFrom carries host/port/tls/mode and the pre-emptive Basic header', () => {
     expect(relayUpstreamFrom({ server: 'https://p:8443', username: 'u', password: 'pw' })).toEqual({
+      mode: 'http-connect',
       host: 'p',
       port: 8443,
       tls: true,
       auth: basicAuthHeader('u', 'pw'),
+      username: 'u',
+      password: 'pw',
     });
     expect(relayUpstreamFrom({ server: 'http://p:3128', username: 'u', password: 'pw' }).tls).toBe(
       false,
     );
+  });
+
+  it('relayUpstreamFrom maps socks5 to the RFC 1929 mode with carried credentials', () => {
+    expect(
+      relayUpstreamFrom({ server: 'socks5://exit.example:1080', username: 'res', password: 'k3y' }),
+    ).toEqual({
+      mode: 'socks5',
+      host: 'exit.example',
+      port: 1080,
+      tls: false,
+      auth: '',
+      username: 'res',
+      password: 'k3y',
+    });
   });
 });
 
@@ -123,6 +140,98 @@ function fakeUpstreamProxy(): Promise<{
   });
 }
 
+/**
+ * A stand-in credentialed SOCKS5 upstream. It always demands the RFC 1929 username/password
+ * sub-negotiation (when `acceptAuth`), records the credentials and the CONNECT target, answers the
+ * tunnel, and then echoes tunnelled bytes — enough to prove the relay authenticates and splices.
+ */
+function fakeSocks5Proxy(acceptAuth = true): Promise<{
+  port: number;
+  credentials: Promise<{ user: string; pass: string }>;
+  target: Promise<{ host: string; port: number }>;
+  close: () => void;
+}> {
+  let resolveCredentials: (value: { user: string; pass: string }) => void;
+  let resolveTarget: (value: { host: string; port: number }) => void;
+  const credentials = new Promise<{ user: string; pass: string }>((resolve) => {
+    resolveCredentials = resolve;
+  });
+  const target = new Promise<{ host: string; port: number }>((resolve) => {
+    resolveTarget = resolve;
+  });
+
+  const server = net.createServer((socket: net.Socket) => {
+    let input = Buffer.alloc(0);
+    let stage: 'greeting' | 'auth' | 'request' = 'greeting';
+    const onData = (chunk: Buffer): void => {
+      input = Buffer.concat([input, chunk]);
+      for (;;) {
+        if (stage === 'greeting') {
+          if (input.length < 2) break;
+          const nmethods = input.readUInt8(1);
+          if (input.length < 2 + nmethods) break;
+          input = input.subarray(2 + nmethods);
+          socket.write(Buffer.from([0x05, 0x02]));
+          stage = 'auth';
+          continue;
+        }
+        if (stage === 'auth') {
+          if (input.length < 2) break;
+          const ulen = input.readUInt8(1);
+          if (input.length < 2 + ulen + 1) break;
+          const plen = input.readUInt8(2 + ulen);
+          if (input.length < 2 + ulen + 1 + plen) break;
+          const user = input.subarray(2, 2 + ulen).toString('utf8');
+          const pass = input.subarray(2 + ulen + 1, 2 + ulen + 1 + plen).toString('utf8');
+          input = input.subarray(2 + ulen + 1 + plen);
+          resolveCredentials({ user, pass });
+          socket.write(Buffer.from([0x01, acceptAuth ? 0x00 : 0x01]));
+          stage = 'request';
+          continue;
+        }
+        if (stage === 'request') {
+          if (input.length < 4) break;
+          const atyp = input.readUInt8(3);
+          if (atyp === 0x03 && input.length < 5) break;
+          const addrLen = atyp === 0x01 ? 4 : atyp === 0x04 ? 16 : input.readUInt8(4);
+          const addrStart = atyp === 0x03 ? 5 : 4;
+          if (input.length < addrStart + addrLen + 2) break;
+          const host =
+            atyp === 0x03
+              ? input.subarray(addrStart, addrStart + addrLen).toString('utf8')
+              : input.subarray(addrStart, addrStart + addrLen).toString('hex');
+          const port = input.readUInt16BE(addrStart + addrLen);
+          const addr = input.subarray(addrStart, addrStart + addrLen);
+          input = input.subarray(addrStart + addrLen + 2);
+          resolveTarget({ host, port });
+          // RFC 1928: for ATYP 0x03 the reply's BND.ADDR carries the same 1-byte length prefix the
+          // request address did — a reply without it would stall a standards-conformant client.
+          const boundAddr = atyp === 0x03 ? Buffer.concat([Buffer.from([addrLen]), addr]) : addr;
+          socket.write(
+            Buffer.concat([
+              Buffer.from([0x05, 0x00, 0x00, atyp]),
+              boundAddr,
+              Buffer.from([(port >> 8) & 0xff, port & 0xff]),
+            ]),
+          );
+          socket.removeListener('data', onData);
+          socket.on('data', (payload: Buffer) => socket.write(payload));
+          return;
+        }
+        break;
+      }
+    };
+    socket.on('data', onData);
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address() as net.AddressInfo;
+      resolve({ port: address.port, credentials, target, close: () => server.close() });
+    });
+  });
+}
+
 describe('startProxyRelay — the CONNECT auth injection', () => {
   let relay: ProxyRelay | null = null;
   let upstream: Awaited<ReturnType<typeof fakeUpstreamProxy>> | null = null;
@@ -137,7 +246,15 @@ describe('startProxyRelay — the CONNECT auth injection', () => {
   it('injects the upstream Basic auth on the CONNECT and then tunnels bytes both ways', async () => {
     upstream = await fakeUpstreamProxy();
     const auth = basicAuthHeader('exit', 'sekret');
-    relay = await startProxyRelay({ host: upstream.host, port: upstream.port, tls: false, auth });
+    relay = await startProxyRelay({
+      mode: 'http-connect',
+      host: upstream.host,
+      port: upstream.port,
+      tls: false,
+      auth,
+      username: 'exit',
+      password: 'sekret',
+    });
 
     const client = net.connect(relay.port, '127.0.0.1');
     const clientData: Buffer[] = [];
@@ -186,10 +303,13 @@ describe('startProxyRelay — the CONNECT auth injection', () => {
       });
     });
     relay = await startProxyRelay({
+      mode: 'http-connect',
       host: '127.0.0.1',
       port: denier.port,
       tls: false,
       auth: basicAuthHeader('u', 'p'),
+      username: 'u',
+      password: 'p',
     });
 
     const client = net.connect(relay.port, '127.0.0.1');
@@ -202,5 +322,75 @@ describe('startProxyRelay — the CONNECT auth injection', () => {
 
     expect(seen).toContain('502');
     denier.close();
+  });
+
+  it('fronts a credentialed SOCKS5 upstream: RFC 1929 auth then a tunnel to the CONNECT target', async () => {
+    const socks = await fakeSocks5Proxy();
+    relay = await startProxyRelay({
+      mode: 'socks5',
+      host: '127.0.0.1',
+      port: socks.port,
+      tls: false,
+      auth: '',
+      username: 'res',
+      password: 'k3y',
+    });
+
+    const client = net.connect(relay.port, '127.0.0.1');
+    const clientData: Buffer[] = [];
+    client.on('data', (chunk: Buffer) => clientData.push(chunk));
+
+    await new Promise<void>((resolve) => client.on('connect', () => resolve()));
+    client.write('CONNECT agents.ichancy.com:443 HTTP/1.1\r\nHost: agents.ichancy.com:443\r\n\r\n');
+
+    await new Promise<void>((resolve) => {
+      const check = (): void => {
+        if (Buffer.concat(clientData).toString('latin1').includes('200')) resolve();
+        else client.once('data', check);
+      };
+      client.once('data', check);
+    });
+
+    // The relay must have performed the RFC 1929 sub-negotiation with the configured credentials…
+    expect(await socks.credentials).toEqual({ user: 'res', pass: 'k3y' });
+    // …and forwarded exactly the client's CONNECT target inside the SOCKS5 CONNECT request.
+    expect(await socks.target).toEqual({ host: 'agents.ichancy.com', port: 443 });
+
+    // And the tunnel is live end to end through the SOCKS5 hop.
+    const echoed = new Promise<string>((resolve) => {
+      client.on('data', () => {
+        const seen = Buffer.concat(clientData).toString('latin1');
+        if (seen.includes('socks-ping')) resolve(seen);
+      });
+    });
+    client.write('socks-ping');
+    expect(await echoed).toContain('socks-ping');
+
+    client.destroy();
+    socks.close();
+  });
+
+  it('answers 502 when the SOCKS5 upstream rejects the credentials', async () => {
+    const socks = await fakeSocks5Proxy(false);
+    relay = await startProxyRelay({
+      mode: 'socks5',
+      host: '127.0.0.1',
+      port: socks.port,
+      tls: false,
+      auth: '',
+      username: 'res',
+      password: 'wrong',
+    });
+
+    const client = net.connect(relay.port, '127.0.0.1');
+    const seen = await new Promise<string>((resolve) => {
+      const chunks: Buffer[] = [];
+      client.on('connect', () => client.write('CONNECT x:443 HTTP/1.1\r\nHost: x:443\r\n\r\n'));
+      client.on('data', (chunk: Buffer) => chunks.push(chunk));
+      client.on('close', () => resolve(Buffer.concat(chunks).toString('latin1')));
+    });
+
+    expect(seen).toContain('502');
+    socks.close();
   });
 });

@@ -14,8 +14,13 @@
  * CONNECT it opens to the real proxy. Chromium never sees a 407. The in-page signin POST then
  * returned real Ichancy JSON (HTTP 401 for dummy creds) through the edge instead of the block page.
  *
+ * The same relay also front-ends a CREDENTIALED SOCKS5 proxy (RFC 1928 + RFC 1929 username/password
+ * sub-negotiation). Chromium speaks plain SOCKS5 without auth natively, but it has NO support for
+ * SOCKS5 authentication — a credentialed SOCKS5 upstream therefore fails inside the browser unless
+ * the relay terminates the auth handshake for it.
+ *
  * undici's ProxyAgent (the fetch transport) needs none of this — it handles proxy Basic auth from
- * the URL itself. This relay is only for Chromium.
+ * the URL itself and ships its own SOCKS5 client. This relay is only for Chromium.
  */
 import * as net from 'node:net';
 import * as tls from 'node:tls';
@@ -73,23 +78,36 @@ export async function createProxyDispatcher(proxy: ProxySettings | null): Promis
   return new ProxyAgent(authenticatedProxyUrl(proxy));
 }
 
-/** The upstream a relay tunnels to. `auth` is the whole `Basic <base64>` header value. */
+/** How the relay talks to the upstream proxy. */
+export type RelayMode = 'http-connect' | 'socks5';
+
+/** The upstream a relay tunnels to. `auth` is the whole `Basic <base64>` header value (connect mode). */
 export interface RelayUpstream {
+  readonly mode: RelayMode;
   readonly host: string;
   readonly port: number;
   /** true when the proxy URL scheme is https (TLS to the proxy itself); false for plain http. */
   readonly tls: boolean;
+  /** http-connect only: the pre-emptive `Proxy-Authorization` header value. */
   readonly auth: string;
+  /** socks5 only: the RFC 1929 username (empty when the proxy needs none). */
+  readonly username: string;
+  /** socks5 only: the RFC 1929 password (empty when the proxy needs none). */
+  readonly password: string;
 }
 
 /** Build the relay upstream from the proxy settings; the credentials become a pre-emptive header. */
 export function relayUpstreamFrom(proxy: ProxySettings): RelayUpstream {
   const parsed = parseProxyServer(proxy.server);
+  const socks5 = parsed.scheme === 'socks5';
   return {
+    mode: socks5 ? 'socks5' : 'http-connect',
     host: parsed.host,
     port: parsed.port,
     tls: parsed.scheme === 'https',
-    auth: basicAuthHeader(proxy.username ?? '', proxy.password ?? ''),
+    auth: socks5 ? '' : basicAuthHeader(proxy.username ?? '', proxy.password ?? ''),
+    username: proxy.username ?? '',
+    password: proxy.password ?? '',
   };
 }
 
@@ -168,10 +186,205 @@ export function startProxyRelay(up: RelayUpstream): Promise<ProxyRelay> {
 
 /**
  * Open the authenticated tunnel to the upstream proxy for one client CONNECT, and — once the proxy
- * answers 200 — splice the two sockets together. Any failure closes both sides; the client is told
+ * answers — splice the two sockets together. Any failure closes both sides; the client is told
  * with a 502 only while it is still expecting the CONNECT reply.
  */
 function openUpstream(
+  client: net.Socket,
+  target: string,
+  up: RelayUpstream,
+  track: (socket: net.Socket) => void,
+): void {
+  if (up.mode === 'socks5') {
+    openSocks5Upstream(client, target, up, track);
+    return;
+  }
+  openHttpConnectUpstream(client, target, up, track);
+}
+
+/** RFC 1928 constants. */
+const SOCKS5_METHOD_NO_AUTH = 0x00;
+const SOCKS5_METHOD_USER_PASS = 0x02;
+const SOCKS5_METHOD_NONE = 0xff;
+const SOCKS5_CMD_CONNECT = 0x01;
+const SOCKS5_ATYP_IPV4 = 0x01;
+const SOCKS5_ATYP_DOMAIN = 0x03;
+const SOCKS5_ATYP_IPV6 = 0x04;
+
+/** Parse a CONNECT target (`host:port`, `[v6]:port`) into host + port, or null when malformed. */
+function splitTarget(target: string): { host: string; port: number } | null {
+  const trimmed = target.trim();
+  if (trimmed.length === 0) return null;
+  let host: string;
+  let portRaw: string;
+  if (trimmed.startsWith('[')) {
+    const close = trimmed.indexOf(']');
+    if (close === -1) return null;
+    host = trimmed.slice(1, close);
+    portRaw = trimmed.slice(close + 1);
+    if (!portRaw.startsWith(':')) return null;
+    portRaw = portRaw.slice(1);
+  } else {
+    const colon = trimmed.lastIndexOf(':');
+    if (colon === -1) return null;
+    host = trimmed.slice(0, colon);
+    portRaw = trimmed.slice(colon + 1);
+  }
+  const port = Number(portRaw);
+  if (host.length === 0 || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return { host, port };
+}
+
+/** Build the SOCKS5 CONNECT request (atyp: IPv4 literal, IPv6 literal, or domain name). */
+function socks5ConnectRequest(host: string, port: number): Buffer | null {
+  const parts: number[] = [0x05, SOCKS5_CMD_CONNECT, 0x00];
+  const ipVersion = net.isIP(host);
+  if (ipVersion === 4) {
+    parts.push(SOCKS5_ATYP_IPV4, ...host.split('.').map((part) => Number(part)));
+  } else if (ipVersion === 6) {
+    // No ripe IPv6 literals in practice (targets are hostnames); sent as a domain string. Most
+    // residential proxies resolve it or reject it the same way they would reject a bad name.
+    parts.push(SOCKS5_ATYP_DOMAIN, host.length, ...Buffer.from(host, 'utf8'));
+  } else {
+    const label = Buffer.from(host, 'utf8');
+    if (label.length === 0 || label.length > 255) return null;
+    parts.push(SOCKS5_ATYP_DOMAIN, label.length, ...label);
+  }
+  parts.push((port >> 8) & 0xff, port & 0xff);
+  return Buffer.from(parts);
+}
+
+/**
+ * Front a CREDENTIALED SOCKS5 upstream. Performs the RFC 1928 method selection and, when the proxy
+ * demands it, the RFC 1929 username/password sub-negotiation, then a CONNECT request for the
+ * client's target. On success the bytes are spliced exactly like the HTTP CONNECT path.
+ */
+function openSocks5Upstream(
+  client: net.Socket,
+  target: string,
+  up: RelayUpstream,
+  track: (socket: net.Socket) => void,
+): void {
+  const upstream = net.connect(up.port, up.host);
+  track(upstream);
+
+  let settled = false;
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    client.destroy();
+    upstream.destroy();
+  }, CONNECT_TIMEOUT_MS);
+
+  const fail = (): void => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    client.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    upstream.destroy();
+  };
+
+  const decided = splitTarget(target);
+  if (decided === null) {
+    upstream.destroy();
+    fail();
+    return;
+  }
+  const hasAuth = up.username.length > 0 || up.password.length > 0;
+
+  let input = Buffer.alloc(0);
+  type Stage = 'greeting' | 'auth' | 'request';
+  let stage: Stage = 'greeting';
+
+  const sendRequest = (): void => {
+    const request = socks5ConnectRequest(decided.host, decided.port);
+    if (request === null) {
+      fail();
+      return;
+    }
+    upstream.write(request);
+    stage = 'request';
+  };
+
+  const onData = (chunk: Buffer): void => {
+    if (settled) return;
+    input = Buffer.concat([input, chunk]);
+
+    while (!settled) {
+      if (stage === 'greeting') {
+        // Reply: [version, method]
+        if (input.length < 2) return;
+        const version = input[0];
+        const method = input[1];
+        input = input.subarray(2);
+        if (version !== 0x05 || method === SOCKS5_METHOD_NONE) return fail();
+        if (method === SOCKS5_METHOD_NO_AUTH) {
+          sendRequest();
+          continue;
+        }
+        if (method === SOCKS5_METHOD_USER_PASS) {
+          const user = Buffer.from(up.username, 'utf8');
+          const pass = Buffer.from(up.password, 'utf8');
+          if (user.length > 255 || pass.length > 255) return fail();
+          upstream.write(Buffer.from([0x01, user.length, ...user, pass.length, ...pass]));
+          stage = 'auth';
+          continue;
+        }
+        return fail();
+      }
+      if (stage === 'auth') {
+        // Reply: [version, status]
+        if (input.length < 2) return;
+        const status = input[1];
+        input = input.subarray(2);
+        if (status !== 0x00) return fail();
+        sendRequest();
+        continue;
+      }
+      // Reply: [ver, rep, rsv, atyp, addr, port]
+      if (input.length < 4) return;
+      const version = input[0];
+      const rep = input[1];
+      const atyp = input[3];
+      if (version !== 0x05) return fail();
+      let need = 4; // ver + rep + rsv + atyp
+      if (atyp === SOCKS5_ATYP_IPV4) need += 4;
+      else if (atyp === SOCKS5_ATYP_IPV6) need += 16;
+      else if (atyp === SOCKS5_ATYP_DOMAIN) {
+        if (input.length < 5) return;
+        need += 1 + input.readUInt8(4);
+      } else return fail();
+      need += 2; // port
+      if (input.length < need) return;
+      const leftover = input.subarray(need);
+      if (rep !== 0x00) return fail();
+      settled = true;
+      clearTimeout(timer);
+      upstream.removeListener('data', onData);
+      client.write('HTTP/1.1 200 Connection established\r\n\r\n');
+      if (leftover.length > 0) client.write(leftover);
+      upstream.pipe(client);
+      client.pipe(upstream);
+      return;
+    }
+  };
+
+  upstream.once('connect', () => {
+    const greeting = hasAuth
+      ? Buffer.from([0x05, 0x02, SOCKS5_METHOD_USER_PASS, SOCKS5_METHOD_NO_AUTH])
+      : Buffer.from([0x05, 0x01, SOCKS5_METHOD_NO_AUTH]);
+    upstream.write(greeting);
+  });
+  upstream.on('data', onData);
+  upstream.on('error', () => {
+    if (settled) client.destroy();
+    else fail();
+  });
+  client.on('error', () => upstream.destroy());
+}
+
+/** HTTP CONNECT path: inject the upstream `Proxy-Authorization` pre-emptively (see File header). */
+function openHttpConnectUpstream(
   client: net.Socket,
   target: string,
   up: RelayUpstream,

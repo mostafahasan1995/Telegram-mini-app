@@ -457,10 +457,13 @@ describe('BrowserIchancyTransport — proxy egress', () => {
     // The relay was asked to tunnel to the real upstream, with the credentials as a pre-emptive
     // Basic header — the thing headless Chromium cannot do itself on the CONNECT.
     expect(transport.relayUpstream).toEqual({
+      mode: 'http-connect',
       host: 'proxy.example',
       port: 3128,
       tls: false,
       auth: basicAuthHeader('exit', 's3cr3t!@:pass'),
+      username: 'exit',
+      password: 's3cr3t!@:pass',
     });
     // Chromium is pointed at the local relay, and NEVER given the username/password — that is the
     // whole point: the dead launch-proxy-auth path is not taken.
@@ -484,6 +487,35 @@ describe('BrowserIchancyTransport — proxy egress', () => {
 
     expect(transport.relayUpstream?.tls).toBe(true);
     expect(transport.relayUpstream?.port).toBe(8443);
+  });
+
+  it('a CREDENTIALED socks5 proxy goes through the relay (RFC 1929), never straight to Chromium', async () => {
+    // Chromium has zero SOCKS5 authentication support; a credentialed `socks5://` must be handled
+    // by the relay or it dies with ERR_PROXY_CONNECTION_FAILED on the Indian residential egress.
+    const harness = new FakeHarness();
+    harness.responses = [JSON_OK];
+    const transport = build(harness, 8_000, {
+      server: 'socks5://exit.example:1080',
+      username: 'res',
+      password: 'k3y',
+    });
+
+    await post(transport);
+
+    expect(transport.relayUpstream).toEqual({
+      mode: 'socks5',
+      host: 'exit.example',
+      port: 1080,
+      tls: false,
+      auth: '',
+      username: 'res',
+      password: 'k3y',
+    });
+    const proxy = launchProxy(harness);
+    expect(proxy).toEqual({ server: 'http://127.0.0.1:54321' });
+    expect(proxy).not.toHaveProperty('username');
+    expect(proxy).not.toHaveProperty('password');
+    expect(transport.logged.join(' ')).toContain('proxy exit.example:1080 via local relay');
   });
 
   it('NEVER prints the proxy password — not in describeTransport, not in any log', async () => {
