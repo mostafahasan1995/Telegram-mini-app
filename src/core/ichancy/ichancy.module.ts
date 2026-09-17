@@ -38,6 +38,7 @@ import { IchancySessionService } from './ichancy-session.service';
 import { ICHANCY_SESSION_STORE, RedisIchancySessionStore } from './ichancy-session.store';
 import { ICHANCY_PORT, type IchancyPort } from './ichancy.port';
 import { IchancyCheckCommand } from './commands/ichancy-check.command';
+import { IchancyProbeCommand } from './commands/ichancy-probe.command';
 import { TenantIchancyAgentResolver } from './tenant-ichancy-agent.resolver';
 import { BrowserIchancyTransport } from './transport/browser.transport';
 import { CookieHarvesterService } from './transport/cookie-harvester.service';
@@ -137,6 +138,10 @@ const transportProvider: Provider = {
     // A read-only diagnostic; nest-commander only instantiates it when main.cli.ts drives the app,
     // exactly as TelegramModule carries webhook:set and bot:setup.
     IchancyCheckCommand,
+    // Egress audit for the Cloudflare-BLOCKED case: it dials out and says whether the configured
+    // proxy exits clean, exits blocked, or is unreachable. Registered with the others so it runs in
+    // the api/worker images (and tools-backend: it needs no Chromium — undici only).
+    IchancyProbeCommand,
   ],
   exports: [
     ICHANCY_PORT,

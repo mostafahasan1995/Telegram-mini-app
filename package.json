@@ -33,8 +33,9 @@
     "webhook:set": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts webhook:set",
     "tunnel:sync": "ts-node -r tsconfig-paths/register scripts/tunnel-sync.ts",
     "bot:setup": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts bot:setup",
-    "ichancy:check": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts ichancy:check",
-    "ichancy:check:signin": "cross-env APP_ROLE=worker ts-node -r tsconfig-paths/register src/main.cli.ts ichancy:check",
+"ichancy:check": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts ichancy:check",
+  "ichancy:check:signin": "cross-env APP_ROLE=worker ts-node -r tsconfig-paths/register src/main.cli.ts ichancy:check",
+  "ichancy:probe": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts ichancy:probe",
     "player:register": "cross-env APP_ROLE=api ts-node -r tsconfig-paths/register src/main.cli.ts player:register"
   },
   "dependencies": {
