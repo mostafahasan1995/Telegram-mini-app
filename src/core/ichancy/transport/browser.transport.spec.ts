@@ -19,11 +19,17 @@
 import { type AppConfigService } from '@core/config/config.service';
 
 import { classifyTransportFailure } from '../error-map';
-import { BrowserIchancyTransport, looksChallenged } from './browser.transport';
+import { BrowserIchancyTransport, looksBlocked, looksChallenged } from './browser.transport';
 import { type IchancyTransportResponse } from './ichancy-transport';
+import { basicAuthHeader, type ProxyRelay, type RelayUpstream } from './proxy-relay';
 
 const CHALLENGE_HTML =
   '<html><head><title>Just a moment...</title></head><body>cf-browser-verification</body></html>';
+
+/** Cloudflare's TERMINAL block page — never solvable, never replayed. */
+const BLOCK_HTML =
+  '<html><head><title>Attention Required! | Cloudflare</title></head>' +
+  '<body>Sorry, you have been blocked</body></html>';
 
 interface FakeResponse {
   status: number;
@@ -45,6 +51,7 @@ const HEADLESS_UA =
 
 class FakeHarness {
   readonly newContextOptions: Record<string, unknown>[] = [];
+  readonly launchOptions: Record<string, unknown>[] = [];
   readonly fetchScripts: string[] = [];
   gotoCalls = 0;
   closeCalls = 0;
@@ -62,9 +69,14 @@ class FakeHarness {
   reportedUserAgent = HEADLESS_UA;
   /** Cookies the "context" reports; a cf_clearance is what solveChallenge waits for. */
   clearance = 'granted';
+  /** What `page.content()` returns — solveChallenge reads it to spot a terminal block. Benign by default. */
+  pageContent = '<html><body>agent panel</body></html>';
 
   readonly chromium = {
-    launch: (): Promise<unknown> => Promise.resolve(this.browser),
+    launch: (options?: Record<string, unknown>): Promise<unknown> => {
+      this.launchOptions.push(options ?? {});
+      return Promise.resolve(this.browser);
+    },
   };
 
   private readonly page = {
@@ -74,6 +86,7 @@ class FakeHarness {
       return Promise.resolve(null);
     },
     title: (): Promise<string> => Promise.resolve('Agent panel'),
+    content: (): Promise<string> => Promise.resolve(this.pageContent),
     isClosed: (): boolean => false,
     evaluate: (script: string): Promise<unknown> => {
       if (script === 'navigator.userAgent') return Promise.resolve(this.reportedUserAgent);
@@ -114,21 +127,56 @@ class FakeHarness {
   };
 }
 
+interface ProxyConfig {
+  server: string;
+  username: string | null;
+  password: string | null;
+}
+
 /** The seam. Nothing else about the class changes. */
 class TestableTransport extends BrowserIchancyTransport {
+  /** The upstream the relay was asked to tunnel to, or null when no relay was started. */
+  relayUpstream: RelayUpstream | null = null;
+  relayCloseCalls = 0;
+  /** The messages this transport logged, so a test can prove the proxy password never appears. */
+  readonly logged: string[] = [];
+
   constructor(
     config: AppConfigService,
     private readonly harness: FakeHarness,
   ) {
     super(config);
+    const sink = (message: unknown): void => {
+      this.logged.push(String(message));
+    };
+    const logger = (this as unknown as { logger: Record<string, (m: unknown) => void> }).logger;
+    logger.log = sink;
+    logger.warn = sink;
+    logger.error = sink;
+    logger.debug = sink;
   }
 
   protected override loadChromium(): Promise<never> {
     return Promise.resolve(this.harness.chromium) as unknown as Promise<never>;
   }
+
+  protected override startRelay(up: RelayUpstream): Promise<ProxyRelay> {
+    this.relayUpstream = up;
+    const relay: ProxyRelay = {
+      port: 54321,
+      close: () => {
+        this.relayCloseCalls += 1;
+      },
+    };
+    return Promise.resolve(relay);
+  }
 }
 
-function build(harness: FakeHarness, timeoutMs = 8_000): TestableTransport {
+function build(
+  harness: FakeHarness,
+  timeoutMs = 8_000,
+  proxy: ProxyConfig | null = null,
+): TestableTransport {
   const config = {
     ichancy: {
       baseUrl: 'https://agents.ichancy.com',
@@ -136,6 +184,7 @@ function build(harness: FakeHarness, timeoutMs = 8_000): TestableTransport {
       cookie: null,
       userAgent: CONFIGURED_UA,
       timeoutMs,
+      proxy,
     },
   } as unknown as AppConfigService;
   return new TestableTransport(config, harness);
@@ -360,5 +409,200 @@ describe('when Chromium dies mid-call', () => {
     expect(recovered.status).toBe(200);
     expect(harness.gotoCalls).toBeGreaterThan(launchesAfterDeath);
     expect(harness.closeCalls).toBeGreaterThan(0);
+  });
+});
+
+describe('BrowserIchancyTransport — proxy egress', () => {
+  const CREDS = { server: 'http://proxy.example:3128', username: 'exit', password: 's3cr3t!@:pass' };
+
+  const launchProxy = (harness: FakeHarness): Record<string, unknown> | undefined =>
+    harness.launchOptions[0]?.['proxy'] as Record<string, unknown> | undefined;
+
+  it('unset: launches Chromium with NO proxy, exactly as before', async () => {
+    const harness = new FakeHarness();
+    harness.responses = [JSON_OK];
+    const transport = build(harness, 8_000, null);
+
+    await post(transport);
+
+    expect(launchProxy(harness)).toBeUndefined();
+    expect(transport.relayUpstream).toBeNull();
+    expect(transport.describeTransport().proxy).toBeNull();
+  });
+
+  it('proxy WITHOUT credentials: passed straight to chromium.launch, no relay', async () => {
+    const harness = new FakeHarness();
+    harness.responses = [JSON_OK];
+    const transport = build(harness, 8_000, {
+      server: 'socks5://exit.example:1080',
+      username: null,
+      password: null,
+    });
+
+    await post(transport);
+
+    expect(launchProxy(harness)).toEqual({ server: 'socks5://exit.example:1080' });
+    // No relay for a credential-free proxy: Chromium handles it directly.
+    expect(transport.relayUpstream).toBeNull();
+    expect(transport.describeTransport().proxy).toBe('exit.example:1080');
+  });
+
+  it('proxy WITH credentials: starts the relay, launches Chromium at the local relay with NO auth', async () => {
+    const harness = new FakeHarness();
+    harness.responses = [JSON_OK];
+    const transport = build(harness, 8_000, CREDS);
+
+    await post(transport);
+
+    // The relay was asked to tunnel to the real upstream, with the credentials as a pre-emptive
+    // Basic header — the thing headless Chromium cannot do itself on the CONNECT.
+    expect(transport.relayUpstream).toEqual({
+      mode: 'http-connect',
+      host: 'proxy.example',
+      port: 3128,
+      tls: false,
+      auth: basicAuthHeader('exit', 's3cr3t!@:pass'),
+      username: 'exit',
+      password: 's3cr3t!@:pass',
+    });
+    // Chromium is pointed at the local relay, and NEVER given the username/password — that is the
+    // whole point: the dead launch-proxy-auth path is not taken.
+    const proxy = launchProxy(harness);
+    expect(proxy).toEqual({ server: 'http://127.0.0.1:54321' });
+    expect(proxy).not.toHaveProperty('username');
+    expect(proxy).not.toHaveProperty('password');
+    expect(transport.describeTransport().proxy).toBe('proxy.example:3128');
+  });
+
+  it('an https proxy relays over TLS', async () => {
+    const harness = new FakeHarness();
+    harness.responses = [JSON_OK];
+    const transport = build(harness, 8_000, {
+      server: 'https://secure-proxy.example:8443',
+      username: 'u',
+      password: 'p',
+    });
+
+    await post(transport);
+
+    expect(transport.relayUpstream?.tls).toBe(true);
+    expect(transport.relayUpstream?.port).toBe(8443);
+  });
+
+  it('a CREDENTIALED socks5 proxy goes through the relay (RFC 1929), never straight to Chromium', async () => {
+    // Chromium has zero SOCKS5 authentication support; a credentialed `socks5://` must be handled
+    // by the relay or it dies with ERR_PROXY_CONNECTION_FAILED on the Indian residential egress.
+    const harness = new FakeHarness();
+    harness.responses = [JSON_OK];
+    const transport = build(harness, 8_000, {
+      server: 'socks5://exit.example:1080',
+      username: 'res',
+      password: 'k3y',
+    });
+
+    await post(transport);
+
+    expect(transport.relayUpstream).toEqual({
+      mode: 'socks5',
+      host: 'exit.example',
+      port: 1080,
+      tls: false,
+      auth: '',
+      username: 'res',
+      password: 'k3y',
+    });
+    const proxy = launchProxy(harness);
+    expect(proxy).toEqual({ server: 'http://127.0.0.1:54321' });
+    expect(proxy).not.toHaveProperty('username');
+    expect(proxy).not.toHaveProperty('password');
+    expect(transport.logged.join(' ')).toContain('proxy exit.example:1080 via local relay');
+  });
+
+  it('NEVER prints the proxy password — not in describeTransport, not in any log', async () => {
+    const harness = new FakeHarness();
+    harness.responses = [JSON_OK];
+    const transport = build(harness, 8_000, CREDS);
+
+    await post(transport);
+
+    const described = JSON.stringify(transport.describeTransport());
+    expect(described).not.toContain(CREDS.password);
+    expect(described).toContain('proxy.example:3128');
+    for (const line of transport.logged) expect(line).not.toContain(CREDS.password);
+    // The egress WAS announced, host:port only, and said it goes via the relay.
+    expect(transport.logged.join(' ')).toContain('proxy proxy.example:3128 via local relay');
+  });
+
+  it('closes the relay when the browser is discarded', async () => {
+    const harness = new FakeHarness();
+    harness.responses = [JSON_OK];
+    const transport = build(harness, 8_000, CREDS);
+
+    await post(transport);
+    await transport.onModuleDestroy();
+
+    expect(transport.relayCloseCalls).toBe(1);
+  });
+});
+
+describe('BrowserIchancyTransport — Cloudflare BLOCK vs challenge', () => {
+  it('returns a BLOCK response without replaying, and records the origin as blocked', async () => {
+    // A terminal block must NOT be re-solved or replayed: re-navigating cannot clear a reputation
+    // block, and replaying registerPlayer risks an undeletable second account for nothing.
+    const harness = new FakeHarness();
+    harness.responses = [{ status: 403, contentType: 'text/html; charset=UTF-8', text: BLOCK_HTML }];
+    const transport = build(harness);
+
+    const response = await post(transport);
+
+    expect(response.status).toBe(403);
+    expect(harness.fetchScripts).toHaveLength(1); // no replay
+    expect(harness.gotoCalls).toBe(1); // one navigation for the launch, no re-solve
+    expect(transport.describeTransport().lastOriginState).toBe('blocked');
+  });
+
+  it('a BLOCK page at solve time bails immediately instead of polling the challenge for 45s', async () => {
+    // Regression guard for the live bug: the block page's title ("Attention Required!") is NOT in
+    // CHALLENGE_TITLES, so without the content-level block detector the solver treated it as
+    // "cleared", never saw cf_clearance, and burned the full 45s. This test would TIME OUT (jest's
+    // 5s default) if the poll ran; it passes fast because the solver bails on the block marker.
+    const harness = new FakeHarness();
+    harness.pageContent = BLOCK_HTML; // the origin serves the block page during the solve
+    harness.clearance = ''; // and no clearance is ever granted
+    harness.responses = [{ status: 403, contentType: 'text/html', text: BLOCK_HTML }];
+    const transport = build(harness);
+
+    const response = await post(transport);
+
+    expect(response.status).toBe(403);
+    expect(transport.describeTransport().lastOriginState).toBe('blocked');
+  });
+
+  it('still re-solves and replays a GENUINE "just a moment" challenge', async () => {
+    // The block detector must not eat solvable challenges: this is the case that keeps working.
+    const harness = new FakeHarness();
+    harness.responses = [
+      { status: 403, contentType: 'text/html; charset=UTF-8', text: CHALLENGE_HTML },
+      JSON_OK,
+    ];
+    const transport = build(harness);
+
+    const response = await post(transport);
+
+    expect(response.status).toBe(200);
+    expect(harness.fetchScripts).toHaveLength(2); // re-solved and replayed once
+    expect(harness.gotoCalls).toBe(2);
+  });
+
+  it('looksBlocked agrees with the error map, and a block is not a challenge', () => {
+    const block: IchancyTransportResponse = {
+      status: 403,
+      contentType: 'text/html',
+      text: BLOCK_HTML,
+    };
+    expect(looksBlocked(block)).toBe(true);
+    expect(looksChallenged(block)).toBe(false); // block wins over challenge
+    expect(looksBlocked({ status: 403, contentType: 'application/json', text: '{}' })).toBe(false);
+    expect(looksBlocked({ status: 200, contentType: 'text/html', text: BLOCK_HTML })).toBe(false);
   });
 });

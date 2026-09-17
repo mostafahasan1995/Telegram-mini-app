@@ -66,6 +66,30 @@ const optionalText = (label: string) =>
   );
 
 /**
+ * A forward-proxy URL — `scheme://host:port` and NOTHING else. Blank reads as absent (like
+ * optionalText), which is the whole feature being off.
+ *
+ * CREDENTIALS ARE REFUSED IN THE URL, on purpose. `user:pass@host` would leak the password into
+ * every log line that prints the egress (the launch banner, describeTransport, ichancy:check) — the
+ * one thing this file promises never to do. The username and password go in their own variables and
+ * are attached out of band (the CONNECT relay's pre-emptive Proxy-Authorization; undici's
+ * ProxyAgent). The pattern rejects an `@`, any path, and a missing port for exactly that reason.
+ */
+const optionalProxyUrl = (label: string) =>
+  z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z
+      .string()
+      .trim()
+      .regex(
+        /^(?:https?|socks5):\/\/[^\s/@:]+:\d{1,5}$/i,
+        `${label} must be http(s)://host:port or socks5://host:port (no credentials in the URL — ` +
+          'put them in ICHANCY_PROXY_USERNAME / ICHANCY_PROXY_PASSWORD)',
+      )
+      .optional(),
+  );
+
+/**
  * Sent as `User-Agent` to the agent API when ICHANCY_USER_AGENT is unset or blank.
  *
  * A desktop Chrome string, deliberately NOT `node`/`undici`: bot protection scores a default runtime
@@ -318,6 +342,24 @@ export const envSchema = z
           ? DEFAULT_ICHANCY_USER_AGENT
           : value.trim(),
       ),
+    /**
+     * Route ONLY the Ichancy egress (the browser transport's Chromium, and the fetch transport's
+     * Node fetch) through a forward proxy with a trusted exit IP. Everything else on this box keeps
+     * using the host's own network.
+     *
+     * WHY THIS EXISTS (measured on the VPS 2026-09-16): agents.ichancy.com returns Cloudflare's
+     * TERMINAL block page from this server's IP — a hard `Sorry, you have been blocked`, not a
+     * solvable "Just a moment" challenge. The decision is IP/ASN reputation, upstream of any browser
+     * fingerprint, so no cookie, User-Agent or fingerprint trick can clear it; only a different exit
+     * IP can. Through the owner's proxy the same origin serves the solvable challenge instead.
+     *
+     * BLANK = DIRECT, and the default. An existing env file with these three empty boots exactly as
+     * before — the transports pass no proxy and nothing changes. Set the URL to turn it on.
+     */
+    ICHANCY_PROXY_URL: optionalProxyUrl('ICHANCY_PROXY_URL'),
+    /** Proxy auth, kept OUT of ICHANCY_PROXY_URL so it never lands in a log. Blank = no auth. */
+    ICHANCY_PROXY_USERNAME: optionalText('ICHANCY_PROXY_USERNAME'),
+    ICHANCY_PROXY_PASSWORD: optionalText('ICHANCY_PROXY_PASSWORD'),
     /**
      * Route every Ichancy call to the in-memory fake instead of the real agent API.
      *

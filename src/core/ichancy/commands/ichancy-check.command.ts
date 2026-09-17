@@ -29,7 +29,7 @@ import { formatMinorToDecimal } from '@common/helpers/money.util';
 import { TENANT_BOOTSTRAP_ID } from '@core/tenant/tenant.constants';
 import { runWithTenant } from '@core/tenant/tenant.storage';
 
-import { CLOUDFLARE_CHALLENGE_CODE } from '../error-map';
+import { CLOUDFLARE_BLOCKED_CODE, CLOUDFLARE_CHALLENGE_CODE } from '../error-map';
 import { ICHANCY_AGENT_RESOLVER, type IchancyAgent, type IchancyAgentResolver } from '../ichancy-agent';
 import { BrowserIchancyTransport } from '../transport/browser.transport';
 import { IchancySessionService } from '../ichancy-session.service';
@@ -157,6 +157,18 @@ export class IchancyCheckCommand extends CommandRunner {
 
     const described = this.browser.describeTransport();
     this.logger.log(`transport   browser  (headless=${String(described.headless)})`);
+    // The egress IP is the whole ballgame for the Cloudflare block: print host:port (NEVER the
+    // password) so an operator can see at a glance whether calls leave via the proxy or direct.
+    this.logger.log(
+      `egress      ${
+        described.proxy === null
+          ? 'direct (this server’s own IP)'
+          : `proxy ${described.proxy} (via a local relay when credentialed)`
+      }`,
+    );
+    // What the origin last looked like — 'app' (through, good), 'challenge' (solvable), 'blocked'
+    // (terminal; needs ICHANCY_PROXY_URL). Null until a call or warm-up has observed it.
+    this.logger.log(`origin      ${described.lastOriginState ?? 'not observed in this process yet'}`);
 
     let executable: string | null = null;
     try {
@@ -216,6 +228,18 @@ export class IchancyCheckCommand extends CommandRunner {
 
   /** Turns the failure into the one sentence that says what to change. */
   private explain(detail: string): void {
+    // A BLOCK is checked before a challenge: it is terminal and has a DIFFERENT fix. Saying "refresh
+    // the cookie / allowlist the IP" here would send an operator chasing something that cannot work
+    // against a reputation block — only a trusted exit IP can.
+    if (detail.includes(CLOUDFLARE_BLOCKED_CODE)) {
+      this.logger.error(
+        "FIX: Cloudflare BLOCKED this server's egress IP at its edge — a terminal denial, not a " +
+          'solvable challenge. No cookie refresh, User-Agent or re-auth can change it. Set ' +
+          'ICHANCY_PROXY_URL (with ICHANCY_PROXY_USERNAME / ICHANCY_PROXY_PASSWORD) to a trusted ' +
+          'exit proxy so the Ichancy calls leave from an IP Cloudflare has not blocked.',
+      );
+      return;
+    }
     if (detail.includes(CLOUDFLARE_CHALLENGE_CODE) || detail.toLowerCase().includes('cloudflare')) {
       this.logger.error(
         'FIX: Cloudflare blocked the call. Copy a fresh cf_clearance (plus __cf_bm and PHPSESSID) ' +

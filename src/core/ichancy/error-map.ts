@@ -212,28 +212,91 @@ export function isUnauthorizedHttpStatus(status: number): boolean {
 /** Stable code for "Cloudflare answered instead of Ichancy". Ends up on ichancy_calls.error_code. */
 export const CLOUDFLARE_CHALLENGE_CODE = 'CLOUDFLARE_CHALLENGE';
 
+/** Stable code for "Cloudflare BLOCKED us at the edge" — a different failure with a different fix. */
+export const CLOUDFLARE_BLOCKED_CODE = 'CLOUDFLARE_BLOCKED';
+
 /**
- * Fingerprints of Cloudflare's interstitial. Matched against the RAW body because a challenge page
- * is HTML — `toEnvelope` has already returned null by the time anything else looks at it.
+ * TWO Cloudflare interstitials that mean OPPOSITE things, and conflating them is the live bug this
+ * split fixes.
+ *
+ *   CHALLENGE — "Just a moment…", the JS/Managed challenge. SOLVABLE: a real browser passes it and
+ *               earns a cf_clearance, so the browser transport may re-solve and replay once.
+ *   BLOCK     — "Sorry, you have been blocked" / error 1020, a TERMINAL edge denial keyed on the
+ *               egress IP/ASN reputation. NOTHING in a browser clears it — no cookie, no
+ *               User-Agent, no fingerprint. Only a different exit IP (ICHANCY_PROXY_URL) can. It
+ *               must NEVER be treated as solvable: a 45s challenge poll and a replay per call are
+ *               pure waste, and every failed check lowers the IP's score further.
+ *
+ * Matched against the RAW body because these pages are HTML — `toEnvelope` has already returned null
+ * by the time anything else looks at it. `attention required! | cloudflare` is a BLOCK title (it was
+ * wrongly listed as a challenge marker until 2026-09-16, which is exactly what made a block poll for
+ * 45s and replay).
  */
-const CLOUDFLARE_MARKERS = [
+const CLOUDFLARE_BLOCK_MARKERS = [
+  'sorry, you have been blocked',
+  'you are unable to access',
+  'attention required! | cloudflare',
+  'error 1020',
+  'error code 1020',
+];
+
+const CLOUDFLARE_CHALLENGE_MARKERS = [
   'just a moment',
   'cf-browser-verification',
   'cf_chl_opt',
   '__cf_chl',
   'cf-mitigated',
-  'attention required! | cloudflare',
   'enable javascript and cookies to continue',
 ];
 
+/** Only a non-JSON body on a blocking status can be an interstitial; JSON on any status is Ichancy's. */
+function couldBeInterstitial(httpStatus: number, contentType: string | null): boolean {
+  if (contentType !== null && contentType.toLowerCase().includes('application/json')) return false;
+  return httpStatus === 403 || httpStatus === 503 || httpStatus === 429;
+}
+
 /**
- * Did Cloudflare answer instead of the agent API?
+ * Do the raw HTML bytes carry a Cloudflare BLOCK marker? Status-free, so the browser transport can
+ * ask it of `page.content()` (which has no HTTP status) during a challenge solve, where the whole
+ * point is to bail out of the 45s poll the instant a terminal block is seen.
+ */
+export function isCloudflareBlockBody(rawBody: string): boolean {
+  const haystack = rawBody.slice(0, 4_000).toLowerCase();
+  return CLOUDFLARE_BLOCK_MARKERS.some((marker) => haystack.includes(marker));
+}
+
+/** Do the raw HTML bytes carry a SOLVABLE-challenge marker? Status-free, for the same reason. */
+export function isCloudflareChallengeBody(rawBody: string): boolean {
+  const haystack = rawBody.slice(0, 4_000).toLowerCase();
+  return CLOUDFLARE_CHALLENGE_MARKERS.some((marker) => haystack.includes(marker));
+}
+
+/**
+ * Did Cloudflare BLOCK us at the edge (terminal), rather than serve a solvable challenge?
+ *
+ * Checked BEFORE isCloudflareChallenge everywhere, and isCloudflareChallenge also defers to it, so a
+ * page carrying block markers is never mistaken for something a browser can solve.
+ */
+export function isCloudflareBlock(
+  httpStatus: number,
+  rawBody: string,
+  contentType: string | null,
+): boolean {
+  if (!couldBeInterstitial(httpStatus, contentType)) return false;
+  return isCloudflareBlockBody(rawBody);
+}
+
+/**
+ * Did Cloudflare answer with a SOLVABLE challenge instead of the agent API?
  *
  * WHY THIS MUST BE CHECKED BEFORE classifyEnvelope: a challenge comes back as HTTP 403, and 403 is
  * in isUnauthorizedHttpStatus — so without this the adapter reads "token expired", spends the
  * refresh token, replays the call, gets challenged again, and ends up having thrown away a live
  * session over a bot check. The whole point of a separate code is that no amount of re-authenticating
  * can fix it: only a fresh cookie (or an IP allowlist) can.
+ *
+ * A BLOCK is deliberately NOT a challenge (see the marker split): returning true for a block would
+ * send the browser transport back into a 45s poll and a replay it can never win.
  *
  * WHY `ambiguous` AND NOT `rejected`: same rule as everything else in this file — Cloudflare blocks
  * the REQUEST, so the money certainly did not move, but proving that from here would mean trusting
@@ -245,12 +308,10 @@ export function isCloudflareChallenge(
   rawBody: string,
   contentType: string | null,
 ): boolean {
-  // A JSON answer is Ichancy's, whatever the status. Only non-JSON can be the interstitial.
-  if (contentType !== null && contentType.toLowerCase().includes('application/json')) return false;
-  if (httpStatus !== 403 && httpStatus !== 503 && httpStatus !== 429) return false;
-
-  const haystack = rawBody.slice(0, 4_000).toLowerCase();
-  return CLOUDFLARE_MARKERS.some((marker) => haystack.includes(marker));
+  if (!couldBeInterstitial(httpStatus, contentType)) return false;
+  // A block wins over a challenge: never poll/replay a terminal denial.
+  if (isCloudflareBlockBody(rawBody)) return false;
+  return isCloudflareChallengeBody(rawBody);
 }
 
 /** The classification for a challenged call, with the fix spelled out for whoever reads the log. */
@@ -264,6 +325,27 @@ export function cloudflareClassification(httpStatus: number): IchancyClassificat
       'Refresh cf_clearance from a browser on the same public IP as this server, or have the ' +
       "server's IP allowlisted.",
     rule: 'CLOUDFLARE_CHALLENGE',
+  };
+}
+
+/**
+ * The classification for a BLOCKED call. Its outcome MUST stay `ambiguous`, exactly like
+ * cloudflareClassification: the credit worker must never read an edge block as success, and — as
+ * everywhere else here — we cannot prove from the edge's answer that the origin did not act. What
+ * differs is the message: it names the ONLY fix that works (a trusted exit IP via ICHANCY_PROXY_URL),
+ * NOT "refresh the cookie" or "allowlist the IP", both of which are useless against a reputation
+ * block and would send an operator chasing the wrong thing for hours.
+ */
+export function cloudflareBlockedClassification(httpStatus: number): IchancyClassification {
+  return {
+    outcome: 'ambiguous',
+    code: CLOUDFLARE_BLOCKED_CODE,
+    message:
+      `Cloudflare BLOCKED the request at its edge (HTTP ${String(httpStatus)}) instead of the ` +
+      "agent API — a terminal denial, not a solvable challenge. This server's egress IP is blocked " +
+      "at Cloudflare's edge; no cookie refresh, User-Agent or re-auth can change that. Set " +
+      'ICHANCY_PROXY_URL to a trusted exit (proxy) for the Ichancy calls.',
+    rule: 'CLOUDFLARE_BLOCKED',
   };
 }
 

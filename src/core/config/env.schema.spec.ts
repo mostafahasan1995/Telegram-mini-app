@@ -188,3 +188,46 @@ describe('ICHANCY_TRANSPORT', () => {
     expect(() => ichancyEnvFor({ ICHANCY_TRANSPORT: 'curl' })).toThrow();
   });
 });
+
+describe('ICHANCY_PROXY_URL / _USERNAME / _PASSWORD', () => {
+  const proxyOf = (overrides: Record<string, string>): AppConfigService['ichancy']['proxy'] =>
+    new AppConfigService(ichancyEnvFor(overrides)).ichancy.proxy;
+
+  it('is DIRECT (null) when unset — the default, unchanged behaviour', () => {
+    expect(proxyOf({})).toBeNull();
+  });
+
+  it('treats a blank URL as unset (emptying the line turns the feature off)', () => {
+    expect(proxyOf({ ICHANCY_PROXY_URL: '', ICHANCY_PROXY_USERNAME: 'u' })).toBeNull();
+  });
+
+  it('carries server + credentials, with the credentials kept OUT of the server string', () => {
+    const proxy = proxyOf({
+      ICHANCY_PROXY_URL: 'http://proxy.example:3128',
+      ICHANCY_PROXY_USERNAME: 'exit',
+      ICHANCY_PROXY_PASSWORD: 's3cr3t',
+    });
+    expect(proxy).toEqual({ server: 'http://proxy.example:3128', username: 'exit', password: 's3cr3t' });
+    // The password must NOT be inside `server` — that field is printed in logs and describeTransport.
+    expect(proxy?.server).not.toContain('s3cr3t');
+  });
+
+  it('allows a credential-free proxy (open, or IP-authenticated)', () => {
+    expect(proxyOf({ ICHANCY_PROXY_URL: 'socks5://exit.example:1080' })).toEqual({
+      server: 'socks5://exit.example:1080',
+      username: null,
+      password: null,
+    });
+  });
+
+  it('REFUSES credentials embedded in the URL — they would leak into every egress log line', () => {
+    expect(() => ichancyEnvFor({ ICHANCY_PROXY_URL: 'http://user:pass@proxy.example:3128' })).toThrow(
+      /ICHANCY_PROXY_URL/,
+    );
+  });
+
+  it('refuses a URL with no port, or an unsupported scheme', () => {
+    expect(() => ichancyEnvFor({ ICHANCY_PROXY_URL: 'http://proxy.example' })).toThrow();
+    expect(() => ichancyEnvFor({ ICHANCY_PROXY_URL: 'ftp://proxy.example:21' })).toThrow();
+  });
+});

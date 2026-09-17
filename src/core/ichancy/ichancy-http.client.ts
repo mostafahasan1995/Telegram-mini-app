@@ -17,7 +17,9 @@ import { AppConfigService } from '@core/config/config.service';
 import {
   classifyEnvelope,
   classifyTransportFailure,
+  cloudflareBlockedClassification,
   cloudflareClassification,
+  isCloudflareBlock,
   isCloudflareChallenge,
   isTimeoutError,
   type IchancyClassification,
@@ -176,12 +178,19 @@ export class IchancyHttpClient implements IchancyAuthClient {
       envelope = toEnvelope(parsed);
       responseForLog = envelope === null ? { rawBody: text.slice(0, 2_000) } : parsed;
 
-      // BEFORE classifyEnvelope, and the order is load-bearing: a Cloudflare challenge is an HTTP
+      // BEFORE classifyEnvelope, and the order is load-bearing: a Cloudflare interstitial is an HTTP
       // 403, 403 is in isUnauthorizedHttpStatus, so classifying it normally would read "token
       // expired" and spend the agent's single refresh token on a problem no token can fix.
-      classification = isCloudflareChallenge(httpStatus, text, response.contentType)
-        ? cloudflareClassification(httpStatus)
-        : classifyEnvelope(httpStatus, envelope);
+      //
+      // A BLOCK is checked before a CHALLENGE: they are both 403 HTML, both `ambiguous`, but a block
+      // is terminal (fix: ICHANCY_PROXY_URL) while a challenge is solvable (fix: a fresh clearance),
+      // and the operator must be told the right one. isCloudflareChallenge already defers to the
+      // block detector, so the two can never both fire; the order here keeps the codes distinct.
+      classification = isCloudflareBlock(httpStatus, text, response.contentType)
+        ? cloudflareBlockedClassification(httpStatus)
+        : isCloudflareChallenge(httpStatus, text, response.contentType)
+          ? cloudflareClassification(httpStatus)
+          : classifyEnvelope(httpStatus, envelope);
     } catch (error) {
       classification = classifyTransportFailure(error);
       responseForLog = {

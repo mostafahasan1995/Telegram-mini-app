@@ -18,13 +18,14 @@
  */
 import { Injectable, Logger } from '@nestjs/common';
 
-import { AppConfigService } from '@core/config/config.service';
+import { AppConfigService, proxyHostPort } from '@core/config/config.service';
 
 import { isCloudflareChallenge } from '../error-map';
 import { originOf } from '../ichancy-agent';
 
 import { CookieHarvesterService } from './cookie-harvester.service';
 import { IchancyCookieStore, type HarvestedCookies } from './ichancy-cookie.store';
+import { createProxyDispatcher } from './proxy-relay';
 
 import {
   type IchancyTransport,
@@ -75,6 +76,14 @@ export class FetchIchancyTransport implements IchancyTransport {
    */
   private readonly jars = new Map<string, Map<string, string>>();
   private missingCookieWarned = false;
+  /**
+   * undici's ProxyAgent for ICHANCY_PROXY_URL, built ONCE and reused so its connection pool is not
+   * rebuilt per call. `undefined` = not built yet; the resolved value is the dispatcher or null (no
+   * proxy). undici — unlike Chromium — handles proxy Basic auth from the URL, so no relay is needed
+   * on this path. Dormant while ICHANCY_TRANSPORT=browser (the default); it exists so the fetch
+   * fallback and the cf_clearance harvester share the SAME trusted exit IP the browser uses.
+   */
+  private dispatcher: Promise<unknown> | undefined;
 
   constructor(
     private readonly config: AppConfigService,
@@ -109,12 +118,19 @@ export class FetchIchancyTransport implements IchancyTransport {
 
   private async send(request: IchancyTransportRequest): Promise<IchancyTransportResponse> {
     const jar = this.jarFor(request);
-    const response = await fetch(request.url, {
+    const init: RequestInit = {
       method: 'POST',
       headers: await this.buildHeaders(request, jar),
       body: JSON.stringify(request.body),
       signal: AbortSignal.timeout(request.timeoutMs),
-    });
+    };
+    // Route the egress through the configured proxy when one is set. `dispatcher` is undici's
+    // (non-standard) fetch option; attaching it via a cast keeps the standard fields type-checked
+    // while not depending on whether the ambient fetch typings expose it.
+    const dispatcher = await this.proxyDispatcher();
+    if (dispatcher !== null) (init as { dispatcher?: unknown }).dispatcher = dispatcher;
+
+    const response = await fetch(request.url, init);
 
     this.absorbCookies(response, jar);
 
@@ -123,6 +139,22 @@ export class FetchIchancyTransport implements IchancyTransport {
       contentType: response.headers.get('content-type'),
       text: await response.text(),
     };
+  }
+
+  /**
+   * The proxy dispatcher, or null when ICHANCY_PROXY_URL is unset. Built once and cached; the log
+   * line names host:port only — never the password.
+   */
+  private proxyDispatcher(): Promise<unknown> {
+    const proxy = this.config.ichancy.proxy ?? null;
+    if (proxy === null) return Promise.resolve(null);
+    let dispatcher = this.dispatcher;
+    if (dispatcher === undefined) {
+      this.logger.log(`Ichancy fetch egress: proxy ${proxyHostPort(proxy.server)}`);
+      dispatcher = createProxyDispatcher(proxy);
+      this.dispatcher = dispatcher;
+    }
+    return dispatcher;
   }
 
   /**
