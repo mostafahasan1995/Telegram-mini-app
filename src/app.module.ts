@@ -28,6 +28,7 @@ import { AuditModule } from '@core/audit/audit.module';
 import { AuthModule } from '@core/auth/auth.module';
 import { CacheModule } from '@core/cache/cache.module';
 import { AppConfigModule } from '@core/config/config.module';
+import { EgressModule } from '@core/egress/egress.module';
 import { FileModule } from '@core/file/file.module';
 import { HealthModule } from '@core/health/health.module';
 import { IchancyModule } from '@core/ichancy/ichancy.module';
@@ -78,6 +79,8 @@ import { FeaturePortsModule } from './feature-ports.module';
     FileModule,
     TelegramModule,
     HealthModule,
+    // The dashboard's "Egress & VPN" panel — GET /v1/system/egress-status. API role only serves it.
+    EgressModule,
 
     // ---- authentication, then rate limiting (see the header on ordering) -------------------
     AuthModule,

@@ -32,6 +32,8 @@ import { AppConfigService, proxyHostPort } from '@core/config/config.service';
 
 import { isCloudflareBlock, isCloudflareBlockBody, isCloudflareChallenge } from '../error-map';
 
+import { type HarvestedCookies, IchancyCookieStore } from './ichancy-cookie.store';
+
 import {
   type IchancyTransport,
   type IchancyTransportRequest,
@@ -49,12 +51,21 @@ import {
  * compiles — and the whole project typechecks — on a machine where the OPTIONAL `playwright`
  * dependency was never installed. The import itself is dynamic for the same reason.
  */
+interface PlaywrightLocator {
+  /** Wait for the element to be actionable (visible and enabled). */
+  waitFor(options?: { timeout?: number; state?: string }): Promise<void>;
+  fill(value: string): Promise<void>;
+  /** For the submit control: send the click the form listens for. */
+  click(): Promise<void>;
+}
 interface PlaywrightPage {
   goto(url: string, options?: { waitUntil?: string; timeout?: number }): Promise<unknown>;
   title(): Promise<string>;
   /** Full rendered HTML. Read to tell a solvable challenge from a terminal edge block. */
   content(): Promise<string>;
   evaluate<T>(fn: string, arg?: unknown): Promise<T>;
+  /** The in-browser form login uses this for the username/password/submit controls. */
+  locator(selector: string): PlaywrightLocator;
   isClosed(): boolean;
 }
 interface PlaywrightCookie {
@@ -169,6 +180,64 @@ const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 
 const describe = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
+
+/** Cookie names Cloudflare owns. The browser must EARN its own; they are never seeded or trusted. */
+const CLOUDFLARE_OWNED_COOKIES = new Set(['cf_clearance', '__cf_bm', '__cflb', 'cf_chl_rc_m']);
+
+/** Ceiling for the optional in-browser form login, whole in the launch budget's spirit. */
+const LOGIN_TIMEOUT_MS = 25_000;
+/** After clicking submit, let the panel answer before we snapshot the session cookies. */
+const LOGIN_SETTLE_MS = 1_500;
+
+/** The selectors the optional panel form-login targets, with per-variable overrides. */
+export interface LoginSelectors {
+  readonly user: string;
+  readonly password: string;
+  readonly submit: string;
+}
+
+/**
+ * Resolve the login-selector defaults or the ICHANCY_LOGIN_*_SELECTOR overrides.
+ *
+ * The defaults are deliberately broad CSS (Playwright accepts comma-separated selectors and uses
+ * the first match): `name="username"/"login"/"user"` or any password-less text input, the one
+ * `type="password"` input, and the conventional submit controls. A panel that needs something
+ * fancier (an iframe, a React component with no real <input name>) gets the overrides.
+ */
+export function resolveLoginSelectors(overrides: {
+  readonly user?: string | null;
+  readonly password?: string | null;
+  readonly submit?: string | null;
+}): LoginSelectors {
+  return {
+    user:
+      overrides.user ??
+      'input[name="username"], input[name="login"], input[name="user"], input[type="text"]',
+    password: overrides.password ?? 'input[type="password"]',
+    submit:
+      overrides.submit ??
+      'button[type="submit"], input[type="submit"], button:has-text("Sign in"), button:has-text("Login")',
+  };
+}
+
+/** `[{name,value}...]` -> `name=value; name=value` — the ready-made Cookie header for the store. */
+export function serializeCookieJar(cookies: readonly { name: string; value: string }[]): string {
+  return cookies
+    .filter((cookie) => cookie.name.length > 0 && cookie.value.length > 0)
+    .map((cookie) => `${cookie.name}=${cookie.value}`)
+    .join('; ');
+}
+
+/**
+ * Is this jar worth persisting at all? Only a non-empty `cf_clearance` makes it so: without one the
+ * browser was challenged or blocked, and writing a challenged jar over a good stored harvest would
+ * be the opposite of this feature's purpose. Kept pure so the gate is unit-pinnable.
+ */
+export function sessionWorthPersisting(
+  cookies: readonly { name: string; value: string }[],
+): boolean {
+  return cookies.some((cookie) => cookie.name === 'cf_clearance' && cookie.value.length > 0);
+}
 
 /**
  * Did Chromium DIE, as opposed to answering badly?
@@ -305,7 +374,14 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
    */
   private lastOriginState: OriginState | null = null;
 
-  constructor(private readonly config: AppConfigService) {}
+  /**
+   * `cookieStore` is optional so the unit spec can drive this class without Redis; DI always
+   * supplies it. When absent, session persistence is a silent no-op.
+   */
+  constructor(
+    private readonly config: AppConfigService,
+    private readonly cookieStore?: IchancyCookieStore,
+  ) {}
 
   /**
    * One Chromium page, parked on ICHANCY_BASE_URL's origin, and the call is a same-origin fetch from
@@ -677,6 +753,16 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
       }
 
       await this.solveChallenge(page);
+
+      // OPTIONAL form login: only when ICHANCY_LOGIN_URL + credentials are set. It fails OPEN —
+      // a panel that changed its form must not take the cashier's egress down with it.
+      await this.performBrowserLogin(page);
+
+      // The browser now owns a session (clearance + panel cookies). Save it to Redis so the fetch
+      // fallback and a future restart reuse it, and seed a stored session into THIS context first.
+      await this.seedStoredSessionCookies(context);
+      await this.persistBrowserSession();
+
       return page;
     } catch (error: unknown) {
       this.browser = null;
@@ -797,7 +883,6 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
     if (configured === null) return;
 
     const host = new URL(this.config.ichancy.baseUrl).hostname;
-    const cloudflareOwned = new Set(['cf_clearance', '__cf_bm', '__cflb', 'cf_chl_rc_m']);
 
     const cookies: { name: string; value: string; domain: string; path: string }[] = [];
     for (const part of configured.split(';')) {
@@ -806,7 +891,7 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
       const name = part.slice(0, separator).trim();
       const value = part.slice(separator + 1).trim();
       if (name.length === 0 || value.length === 0) continue;
-      if (cloudflareOwned.has(name)) continue;
+      if (CLOUDFLARE_OWNED_COOKIES.has(name)) continue;
       cookies.push({ name, value, domain: host, path: '/' });
     }
 
@@ -820,6 +905,116 @@ export class BrowserIchancyTransport implements IchancyTransport, OnModuleDestro
       );
     } catch (error: unknown) {
       this.logger.warn(`Could not seed panel cookies: ${describe(error)}`);
+    }
+  }
+
+  /**
+   * OPTIONAL in-browser form login: `ICHANCY_LOGIN_URL` + credentials filled into the panel's login
+   * form after the challenge clears. This is the part that makes the stored session a real signed-in
+   * session — the panel's own PHPSESSID — rather than just a clearance.
+   *
+   * FAILING OPEN ON PURPOSE: every failure here is a warning and a continue, never a thrown error.
+   * The bearer-token API path (post → runInPage) works without this login; rolling back the whole
+   * egress because a panel renamed its password input would be the wrong cost. The warning is the
+   * contract: an operator sees "login did not complete" in the log and can fix the selector.
+   */
+  private async performBrowserLogin(page: PlaywrightPage): Promise<void> {
+    const { loginUrl, loginUsername, loginPassword } = this.config.ichancy;
+    if (loginUrl === null || loginUsername === null || loginPassword === null) return;
+
+    const selectors = resolveLoginSelectors({
+      user: this.config.ichancy.loginUserSelector,
+      password: this.config.ichancy.loginPasswordSelector,
+      submit: this.config.ichancy.loginSubmitSelector,
+    });
+
+    try {
+      await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: LOGIN_TIMEOUT_MS });
+      const userInput = page.locator(selectors.user);
+      await userInput.waitFor({ timeout: LOGIN_TIMEOUT_MS });
+      await userInput.fill(loginUsername);
+      const passwordInput = page.locator(selectors.password);
+      await passwordInput.waitFor({ timeout: LOGIN_TIMEOUT_MS });
+      await passwordInput.fill(loginPassword);
+      await page.locator(selectors.submit).click();
+      await delay(LOGIN_SETTLE_MS);
+      this.logger.log('In-browser Ichancy panel login submitted; the session will be persisted');
+    } catch (error: unknown) {
+      this.logger.warn(
+        `In-browser panel login did not complete (${describe(error)}); continuing without it. ` +
+          'Check the login form matches ICHANCY_LOGIN_USER_SELECTOR / _PASSWORD_SELECTOR.',
+      );
+    }
+  }
+
+  /**
+   * Seed the cookies recovered from a previous session (Redis ichancy:cookies:v1) into this fresh
+   * context — Cloudflare's excluded so the browser re-earns its own, matching the existing rule.
+   *
+   * This is the second half of "save the session": after a restart the browser resumes the saved
+   * panel session instead of arriving as a stranger. The stored value's UA must agree with the
+   * HarvestedCookies contract; the browser supplies its own clearance regardless.
+   */
+  private async seedStoredSessionCookies(context: PlaywrightContext): Promise<void> {
+    const store = this.cookieStore;
+    if (store === undefined) return;
+    const stored = await store.read().catch(() => null);
+    if (stored === null) return;
+
+    const host = new URL(this.config.ichancy.baseUrl).hostname;
+    const cookies: { name: string; value: string; domain: string; path: string }[] = [];
+    for (const part of stored.cookie.split(';')) {
+      const separator = part.indexOf('=');
+      if (separator <= 0) continue;
+      const name = part.slice(0, separator).trim();
+      const value = part.slice(separator + 1).trim();
+      if (name.length === 0 || value.length === 0) continue;
+      if (CLOUDFLARE_OWNED_COOKIES.has(name)) continue;
+      cookies.push({ name, value, domain: host, path: '/' });
+    }
+    if (cookies.length === 0) return;
+
+    try {
+      await context.addCookies(cookies);
+      this.logger.log(
+        `Resumed ${String(cookies.length)} session cookie(s) from the stored harvest`,
+      );
+    } catch (error: unknown) {
+      this.logger.warn(`Could not resume stored session cookies: ${describe(error)}`);
+    }
+  }
+
+  /**
+   * Persist the browser's CURRENT jar (clearance + panel session) to Redis so the fetch transport
+   * and a future launch reuse exactly what this browser earned. gated on cf_clearance: without one
+   * nothing here is worth sharing, and overwriting a good stored harvest with a challenged jar would
+   * be sabotage. Writes never log cookie values.
+   */
+  private async persistBrowserSession(): Promise<void> {
+    const context = this.context;
+    const store = this.cookieStore;
+    const userAgent = this.chromiumUserAgent;
+    if (context === null || store === undefined || userAgent === null) return;
+
+    try {
+      const cookies = await context.cookies();
+      if (!sessionWorthPersisting(cookies)) {
+        this.logger.debug('No fresh clearance in the jar; not persisting a challenged session');
+        return;
+      }
+
+      const harvest: HarvestedCookies = {
+        cookie: serializeCookieJar(cookies),
+        userAgent,
+        harvestedAt: new Date().toISOString(),
+      };
+      await store.write(harvest);
+      this.logger.log(
+        `Persisted the browser session (${String(cookies.length)} cookie(s)) for reuse`,
+      );
+    } catch (error: unknown) {
+      // Persistence is an enhancement, never a money-path gate.
+      this.logger.warn(`Could not persist the browser session: ${describe(error)}`);
     }
   }
 
