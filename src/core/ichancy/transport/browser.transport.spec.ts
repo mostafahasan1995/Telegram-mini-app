@@ -19,7 +19,15 @@
 import { type AppConfigService } from '@core/config/config.service';
 
 import { classifyTransportFailure } from '../error-map';
-import { BrowserIchancyTransport, looksBlocked, looksChallenged } from './browser.transport';
+import {
+  BrowserIchancyTransport,
+  looksBlocked,
+  looksChallenged,
+  resolveLoginSelectors,
+  serializeCookieJar,
+  sessionWorthPersisting,
+} from './browser.transport';
+import { type HarvestedCookies, type IchancyCookieStore } from './ichancy-cookie.store';
 import { type IchancyTransportResponse } from './ichancy-transport';
 import { basicAuthHeader, type ProxyRelay, type RelayUpstream } from './proxy-relay';
 
@@ -55,6 +63,8 @@ class FakeHarness {
   readonly fetchScripts: string[] = [];
   gotoCalls = 0;
   closeCalls = 0;
+  /** URLs every `page.goto` saw, in order — a launch, a login, a replay each show up here. */
+  readonly gotoCallsByUrl: string[] = [];
   /** Queue of answers the in-page fetch returns, in order. */
   responses: FakeResponse[] = [];
   /** When set, the next `page.evaluate` of a fetch never settles. */
@@ -67,10 +77,22 @@ class FakeHarness {
   gotoError = 'net::ERR_CONNECTION_RESET';
   /** What navigator.userAgent reports inside the fake page. */
   reportedUserAgent = HEADLESS_UA;
-  /** Cookies the "context" reports; a cf_clearance is what solveChallenge waits for. */
-  clearance = 'granted';
   /** What `page.content()` returns — solveChallenge reads it to spot a terminal block. Benign by default. */
   pageContent = '<html><body>agent panel</body></html>';
+  /** The full jar the context reports. Defaults to a granted clearance, so a launch just clears. */
+  cookieJar: { name: string; value: string }[] = [
+    { name: 'cf_clearance', value: 'granted' },
+  ];
+  /** Cookies `addCookies` was asked to seed, for the resume-stored-session test. */
+  readonly seededCookies: { name: string; value: string }[] = [];
+  /** Selectors the fake page is willing to let `waitFor` succeed on. */
+  knownSelectors: ReadonlySet<string> = new Set();
+  /** Every `page.locator(...)` selector requested, in order. */
+  readonly locatorCalls: string[] = [];
+  /** `[selector, value]` from every `fill` on the login form. */
+  readonly loginFills: [string, string][] = [];
+  /** Every submit click. */
+  readonly loginClicks: string[] = [];
 
   readonly chromium = {
     launch: (options?: Record<string, unknown>): Promise<unknown> => {
@@ -80,8 +102,9 @@ class FakeHarness {
   };
 
   private readonly page = {
-    goto: (): Promise<unknown> => {
+    goto: (url?: string): Promise<unknown> => {
       this.gotoCalls += 1;
+      this.gotoCallsByUrl.push(url ?? '');
       if (this.gotoThrows) return Promise.reject(new Error(this.gotoError));
       return Promise.resolve(null);
     },
@@ -102,13 +125,37 @@ class FakeHarness {
       if (next === undefined) throw new Error('the fake ran out of scripted responses');
       return Promise.resolve(next);
     },
+    locator: (selector: string): {
+      waitFor: (options?: { timeout?: number; state?: string }) => Promise<void>;
+      fill: (value: string) => Promise<void>;
+      click: () => Promise<void>;
+    } => {
+      this.locatorCalls.push(selector);
+      return {
+        waitFor: (): Promise<void> =>
+          this.knownSelectors.has(selector)
+            ? Promise.resolve()
+            : Promise.reject(new Error(`locator("${selector}"): not visible`)),
+        fill: (value: string): Promise<void> => {
+          this.loginFills.push([selector, value]);
+          return Promise.resolve();
+        },
+        click: (): Promise<void> => {
+          this.loginClicks.push(selector);
+          return Promise.resolve();
+        },
+      };
+    },
   };
 
   private readonly context = {
     newPage: (): Promise<unknown> => Promise.resolve(this.page),
     cookies: (): Promise<{ name: string; value: string }[]> =>
-      Promise.resolve([{ name: 'cf_clearance', value: this.clearance }]),
-    addCookies: (): Promise<void> => Promise.resolve(),
+      Promise.resolve(this.cookieJar.map((cookie) => ({ ...cookie }))),
+    addCookies: (cookies: { name: string; value: string }[]): Promise<void> => {
+      this.seededCookies.push(...cookies);
+      return Promise.resolve();
+    },
     // The UA probe opens a throwaway context and closes it; without this the probe throws, falls
     // back to "no override", and the headless marker silently survives.
     close: (): Promise<void> => Promise.resolve(),
@@ -133,6 +180,24 @@ interface ProxyConfig {
   password: string | null;
 }
 
+/** Structural stand-in for IchancyCookieStore — the transport only needs read/write. */
+class FakeCookieStore {
+  stored: HarvestedCookies | null = null;
+  readonly writes: HarvestedCookies[] = [];
+  reads = 0;
+
+  read = (): Promise<HarvestedCookies | null> => {
+    this.reads += 1;
+    return Promise.resolve(this.stored);
+  };
+
+  write = (value: HarvestedCookies): Promise<void> => {
+    this.writes.push(value);
+    this.stored = value;
+    return Promise.resolve();
+  };
+}
+
 /** The seam. Nothing else about the class changes. */
 class TestableTransport extends BrowserIchancyTransport {
   /** The upstream the relay was asked to tunnel to, or null when no relay was started. */
@@ -144,8 +209,9 @@ class TestableTransport extends BrowserIchancyTransport {
   constructor(
     config: AppConfigService,
     private readonly harness: FakeHarness,
+    cookieStore?: FakeCookieStore,
   ) {
-    super(config);
+    super(config, cookieStore as unknown as IchancyCookieStore | undefined);
     const sink = (message: unknown): void => {
       this.logged.push(String(message));
     };
@@ -172,10 +238,21 @@ class TestableTransport extends BrowserIchancyTransport {
   }
 }
 
+interface LoginOptions {
+  url: string;
+  username: string;
+  password: string;
+  userSelector?: string | null;
+  passwordSelector?: string | null;
+  submitSelector?: string | null;
+}
+
 function build(
   harness: FakeHarness,
   timeoutMs = 8_000,
   proxy: ProxyConfig | null = null,
+  login: LoginOptions | null = null,
+  cookieStore: FakeCookieStore | undefined = undefined,
 ): TestableTransport {
   const config = {
     ichancy: {
@@ -185,9 +262,15 @@ function build(
       userAgent: CONFIGURED_UA,
       timeoutMs,
       proxy,
+      loginUrl: login?.url ?? null,
+      loginUsername: login?.username ?? null,
+      loginPassword: login?.password ?? null,
+      loginUserSelector: login?.userSelector ?? null,
+      loginPasswordSelector: login?.passwordSelector ?? null,
+      loginSubmitSelector: login?.submitSelector ?? null,
     },
   } as unknown as AppConfigService;
-  return new TestableTransport(config, harness);
+  return new TestableTransport(config, harness, cookieStore);
 }
 
 const post = (transport: TestableTransport, timeoutMs = 8_000): Promise<IchancyTransportResponse> =>
@@ -568,7 +651,7 @@ describe('BrowserIchancyTransport — Cloudflare BLOCK vs challenge', () => {
     // 5s default) if the poll ran; it passes fast because the solver bails on the block marker.
     const harness = new FakeHarness();
     harness.pageContent = BLOCK_HTML; // the origin serves the block page during the solve
-    harness.clearance = ''; // and no clearance is ever granted
+    harness.cookieJar = [{ name: 'cf_clearance', value: '' }]; // and no clearance is ever granted
     harness.responses = [{ status: 403, contentType: 'text/html', text: BLOCK_HTML }];
     const transport = build(harness);
 
@@ -604,5 +687,140 @@ describe('BrowserIchancyTransport — Cloudflare BLOCK vs challenge', () => {
     expect(looksChallenged(block)).toBe(false); // block wins over challenge
     expect(looksBlocked({ status: 403, contentType: 'application/json', text: '{}' })).toBe(false);
     expect(looksBlocked({ status: 200, contentType: 'text/html', text: BLOCK_HTML })).toBe(false);
+  });
+
+  describe('session persistence', () => {
+    it('serializes a cookie jar into a Cookie header, dropping empty pairs', () => {
+      expect(
+        serializeCookieJar([
+          { name: 'PHPSESSID', value: 'abc123' },
+          { name: 'cf_clearance', value: 'granted' },
+        ]),
+      ).toBe('PHPSESSID=abc123; cf_clearance=granted');
+      expect(
+        serializeCookieJar([
+          { name: 'empty', value: '' },
+          { name: '', value: 'orphan' },
+        ]),
+      ).toBe('');
+    });
+
+    it('resolves the stock login selectors, and an override always wins', () => {
+      expect(resolveLoginSelectors({})).toEqual({
+        user: expect.stringContaining('name="username"'),
+        password: 'input[type="password"]',
+        submit: expect.stringContaining('button[type="submit"]'),
+      });
+      const override = resolveLoginSelectors({
+        user: 'input#agent_email',
+        password: 'input#agent_secret',
+        submit: 'button.topbar-login',
+      });
+      expect(override).toEqual({
+        user: 'input#agent_email',
+        password: 'input#agent_secret',
+        submit: 'button.topbar-login',
+      });
+    });
+
+    it('only persists a jar that actually carries a cf_clearance', () => {
+      expect(sessionWorthPersisting([{ name: 'cf_clearance', value: 'granted' }])).toBe(true);
+      expect(sessionWorthPersisting([{ name: 'cf_clearance', value: '' }])).toBe(false);
+      expect(sessionWorthPersisting([{ name: 'PHPSESSID', value: 'abc123' }])).toBe(false);
+    });
+
+    it('fills the configured login form after the solve, then persists the full session', async () => {
+      const harness = new FakeHarness();
+      // A real context reports what it ANNOUNCED, i.e. the masked UA; Cloudflare binds the clearance
+      // to that string, so it is the one the harvest must carry.
+      harness.reportedUserAgent = HEADLESS_UA.replace('HeadlessChrome', 'Chrome');
+      harness.cookieJar = [
+        { name: 'cf_clearance', value: 'granted' },
+        { name: 'PHPSESSID', value: 'panel-session-42' },
+      ];
+      const selectors = resolveLoginSelectors({});
+      harness.knownSelectors = new Set([selectors.user, selectors.password, selectors.submit]);
+      harness.responses = [JSON_OK];
+      const store = new FakeCookieStore();
+      const transport = build(
+        harness,
+        8_000,
+        null,
+        { url: 'https://agents.ichancy.com/login', username: 'cd', password: 'secret' },
+        store,
+      );
+
+      const response = await post(transport);
+
+      expect(response.status).toBe(200);
+      // The login navigated to ICHANCY_LOGIN_URL after the origin solve (two gotos total).
+      expect(harness.gotoCallsByUrl).toContain('https://agents.ichancy.com/login');
+      // Credentials went into the RESOLVED stock selectors.
+      expect(harness.loginFills).toContainEqual([selectors.user, 'cd']);
+      expect(harness.loginFills).toContainEqual([selectors.password, 'secret']);
+      expect(harness.loginClicks).toContain(selectors.submit);
+      // The persisted harvest carries the whole jar (clearance + panel session) and the masked UA.
+      expect(store.writes).toHaveLength(1);
+      const harvest = store.writes[0];
+      expect(harvest).toBeDefined();
+      expect(harvest?.cookie).toContain('cf_clearance=granted');
+      expect(harvest?.cookie).toContain('PHPSESSID=panel-session-42');
+      expect(harvest?.userAgent).toBe(HEADLESS_UA.replace('HeadlessChrome', 'Chrome'));
+      // Nothing about the password or the cookie VALUES may reach the logs.
+      const joined = transport.logged.join('\n');
+      expect(joined.toLowerCase()).not.toContain('secret');
+      expect(joined).not.toContain('panel-session-42');
+    });
+
+    it('does nothing DOM-shaped when the login is not configured', async () => {
+      const harness = new FakeHarness();
+      harness.responses = [JSON_OK];
+      const transport = build(harness);
+
+      const response = await post(transport);
+
+      expect(response.status).toBe(200);
+      expect(harness.locatorCalls).toHaveLength(0);
+      expect(harness.gotoCallsByUrl).toHaveLength(1); // origin solve only, no login page
+    });
+
+    it('resumes a stored session into the context, minus the Cloudflare-owned cookies', async () => {
+      const harness = new FakeHarness();
+      harness.responses = [JSON_OK];
+      const store = new FakeCookieStore();
+      store.stored = {
+        cookie: 'PHPSESSID=resumed-77; cf_clearance=STALE-CANNOT-BE-SEEDED',
+        userAgent: HEADLESS_UA.replace('HeadlessChrome', 'Chrome'),
+        harvestedAt: new Date().toISOString(),
+      };
+      const transport = build(harness, 8_000, null, null, store);
+
+      const response = await post(transport);
+
+      expect(response.status).toBe(200);
+      const names = harness.seededCookies.map((cookie) => cookie.name);
+      expect(names).toContain('PHPSESSID'); // panel session survives the restart
+      expect(names).not.toContain('cf_clearance'); // the browser must re-earn its own
+    });
+
+    it('fails OPEN when the login form is missing, and never bricks the call', async () => {
+      const harness = new FakeHarness();
+      // No selectors are "known" to the fake page, so waitFor rejects at the first locator.
+      harness.responses = [JSON_OK];
+      const store = new FakeCookieStore();
+      // The store is empty, so the only observable state is: the call still goes through.
+      const transport = build(
+        harness,
+        8_000,
+        null,
+        { url: 'https://agents.ichancy.com/login', username: 'cd', password: 'secret' },
+        store,
+      );
+
+      const response = await post(transport);
+
+      expect(response.status).toBe(200); // login failed, the POST did not
+      expect(transport.logged.join('\n')).toContain('did not complete');
+    });
   });
 });

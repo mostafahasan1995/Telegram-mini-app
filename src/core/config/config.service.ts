@@ -136,6 +136,18 @@ export interface IchancySettings {
     readonly username: string | null;
     readonly password: string | null;
   } | null;
+  /**
+   * Optional in-browser FORM login (ICHANCY_LOGIN_URL + credentials). The browser transport fills
+   * these into the panel's login form after solving the challenge, then persists the session. All
+   * fields are null unless ICHANCY_LOGIN_URL is set. The credentials are used ONLY for that form and
+   * must never reach a log or the egress status endpoint.
+   */
+  readonly loginUrl: string | null;
+  readonly loginUsername: string | null;
+  readonly loginPassword: string | null;
+  readonly loginUserSelector: string | null;
+  readonly loginPasswordSelector: string | null;
+  readonly loginSubmitSelector: string | null;
 }
 
 export interface S3Settings {
@@ -234,6 +246,15 @@ export class AppConfigService {
               username: env.ICHANCY_PROXY_USERNAME ?? null,
               password: env.ICHANCY_PROXY_PASSWORD ?? null,
             }),
+      // The OPTIONAL in-browser form login. All null exactly when ICHANCY_LOGIN_URL is blank —
+      // which is the shipped default, so this feature changes nothing for an env file that never
+      // set it. Credentials are used ONLY for the form submission and must never reach a log.
+      loginUrl: env.ICHANCY_LOGIN_URL ?? null,
+      loginUsername: env.ICHANCY_LOGIN_USERNAME ?? null,
+      loginPassword: env.ICHANCY_LOGIN_PASSWORD ?? null,
+      loginUserSelector: env.ICHANCY_LOGIN_USER_SELECTOR ?? null,
+      loginPasswordSelector: env.ICHANCY_LOGIN_PASSWORD_SELECTOR ?? null,
+      loginSubmitSelector: env.ICHANCY_LOGIN_SUBMIT_SELECTOR ?? null,
     });
 
     this._s3 = Object.freeze({

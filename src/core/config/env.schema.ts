@@ -90,6 +90,21 @@ const optionalProxyUrl = (label: string) =>
   );
 
 /**
+ * An http(s) URL where BLANK means ABSENT (like optionalText), so `KEY=` — the gesture that turns
+ * an optional feature off in this file — turns the feature off instead of crashing the boot.
+ */
+const optionalHttpUrl = (label: string) =>
+  z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z
+      .string()
+      .trim()
+      .regex(/^https?:\/\/[^\s]+$/i, `${label} must be an http(s) URL`)
+      .transform((value) => value.replace(/\/+$/, ''))
+      .optional(),
+  );
+
+/**
  * Sent as `User-Agent` to the agent API when ICHANCY_USER_AGENT is unset or blank.
  *
  * A desktop Chrome string, deliberately NOT `node`/`undici`: bot protection scores a default runtime
@@ -360,6 +375,34 @@ export const envSchema = z
     /** Proxy auth, kept OUT of ICHANCY_PROXY_URL so it never lands in a log. Blank = no auth. */
     ICHANCY_PROXY_USERNAME: optionalText('ICHANCY_PROXY_USERNAME'),
     ICHANCY_PROXY_PASSWORD: optionalText('ICHANCY_PROXY_PASSWORD'),
+    /**
+     * OPTIONAL. Sign IN to the agent panel inside the parked Chromium, on top of solving the
+     * Cloudflare challenge — the surest way to own a fresh `PHPSESSID` that the panel treats as its
+     * own, and the browser step of the "challenge then login, then save the session" scenario.
+     *
+     * The browser transport otherwise only SOLVES the challenge and lets each API call authenticate
+     * with a bearer token; this adds an actual username/password form submission. Set the panel's
+     * login page URL to turn it on. Username and password come from ICHANCY_LOGIN_USERNAME /
+     * ICHANCY_LOGIN_PASSWORD. After a successful login the browser's session cookies are flushed to
+     * Redis under ichancy:cookies:v1, so the fetch fallback and a restarting browser reuse them.
+     *
+     * FAILING OPEN IS DELIBERATE: when the expected login elements cannot be found, the transport
+     * logs a warning and continues WITHOUT logging in. A panel that quietly changed its form must
+     * not take the whole cashier's Ichancy egress down with it at every boot; the money path is the
+     * challenge-solved bearer-token path, and this login is a session-quality enhancement on top.
+     */
+    ICHANCY_LOGIN_URL: optionalHttpUrl('ICHANCY_LOGIN_URL'),
+    /** Credentials for the IN-BROWSER FORM login only. Never sent as part of any API call. */
+    ICHANCY_LOGIN_USERNAME: optionalText('ICHANCY_LOGIN_USERNAME'),
+    ICHANCY_LOGIN_PASSWORD: optionalText('ICHANCY_LOGIN_PASSWORD'),
+    /**
+     * Selectors the in-browser login uses for the username input, the password input and the submit
+     * button. A panel can use anything, so these are overridable; the defaults cover the three
+     * conventions that between them describe almost every login form in the wild.
+     */
+    ICHANCY_LOGIN_USER_SELECTOR: optionalText('ICHANCY_LOGIN_USER_SELECTOR'),
+    ICHANCY_LOGIN_PASSWORD_SELECTOR: optionalText('ICHANCY_LOGIN_PASSWORD_SELECTOR'),
+    ICHANCY_LOGIN_SUBMIT_SELECTOR: optionalText('ICHANCY_LOGIN_SUBMIT_SELECTOR'),
     /**
      * Route every Ichancy call to the in-memory fake instead of the real agent API.
      *
