@@ -22,7 +22,7 @@
  *   * The proxy line is REPUTATIONAL, not secret: scheme + host:port and whether auth is set. The
  *     password (and the login credentials) never reach this endpoint or any log.
  */
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 
 import { readFileSync } from 'node:fs';
 
@@ -163,7 +163,9 @@ export class EgressStatusService {
 
   constructor(
     private readonly config: AppConfigService,
-    private readonly probe: EgressSystemProbe = defaultSystemProbe,
+    // The probe is an interface token, so it has no runtime metadata; Nest must be told to leave it
+    // alone and let the default value stand, or API bootstrap fails with an UnknownDependenciesException.
+    @Optional() private readonly probe: EgressSystemProbe = defaultSystemProbe,
   ) {}
 
   async status(): Promise<EgressStatusPayload> {
